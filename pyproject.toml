@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chronix"
+version = "0.1.0"
+description = "Hybrid CLI tool for organizing daily tasks from multiple platforms"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "pydantic>=2.0.0",
+    "google-auth>=2.0.0",
+    "google-auth-oauthlib>=1.0.0",
+    "google-auth-httplib2>=0.2.0",
+    "google-api-python-client>=2.0.0",
+    "tomli-w>=1.0.0",
+    "rich>=13.0.0",
+]
+
+[project.scripts]
+chronix = "chronix.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["chronix*"]
