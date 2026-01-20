@@ -166,7 +166,6 @@ def today_command(args: list[str]) -> int:
         aggregator = TaskAggregator()
         aggregated_tasks = aggregator.aggregate(_context.projects)
         task_pool = aggregator.get_task_pool(aggregated_tasks)
-        print(f"[dim]Total tasks in pool: {task_pool}[/dim]")
 
         # Filter incomplete tasks only
         incomplete_tasks = [t for t in task_pool if not t.completed]
