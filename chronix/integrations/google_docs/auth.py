@@ -80,18 +80,18 @@ class OAuthAuth(AuthStrategy):
 
 class ServiceAccountAuth(AuthStrategy):
     """Service account authentication for Google Docs API."""
-    
+
     def __init__(self, credentials_path: Path, scopes: list[str] = SCOPES):
         self.credentials_path = credentials_path
         self.scopes = scopes
-    
+
     def get_service(self):
         """Returns authenticated service using service account."""
         if not self.credentials_path.exists():
             raise FileNotFoundError(
                 f"Service account credentials not found at {self.credentials_path}"
             )
-        
+
         creds = service_account.Credentials.from_service_account_file(
             str(self.credentials_path), scopes=self.scopes
         )

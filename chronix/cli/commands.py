@@ -1,6 +1,6 @@
 """Command implementations for the chronix CLI."""
 
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 from typing import Optional
 from pathlib import Path
 import json
@@ -10,7 +10,7 @@ from chronix.integrations.google_docs.parser import GoogleDocsParser
 from chronix.core.todo import TodoDeriver
 from chronix.core.aggregation import ProjectTodoList, TaskAggregator
 from chronix.core.scheduler import SchedulingEngine, create_time_block
-from chronix.core.models import Task
+from chronix.core.models import Task, DaySchedule
 from chronix.cli.formatting import (
     console,
     format_duration,
@@ -80,7 +80,7 @@ def sync_command(args: list[str]) -> int:
         if not client.authenticate():
             print_error("Authentication failed. Please check your credentials.")
             return 1
-        
+
         console.print("[dim]✓ Authenticated successfully[/dim]")
 
         # Fetch and parse documents
@@ -94,9 +94,9 @@ def sync_command(args: list[str]) -> int:
             try:
                 doc = client.fetch_document(doc_id)
                 doc_structure = parser.parse_document(doc)
-                
+
                 project_name = doc_structure.title
-                
+
                 tasks = deriver.derive_todo_list(doc_structure.to_dict())
 
                 project_todo = ProjectTodoList(
@@ -166,6 +166,7 @@ def today_command(args: list[str]) -> int:
         aggregator = TaskAggregator()
         aggregated_tasks = aggregator.aggregate(_context.projects)
         task_pool = aggregator.get_task_pool(aggregated_tasks)
+        print(f"[dim]Total tasks in pool: {task_pool}[/dim]")
 
         # Filter incomplete tasks only
         incomplete_tasks = [t for t in task_pool if not t.completed]
@@ -180,6 +181,16 @@ def today_command(args: list[str]) -> int:
         # If it's already past work start, use current time
         if now > work_start:
             work_start = now
+
+        # Ensure work_end doesn't go past midnight (limit to current day)
+        end_of_today = datetime.combine(
+            today,
+            datetime.max.time(),
+            tzinfo=tz
+        ).replace(hour=23, minute=59, second=59)
+
+        if work_end > end_of_today:
+            work_end = end_of_today
 
         # Get blocked time from configuration
         blocked_time = config_to_time_blocks(config, today)
@@ -196,6 +207,21 @@ def today_command(args: list[str]) -> int:
             tasks=incomplete_tasks,
             start_time=work_start,
             blocked_time=blocked_time
+        )
+        
+        # Filter scheduled tasks to only include segments within today
+        # This prevents showing tasks that spill into tomorrow
+        today_scheduled_tasks = [
+            st for st in day_schedule.scheduled_tasks
+            if st.start.date() == today
+        ]
+        
+        # Update the day_schedule with filtered tasks
+        day_schedule = DaySchedule(
+            date=day_schedule.date,
+            scheduled_tasks=today_scheduled_tasks,
+            blocked_time=day_schedule.blocked_time,
+            conflicts=day_schedule.conflicts
         )
 
         # Display schedule
@@ -228,6 +254,109 @@ def today_command(args: list[str]) -> int:
         return 1
 
 
+def schedule_command(args: list[str]) -> int:
+    """
+    Schedule command: Display schedule for multiple days.
+
+    Usage: schedule [days]
+    
+    If days is not specified, defaults to 3 days.
+    """
+    try:
+        if not _context.projects:
+            print_warning("No projects loaded. Run 'sync' first.")
+            return 1
+
+        # Parse number of days
+        num_days = 3
+        if args:
+            try:
+                num_days = int(args[0])
+                if num_days < 1:
+                    print_error("Number of days must be positive")
+                    return 1
+            except ValueError:
+                print_error(f"Invalid number of days: {args[0]}")
+                return 1
+
+        console.print(f"[dim]Generating {num_days}-day schedule...[/dim]")
+
+        # Load configuration
+        from chronix.config import ChronixConfig, config_to_time_blocks, get_work_window
+        from zoneinfo import ZoneInfo
+
+        config = _context.config or ChronixConfig.load_or_default()
+        tz = ZoneInfo(config.scheduling.timezone)
+
+        # Aggregate all tasks
+        aggregator = TaskAggregator()
+        aggregated_tasks = aggregator.aggregate(_context.projects)
+        task_pool = aggregator.get_task_pool(aggregated_tasks)
+
+        # Filter incomplete tasks only
+        incomplete_tasks = [t for t in task_pool if not t.completed]
+
+        # Get current time
+        now = datetime.now(tz)
+        
+        # Adjust start time if we're past work start today
+        first_day_start, _ = get_work_window(config, now.date())
+        start_time = max(now, first_day_start)
+        
+        # Schedule continuously across all days
+        scheduler = SchedulingEngine()
+        
+        def get_daily_blocked_time(day_date: date) -> list:
+            """Get blocked time for a specific day."""
+            return config_to_time_blocks(config, day_date)
+        
+        schedules_by_day = scheduler.schedule_continuous(
+            tasks=incomplete_tasks,
+            start_time=start_time,
+            num_days=num_days,
+            daily_blocked_time_fn=get_daily_blocked_time
+        )
+        
+        # Display each day's schedule
+        all_conflicts = []
+        for day_offset in range(num_days):
+            day_date = now.date() + timedelta(days=day_offset)
+            
+            if day_date not in schedules_by_day:
+                continue
+            
+            day_schedule = schedules_by_day[day_date]
+            
+            # Get work window for display
+            work_start, work_end = get_work_window(config, day_date)
+            if day_offset == 0 and now > work_start:
+                work_start = now
+            
+            # Display separator between days
+            if day_offset > 0:
+                console.print("\n" + "─" * 60 + "\n")
+            
+            print_schedule_header(day_schedule.date, work_start, work_end, config.scheduling.timezone)
+            _display_continuous_timeline(day_schedule, work_start, work_end)
+            
+            # Collect conflicts
+            if day_schedule.conflicts:
+                all_conflicts.extend(day_schedule.conflicts)
+        
+        # Show all conflicts at the end
+        if all_conflicts:
+            console.print("\n" + "─" * 60 + "\n")
+            print_conflicts(all_conflicts)
+        
+        return 0
+    
+    except Exception as e:
+        print_error(f"Failed to generate multi-day schedule: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+
+
 def explain_command(args: list[str]) -> int:
     """
     Explain command: Show details about a specific task.
@@ -251,7 +380,7 @@ def explain_command(args: list[str]) -> int:
         
         task = None
         project_context = None
-        
+
         for agg_task in aggregated_tasks:
             if agg_task.task.id == task_id:
                 task = agg_task.task
@@ -296,7 +425,8 @@ def help_command(args: list[str]) -> int:
     
     commands_table = [
         ("sync", "Fetch and parse all configured project documents"),
-        ("today", "Display today's scheduled tasks"),
+        ("today", "Display today's scheduled tasks (until end of day)"),
+        ("schedule [days]", "Display multi-day schedule (default: 3 days)"),
         ("explain <task_id>", "Show details and scheduling info for a task"),
         ("config <cmd>", "Manage configuration (init, show, validate)"),
         ("clear / cls", "Clear the terminal screen"),

@@ -15,6 +15,7 @@ except ImportError:
 from chronix.cli.commands import (
     sync_command,
     today_command,
+    schedule_command,
     explain_command,
     help_command
 )
@@ -30,6 +31,7 @@ class ChronixShell:
         self.commands = {
             'sync': sync_command,
             'today': today_command,
+            'schedule': schedule_command,
             'explain': explain_command,
             'config': config_command,
             'help': help_command,

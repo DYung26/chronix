@@ -62,15 +62,15 @@ class DocumentStructure:
 
 class GoogleDocsParser:
     """Parser for extracting raw structural content from Google Docs API responses."""
-    
+
     TASK_IDENTIFIER = "TASKS ::: duration; external_deadline; user_deadline"
-    
+
     def parse_document(self, doc: dict[str, Any]) -> DocumentStructure:
         """Extract structural content from a Google Docs document with tabs support."""
         structure = DocumentStructure()
         structure.title = doc.get("title", "")
         structure.document_id = doc.get("documentId", "")
-        
+
         # Process tabs if present
         tabs = doc.get("tabs", [])
         if tabs:

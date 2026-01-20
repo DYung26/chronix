@@ -49,8 +49,8 @@ class Task(BaseModel):
 
     @property
     def effective_deadline(self) -> Optional[datetime]:
-        """Returns deadline_user if set, otherwise deadline_external."""
-        return self.deadline_user if self.deadline_user is not None else self.deadline_external
+        """Returns deadline_external if set, otherwise deadline_user."""
+        return self.deadline_external if self.deadline_external is not None else self.deadline_user
 
 
 class TimeBlock(BaseModel):
@@ -83,6 +83,9 @@ class ScheduledTask(BaseModel):
     end: datetime
     violates_deadline_user: bool
     violates_deadline_external: bool
+    is_segment: bool = False
+    segment_index: Optional[int] = None
+    total_segments: Optional[int] = None
 
     @field_validator("start", "end")
     @classmethod
@@ -100,8 +103,17 @@ class ScheduledTask(BaseModel):
     @model_validator(mode="after")
     def validate_duration_matches(self):
         actual_duration = self.end - self.start
-        if actual_duration != self.task.estimated_duration:
+        if not self.is_segment and actual_duration != self.task.estimated_duration:
             raise ValueError("duration must equal task.estimated_duration")
+        return self
+    
+    @model_validator(mode="after")
+    def validate_segment_fields(self):
+        if self.is_segment:
+            if self.segment_index is None or self.total_segments is None:
+                raise ValueError("segment_index and total_segments required when is_segment=True")
+            if self.segment_index < 1 or self.segment_index > self.total_segments:
+                raise ValueError("segment_index must be between 1 and total_segments")
         return self
 
 

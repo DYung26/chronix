@@ -264,7 +264,7 @@ class TodoDeriver:
 
                 # Get the checkbox list ID for this tab
                 checkbox_list_id = tab.get('checkbox_list_id')
-                
+
                 # If no checkbox list ID found for this tab, raise error
                 if checkbox_list_id is None:
                     raise TaskParseError(
@@ -301,57 +301,12 @@ class TodoDeriver:
             except TaskParseError:
                 continue
 
-        return self.sort_tasks(tasks)
-
-        return self.sort_tasks(tasks)
+        # Do NOT sort here - tasks will be sorted globally after aggregation
+        return tasks
 
     def _extract_section_name(self, text: str) -> str:
         """Extract section name from heading text."""
         return text.strip()
-
-    def sort_tasks(self, tasks: list[Task]) -> list[Task]:
-        """Sort tasks according to TODO derivation rules."""
-        incomplete_with_metadata = []
-        completed_with_metadata = []
-        completed_without_metadata = []
-        
-        for task in tasks:
-            if task.completed:
-                if self._has_valid_metadata(task):
-                    completed_with_metadata.append(task)
-                else:
-                    completed_without_metadata.append(task)
-            else:
-                incomplete_with_metadata.append(task)
-        
-        incomplete_sorted = sorted(
-            incomplete_with_metadata,
-            key=lambda t: (
-                t.estimated_duration,
-                t.effective_deadline or datetime.max.replace(tzinfo=timezone.utc),
-                t.title
-            )
-        )
-        
-        completed_meta_sorted = sorted(
-            completed_with_metadata,
-            key=lambda t: (
-                t.estimated_duration,
-                t.effective_deadline or datetime.max.replace(tzinfo=timezone.utc),
-                t.title
-            )
-        )
-        
-        completed_no_meta_sorted = sorted(
-            completed_without_metadata,
-            key=lambda t: t.title
-        )
-        
-        return incomplete_sorted + completed_meta_sorted + completed_no_meta_sorted
-    
-    def _has_valid_metadata(self, task: Task) -> bool:
-        """Check if task has valid metadata (non-default values)."""
-        return task.estimated_duration > timedelta(0)
 
 
 def parse_document_tasks(

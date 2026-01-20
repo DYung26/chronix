@@ -103,12 +103,18 @@ def _print_task_segment(index: int, time_range: str, scheduled_task):
         violations.append("🔴")
     violation_str = " ".join(violations)
     
-    # Main task line
+    # Main task line with segment indicator if applicable
     task_line = Text()
     task_line.append(f"{index:2}. ", style="dim")
     task_line.append(f"{time_range}  ", style="bold cyan")
     task_line.append("📋 ", style="")
     task_line.append(task.title, style="bold white")
+    
+    # Add segment indicator if task is split
+    if scheduled_task.is_segment:
+        segment_label = f" (part {scheduled_task.segment_index}/{scheduled_task.total_segments})"
+        task_line.append(segment_label, style="dim italic")
+    
     if violation_str:
         task_line.append(f" {violation_str}", style="")
     
@@ -135,12 +141,12 @@ def _print_task_segment(index: int, time_range: str, scheduled_task):
     deadline_to_show = None
     deadline_type = None
     
-    if task.deadline_user:
-        deadline_to_show = task.deadline_user
-        deadline_type = "User"
-    elif task.deadline_external:
+    if task.deadline_external:
         deadline_to_show = task.deadline_external
         deadline_type = "External"
+    elif task.deadline_user:
+        deadline_to_show = task.deadline_user
+        deadline_type = "User"
     
     if deadline_to_show:
         deadline_str = deadline_to_show.strftime('%Y-%m-%d %H:%M')

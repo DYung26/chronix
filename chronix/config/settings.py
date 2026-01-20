@@ -45,13 +45,13 @@ class SchedulingConfig(BaseModel):
     sleep_windows: list[TimeBlockConfig] = Field(default_factory=list, description="Sleep time blocks")
     breaks: list[TimeBlockConfig] = Field(default_factory=list, description="Break time blocks")
     meetings: list[TimeBlockConfig] = Field(default_factory=list, description="Recurring meeting blocks")
-    
+
     @model_validator(mode="after")
     def validate_work_hours(self):
         if self.work_start_time >= self.work_end_time:
             raise ValueError("work_start_time must be before work_end_time")
         return self
-    
+
     def get_default_task_duration(self) -> timedelta:
         """Get default task duration as timedelta."""
         return timedelta(minutes=self.default_task_duration_minutes)
@@ -72,7 +72,7 @@ class GoogleDocsConfig(BaseModel):
         if v is None:
             return None
         return Path(v).expanduser().resolve()
-    
+
     @model_validator(mode="after")
     def set_default_paths(self):
         """Set default paths if not specified."""
@@ -85,10 +85,10 @@ class GoogleDocsConfig(BaseModel):
 
 class ChronixConfig(BaseModel):
     """Root configuration for chronix."""
-    
+
     scheduling: SchedulingConfig = Field(default_factory=SchedulingConfig)
     google_docs: GoogleDocsConfig = Field(default_factory=GoogleDocsConfig)
-    
+
     @classmethod
     def from_toml(cls, path: Path) -> "ChronixConfig":
         """Load configuration from TOML file."""
