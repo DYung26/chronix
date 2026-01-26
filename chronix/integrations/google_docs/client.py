@@ -22,12 +22,12 @@ class GoogleDocsClient(TaskSourceIntegration):
         return self._service
 
     def authenticate(self) -> bool:
-        """Authenticate with Google Docs API."""
+        """Authenticate with Google Docs API. Raises exceptions on auth failures."""
         try:
             self.service
             return True
-        except Exception:
-            return False
+        except Exception as e:
+            raise e
 
     def validate_connection(self) -> bool:
         """Validate connection to Google Docs API."""

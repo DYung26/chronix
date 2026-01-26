@@ -5,7 +5,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from chronix.core.models import Task
+from chronix.core.models import Task, AdHocMeeting
 
 
 class TaskParseError(Exception):
@@ -223,6 +223,120 @@ class TaskParser:
         return dt
 
 
+class MeetingParser:
+     """Parses ad-hoc meeting lines from Google Docs into AdHocMeeting objects."""
+
+     METADATA_PATTERN = re.compile(r'^MEETING\s*:::\s*(.+)$', re.IGNORECASE)
+     MEETING_IDENTIFIER = "MEETING ::: start_time ; end_time ; optional_label"
+
+     def parse_meeting_line(
+         self,
+         paragraph: dict,
+         checkbox_list_id: str | None,
+         source: str = "google_docs"
+     ) -> Optional[AdHocMeeting]:
+         """Parse a paragraph into an AdHocMeeting if it contains valid meeting metadata.
+
+         A paragraph is considered a meeting only if:
+         1. It has a bullet field
+         2. The bullet.list_id matches the document's checkbox_list_id
+         3. It matches the meeting metadata pattern (MEETING ::: start ; end ; label)
+
+         Args:
+             paragraph: The paragraph dictionary to parse
+             checkbox_list_id: The discovered checkbox list ID for this document
+             source: The source system (default: "google_docs")
+
+         Returns:
+             AdHocMeeting object if valid, None otherwise
+         """
+         # Check if it's a checkbox bullet
+         bullet = paragraph.get('bullet')
+         if bullet is None:
+             return None
+
+         # Require a valid checkbox list ID
+         if checkbox_list_id is None:
+             return None
+
+         # Only checkbox list items are meetings (match discovered list ID)
+         if bullet.get('list_id') != checkbox_list_id:
+             return None
+
+         text = paragraph['text'].strip()
+         if not text:
+             return None
+
+         match = self.METADATA_PATTERN.match(text)
+         if not match:
+             return None
+
+         metadata_str = match.group(1).strip()
+
+         parts = [p.strip() for p in metadata_str.split(';')]
+         if len(parts) < 2 or len(parts) > 3:
+             raise TaskParseError(
+                 message=f"Invalid meeting format: expected 2-3 fields, got {len(parts)}. "
+                         f"Format: start_time ; end_time ; optional_label",
+                 raw_text=text,
+                 field="metadata",
+                 value=metadata_str
+             )
+
+         start_str = parts[0]
+         end_str = parts[1]
+         label = parts[2] if len(parts) == 3 else None
+
+         try:
+             start = self._parse_datetime(start_str, field="start_time", raw_text=text)
+         except TaskParseError:
+             raise
+
+         try:
+             end = self._parse_datetime(end_str, field="end_time", raw_text=text)
+         except TaskParseError:
+             raise
+
+         # Validate start < end
+         if start >= end:
+             raise TaskParseError(
+                 message=f"Meeting start time must be before end time",
+                 raw_text=text,
+                 field="time_order",
+                 value=f"{start} >= {end}"
+             )
+
+         return AdHocMeeting(
+             start=start,
+             end=end,
+             label=label,
+             source=source
+         )
+
+     def _parse_datetime(
+         self,
+         datetime_str: str,
+         field: Optional[str] = None,
+         raw_text: Optional[str] = None
+     ) -> datetime:
+         """Parse datetime string into timezone-aware datetime."""
+         try:
+             dt = datetime.fromisoformat(datetime_str)
+         except ValueError as e:
+             raise TaskParseError(
+                 message=f"Invalid datetime format: '{datetime_str}'. "
+                         f"Expected ISO-8601 format (e.g., 2026-01-25T14:00 or 2026-01-25T14:00+00:00)",
+                 raw_text=raw_text,
+                 field=field or "datetime",
+                 value=datetime_str
+             ) from e
+
+         if dt.tzinfo is None:
+             dt = dt.replace(tzinfo=timezone.utc)
+
+         return dt
+
+
 class TodoDeriver:
     """Derives canonical TODO list from document structures."""
 
@@ -308,6 +422,63 @@ class TodoDeriver:
         """Extract section name from heading text."""
         return text.strip()
 
+    def derive_meetings_list(
+        self,
+        document_structure: dict,
+        exclude_tab_titles: Optional[list[str]] = None
+    ) -> list[AdHocMeeting]:
+        """Derive list of ad-hoc meetings from document structure.
+
+        Args:
+            document_structure: Parsed document with tabs
+            exclude_tab_titles: Tab titles to exclude (e.g., ["todo"]).
+                                Case-insensitive comparison.
+
+        Returns:
+            List of AdHocMeeting objects
+        """
+        if exclude_tab_titles is None:
+            exclude_tab_titles = ['todo']
+
+        # Normalize exclusion list for case-insensitive comparison
+        exclude_normalized = [t.lower() for t in exclude_tab_titles]
+
+        meetings = []
+        meeting_parser = MeetingParser()
+
+        # Process each tab
+        tabs = document_structure.get('tabs', [])
+        for tab in tabs:
+            try:
+                tab_title = tab.get('title', '').strip()
+
+                # Skip excluded tabs
+                if tab_title.lower() in exclude_normalized:
+                    continue
+
+                # Get the checkbox list ID for this tab
+                checkbox_list_id = tab.get('checkbox_list_id')
+
+                # If no checkbox list ID found for this tab, skip
+                if checkbox_list_id is None:
+                    continue
+
+                # Process paragraphs in this tab
+                paragraphs = tab.get('paragraphs', [])
+                for paragraph in paragraphs:
+                    # Try to parse as meeting
+                    try:
+                        meeting = meeting_parser.parse_meeting_line(paragraph, checkbox_list_id)
+                        if meeting:
+                            meetings.append(meeting)
+                    except TaskParseError:
+                        # Ignore lines that can't be parsed as meetings
+                        continue
+            except TaskParseError:
+                continue
+
+        return meetings
+
 
 def parse_document_tasks(
     document_structure: dict,
@@ -345,3 +516,12 @@ def derive_todo_list(
     """Derive and sort the canonical TODO list from a document with tabs."""
     deriver = TodoDeriver()
     return deriver.derive_todo_list(document_structure, exclude_tab_titles)
+
+
+def parse_document_meetings(
+    document_structure: dict,
+    exclude_tab_titles: Optional[list[str]] = None
+) -> list[AdHocMeeting]:
+    """Parse all ad-hoc meetings from a document structure with tabs."""
+    deriver = TodoDeriver()
+    return deriver.derive_meetings_list(document_structure, exclude_tab_titles)

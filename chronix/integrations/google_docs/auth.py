@@ -47,8 +47,19 @@ class OAuthAuth(AuthStrategy):
 
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-            else:
+                try:
+                    creds.refresh(Request())
+                    # Save the refreshed token
+                    self.token_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(self.token_path, "w") as token_file:
+                        token_file.write(creds.to_json())
+                except Exception as refresh_error:
+                    print(f"\n[!] Token refresh failed: {refresh_error}")
+                    print("[*] Re-authentication is required.\n")
+                    creds = None
+            
+            if not creds or not creds.valid:
+                # Need full OAuth re-authentication
                 if not self.credentials_path.exists():
                     raise FileNotFoundError(
                         f"OAuth credentials not found at {self.credentials_path}. "
@@ -59,21 +70,22 @@ class OAuthAuth(AuthStrategy):
                     str(self.credentials_path), self.scopes
                 )
 
-                _auth_url, _ = flow.authorization_url(prompt="consent")
+                auth_url, _ = flow.authorization_url(prompt="consent")
 
-                print(f"\nOpening browser for Google authentication...")
-                # print(f"If browser doesn't open, visit this URL:\n{auth_url}\n")
+                print(f"\n[*] Please visit this URL to authorize Chronix:\n")
+                print(f"    {auth_url}\n")
+                print(f"[*] Opening browser for Google authentication...\n")
 
-                # try:
-                #     webbrowser.open(auth_url)
-                # except Exception:
-                #     pass
+                try:
+                    webbrowser.open(auth_url)
+                except Exception:
+                    pass
 
                 creds = flow.run_local_server(port=0)
 
-            self.token_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.token_path, "w") as token_file:
-                token_file.write(creds.to_json())
+                self.token_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(self.token_path, "w") as token_file:
+                    token_file.write(creds.to_json())
 
         return build("docs", "v1", credentials=creds)
 

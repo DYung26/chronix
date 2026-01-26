@@ -7,7 +7,7 @@ import json
 
 from chronix.integrations.google_docs.client import GoogleDocsClient
 from chronix.integrations.google_docs.parser import GoogleDocsParser
-from chronix.core.todo import TodoDeriver
+from chronix.core.todo import TodoDeriver, parse_document_meetings
 from chronix.core.aggregation import ProjectTodoList, TaskAggregator
 from chronix.core.scheduler import SchedulingEngine, create_time_block
 from chronix.core.models import Task, DaySchedule
@@ -33,6 +33,7 @@ class ChronixContext:
 
     def __init__(self):
         self.projects: list[ProjectTodoList] = []
+        self.ad_hoc_meetings: list = []
         self.last_sync: Optional[datetime] = None
         self.google_client: Optional[GoogleDocsClient] = None
         self.config: Optional['ChronixConfig'] = None
@@ -77,14 +78,20 @@ def sync_command(args: list[str]) -> int:
         client = _context._ensure_google_client()
         console.print("[dim]Authenticating with Google Docs...[/dim]")
 
-        if not client.authenticate():
-            print_error("Authentication failed. Please check your credentials.")
+        try:
+            if not client.authenticate():
+                print_error("Authentication failed. Please check your credentials.")
+                console.print("[dim]Hint: Ensure OAuth credentials are properly configured.[/dim]")
+                return 1
+        except Exception as auth_error:
+            print_error(f"Authentication error: {auth_error}")
             return 1
 
         console.print("[dim]✓ Authenticated successfully[/dim]")
 
         # Fetch and parse documents
         projects = []
+        all_meetings = []
         parser = GoogleDocsParser()
         deriver = TodoDeriver()
 
@@ -98,6 +105,7 @@ def sync_command(args: list[str]) -> int:
                 project_name = doc_structure.title
 
                 tasks = deriver.derive_todo_list(doc_structure.to_dict())
+                meetings = parse_document_meetings(doc_structure.to_dict())
 
                 project_todo = ProjectTodoList(
                     project_name=project_name,
@@ -105,8 +113,9 @@ def sync_command(args: list[str]) -> int:
                     document_id=doc_id
                 )
                 projects.append(project_todo)
+                all_meetings.extend(meetings)
 
-                console.print(f"  [green]✓[/green] [bold]{project_name}[/bold]: [cyan]{len(tasks)}[/cyan] tasks")
+                console.print(f"  [green]✓[/green] [bold]{project_name}[/bold]: [cyan]{len(tasks)}[/cyan] tasks, [cyan]{len(meetings)}[/cyan] meetings")
 
             except Exception as e:
                 console.print(f"  [red]✗[/red] Failed to fetch document {doc_id}: {e}")
@@ -114,6 +123,7 @@ def sync_command(args: list[str]) -> int:
 
         # Update context
         _context.projects = projects
+        _context.ad_hoc_meetings = all_meetings
         _context.last_sync = datetime.now(timezone.utc)
         _context.config = config
 
@@ -193,6 +203,12 @@ def today_command(args: list[str]) -> int:
 
         # Get blocked time from configuration
         blocked_time = config_to_time_blocks(config, today)
+
+        # Add ad-hoc meetings as blocked time
+        today_date = today
+        for meeting in _context.ad_hoc_meetings:
+            if meeting.start.date() == today_date:
+                blocked_time.append(meeting.to_time_block())
 
         # Filter blocked time to only include blocks within work hours
         blocked_time = [
@@ -307,7 +323,12 @@ def schedule_command(args: list[str]) -> int:
         
         def get_daily_blocked_time(day_date: date) -> list:
             """Get blocked time for a specific day."""
-            return config_to_time_blocks(config, day_date)
+            blocked = config_to_time_blocks(config, day_date)
+            # Add ad-hoc meetings for this day
+            for meeting in _context.ad_hoc_meetings:
+                if meeting.start.date() == day_date:
+                    blocked.append(meeting.to_time_block())
+            return blocked
         
         schedules_by_day = scheduler.schedule_continuous(
             tasks=incomplete_tasks,

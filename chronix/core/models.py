@@ -75,6 +75,37 @@ class TimeBlock(BaseModel):
         return self
 
 
+class AdHocMeeting(BaseModel):
+     """Represents an ad-hoc, non-recurring meeting from Google Docs."""
+
+     start: datetime
+     end: datetime
+     label: Optional[str] = None
+     source: str = "google_docs"
+
+     @field_validator("start", "end")
+     @classmethod
+     def validate_timezone_aware(cls, v: datetime) -> datetime:
+         if v.tzinfo is None:
+             raise ValueError("start and end must be timezone-aware")
+         return v
+
+     @model_validator(mode="after")
+     def validate_start_before_end(self):
+         if self.start >= self.end:
+             raise ValueError("start must be before end")
+         return self
+
+     def to_time_block(self) -> TimeBlock:
+         """Convert to a TimeBlock for scheduler integration."""
+         return TimeBlock(
+             start=self.start,
+             end=self.end,
+             kind="meeting",
+             label=self.label
+         )
+
+
 class ScheduledTask(BaseModel):
     """Represents a Task placed into time."""
 
