@@ -16,6 +16,7 @@ dependencies = [
     "google-api-python-client>=2.0.0",
     "tomli-w>=1.0.0",
     "rich>=13.0.0",
+    "tzdata>=2024.1",
 ]
 
 [project.scripts]
