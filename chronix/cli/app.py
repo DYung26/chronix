@@ -5,12 +5,8 @@ import os
 from datetime import datetime, timezone
 from typing import Optional
 
-# Import readline for command history support (Unix/Mac)
-try:
-    import readline
-    READLINE_AVAILABLE = True
-except ImportError:
-    READLINE_AVAILABLE = False
+from prompt_toolkit import PromptSession
+from prompt_toolkit.history import InMemoryHistory
 
 from chronix.cli.commands import (
     sync_command,
@@ -41,10 +37,12 @@ class ChronixShell:
             'cls': self._clear_command,
         }
         
-        # Enable command history if readline is available
-        if READLINE_AVAILABLE:
-            # Set up history (in-memory only, not persisted)
-            readline.set_history_length(1000)
+        # Set up command history with prompt_toolkit
+        self.history = InMemoryHistory()
+        self.prompt_session = PromptSession(
+            history=self.history,
+            enable_history_search=True
+        )
     
     def _exit_command(self, args: list[str]) -> int:
         """Exit the shell."""
@@ -77,7 +75,7 @@ class ChronixShell:
         
         while self.running:
             try:
-                user_input = input("chronix> ").strip()
+                user_input = self.prompt_session.prompt("chronix> ").strip()
                 
                 if not user_input:
                     continue

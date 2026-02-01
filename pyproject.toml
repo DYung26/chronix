@@ -17,6 +17,7 @@ dependencies = [
     "tomli-w>=1.0.0",
     "rich>=13.0.0",
     "tzdata>=2024.1",
+    "prompt_toolkit>=3.0.0",
 ]
 
 [project.scripts]
