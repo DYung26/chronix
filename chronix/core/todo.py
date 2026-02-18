@@ -63,8 +63,8 @@ class TaskParser:
     
     METADATA_PATTERN = re.compile(r'^(.*?)\s*:::\s*(.+)$')
     DURATION_PATTERN = re.compile(r'^(\d+)(hours?|minutes?)$', re.IGNORECASE)
-    TASK_IDENTIFIER = "TASKS ::: duration; external_deadline; user_deadline"
-    
+    TASK_IDENTIFIER = "TASKS ::: duration; external_deadline; user_deadline; ref; depends"
+
     def parse_task_line(
         self, 
         paragraph: dict, 
@@ -77,7 +77,7 @@ class TaskParser:
         1. It has a bullet field
         2. The bullet.list_id matches the document's checkbox_list_id
         3. It is NOT the identifier line itself
-        4. It matches the task metadata pattern (title ::: duration ; deadline ; deadline)
+        4. It matches the task metadata pattern (title ::: duration ; deadline ; deadline [; key=value ...])
         
         Args:
             paragraph: The paragraph dictionary to parse
@@ -116,16 +116,17 @@ class TaskParser:
         metadata_str = match.group(2).strip()
 
         parts = [p.strip() for p in metadata_str.split(';')]
-        if len(parts) != 3:
+        if len(parts) < 3:
             raise TaskParseError(
-                message=f"Invalid metadata format: expected 3 fields, got {len(parts)}. "
-                        f"Format: duration ; external_deadline ; user_deadline",
+                message=f"Invalid metadata format: expected at least 3 fields, got {len(parts)}. "
+                        f"Format: duration ; external_deadline ; user_deadline [; key=value ...]",
                 raw_text=text,
                 field="metadata",
                 value=metadata_str
             )
 
-        duration_str, external_deadline_str, user_deadline_str = parts
+        duration_str, external_deadline_str, user_deadline_str = parts[:3]
+        extra_fields = parts[3:]
 
         try:
             duration = self._parse_duration(duration_str, raw_text=text)
@@ -142,6 +143,23 @@ class TaskParser:
         except TaskParseError:
             raise
 
+        ref = None
+        depends_on = []
+
+        for field_str in extra_fields:
+            if '=' not in field_str:
+                continue
+            
+            key, value = field_str.split('=', 1)
+            key = key.strip()
+            value = value.strip()
+            
+            if key == 'ref':
+                ref = value if value else None
+            elif key == 'depends':
+                if value:
+                    depends_on = [d.strip() for d in value.split(',') if d.strip()]
+
         completed = bullet.get('has_strikethrough', False)
 
         return Task(
@@ -150,7 +168,9 @@ class TaskParser:
             deadline_external=external_deadline,
             deadline_user=user_deadline,
             completed=completed,
-            source=source
+            source=source,
+            ref=ref,
+            depends_on=depends_on
         )
 
     def _parse_duration(self, duration_str: str, raw_text: Optional[str] = None) -> timedelta:
@@ -384,7 +404,7 @@ class TodoDeriver:
                     raise TaskParseError(
                         message=f"No checkbox list ID found in tab '{tab_title}'. "
                                 f"Tab must contain a checkbox line with text: "
-                                f"'TASKS ::: duration; external_deadline; user_deadline'",
+                                f"'TASKS ::: duration; external_deadline; user_deadline; ref; depends'",
                         raw_text=None,
                         field="checkbox_list_id",
                         value=None

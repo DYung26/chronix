@@ -18,6 +18,8 @@ class Task(BaseModel):
     deadline_external: Optional[datetime] = None
     completed: bool = False
     source: str
+    ref: Optional[str] = None
+    depends_on: list[str] = []
 
     @model_validator(mode="before")
     @classmethod

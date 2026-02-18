@@ -146,6 +146,7 @@ class SchedulingEngine:
         - Ensures external deadlines are protected (tasks deferred if needed)
         - Handles task interleaving and resumption
         - Still schedules tasks even when deadlines are impossible (flags violations)
+        - Respects dependency constraints (tasks cannot start until dependencies complete)
         
         Returns:
             (list of scheduled task segments, list of conflict messages)
@@ -155,6 +156,7 @@ class SchedulingEngine:
         # Track remaining work for each incomplete task
         remaining_work = {}
         incomplete_tasks = []
+        completion_times = {}
         
         for task in tasks:
             if not task.completed:
@@ -173,17 +175,27 @@ class SchedulingEngine:
                 incomplete_tasks,
                 remaining_work,
                 current_time,
-                blocked_time
+                blocked_time,
+                completion_times
             )
             
             if task_to_schedule is None:
                 # No tasks left to schedule
                 break
             
+            earliest_allowed_start = current_time
+            ref_to_task = {t.ref: t for t in incomplete_tasks if t.ref}
+            
+            for dep_ref in task_to_schedule.depends_on:
+                dep_task = ref_to_task.get(dep_ref)
+                if dep_task and dep_task.id in completion_times:
+                    dep_completion = completion_times[dep_task.id]
+                    earliest_allowed_start = max(earliest_allowed_start, dep_completion)
+            
             # Schedule a segment of this task
             segment, next_time = self._schedule_task_segment(
                 task=task_to_schedule,
-                earliest_start=current_time,
+                earliest_start=earliest_allowed_start,
                 blocked_time=blocked_time,
                 remaining_duration=remaining_work[task_to_schedule.id]
             )
@@ -193,6 +205,10 @@ class SchedulingEngine:
                 segments_by_task[task_to_schedule.id].append((task_to_schedule, start, end))
                 segment_duration = end - start
                 remaining_work[task_to_schedule.id] -= segment_duration
+                
+                if remaining_work[task_to_schedule.id] <= timedelta(0):
+                    completion_times[task_to_schedule.id] = end
+                
                 current_time = next_time
             else:
                 # Could not schedule - should not happen, but safety break
@@ -208,40 +224,59 @@ class SchedulingEngine:
         tasks: list[Task],
         remaining_work: dict[str, timedelta],
         current_time: datetime,
-        blocked_time: list[TimeBlock]
+        blocked_time: list[TimeBlock],
+        completion_times: Optional[dict[str, datetime]] = None
     ) -> Optional[Task]:
         """
         Select the next task to schedule using urgency-aware logic.
         
         Strategy:
         1. Find tasks with remaining work
-        2. For each task, calculate how urgent it is (time until deadline vs time needed)
-        3. Prioritize tasks that:
+        2. Check if dependencies are satisfied
+        3. For each task, calculate how urgent it is (time until deadline vs time needed)
+        4. Prioritize tasks that:
+           - Have all dependencies completed
            - Have deadlines that are becoming critical
            - Can fit without violating other critical deadlines
-        4. Fall back to sorted order if no urgency differentiation
+        5. Fall back to sorted order if no urgency differentiation
         """
+        if completion_times is None:
+            completion_times = {}
+        
         candidates = [t for t in tasks if remaining_work.get(t.id, timedelta(0)) > timedelta(0)]
         
         if not candidates:
             return None
         
-        # Calculate urgency score for each candidate
+        def deps_satisfied(task: Task) -> bool:
+            if not task.depends_on:
+                return True
+            ref_to_task = {t.ref: t for t in tasks if t.ref}
+            for dep_ref in task.depends_on:
+                dep_task = ref_to_task.get(dep_ref)
+                if not dep_task:
+                    return True
+                if dep_task.id not in completion_times:
+                    return False
+            return True
+        
+        available = [t for t in candidates if deps_satisfied(t)]
+        
+        if not available:
+            return None
+        
         urgency_scores = []
-        for task in candidates:
+        for task in available:
             score = self._calculate_urgency(task, current_time, remaining_work.get(task.id, timedelta(0)), blocked_time)
             urgency_scores.append((score, task))
         
-        # Sort by urgency (lower score = more urgent)
         urgency_scores.sort(key=lambda x: x[0])
         
-        # Try to schedule the most urgent task that doesn't endanger critical deadlines
         for urgency, task in urgency_scores:
-            if self._is_safe_to_schedule(task, current_time, remaining_work, candidates, blocked_time):
+            if self._is_safe_to_schedule(task, current_time, remaining_work, available, blocked_time):
                 return task
         
-        # All tasks would cause violations - schedule most urgent anyway (best effort)
-        return urgency_scores[0][1]
+        return urgency_scores[0][1] if urgency_scores else None
     
     def _calculate_urgency(
         self,

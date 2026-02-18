@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from chronix.core.models import Task
+from chronix.core.dependencies import resolve_task_dependencies, DependencyError
 
 
 @dataclass
@@ -110,7 +111,11 @@ class TaskAggregator:
     ) -> list[Task]:
         """Extract raw Task objects from aggregated view and sort globally."""
         tasks = [agg_task.task for agg_task in aggregated_tasks]
-        return self._sort_tasks_globally(tasks)
+        sorted_tasks = self._sort_tasks_globally(tasks)
+        try:
+            return resolve_task_dependencies(sorted_tasks)
+        except DependencyError as e:
+            raise ValueError(f"Dependency validation failed: {str(e)}") from e
     
     def _sort_tasks_globally(self, tasks: list[Task]) -> list[Task]:
         """
