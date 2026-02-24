@@ -106,6 +106,15 @@ Available commands:
 **REPL Features**:
 - Command history: Use UP/DOWN arrows to navigate previous commands
 - Auto-sync: Tasks are synced automatically when entering the REPL
+- Command chaining with `&&`: Execute multiple commands in sequence (stops on failure)
+  - Example: `sync && today`
+  - Example: `sync && invalid_command && today` (stops at invalid_command)
+- Line continuation with `\`: Continue input across multiple lines
+  - Example:
+    ```
+    chronix> sync \
+    ... && today
+    ```
 
 ### One-Shot Commands
 

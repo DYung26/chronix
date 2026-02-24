@@ -59,6 +59,50 @@ class ChronixShell:
         console.print("[dim]Type 'help' for available commands or 'exit' to quit.[/dim]\n")
         return 0
     
+    def _read_continued_input(self, initial_input: str) -> str:
+        """Read input with line continuation support (backslash at end of line)."""
+        combined = initial_input
+        while combined.rstrip().endswith('\\'):
+            combined = combined.rstrip()[:-1].rstrip()
+            try:
+                next_line = self.prompt_session.prompt("... ").strip()
+                combined = combined + ' ' + next_line if next_line else combined
+            except EOFError:
+                raise
+        return combined
+    
+    def _execute_command_chain(self, user_input: str) -> bool:
+        """Execute command chain with && support. Returns True if successful."""
+        commands = user_input.split('&&')
+        
+        for command_str in commands:
+            command_str = command_str.strip()
+            if not command_str:
+                continue
+            
+            parts = command_str.split()
+            command_name = parts[0]
+            args = parts[1:]
+            
+            if command_name not in self.commands:
+                console.print(f"[yellow]Unknown command:[/yellow] {command_name}")
+                console.print("[dim]Type 'help' for available commands.[/dim]")
+                return False
+            
+            command = self.commands[command_name]
+            try:
+                result = command(args)
+                if result != 0:
+                    return False
+            except KeyboardInterrupt:
+                console.print("\n^C")
+                return False
+            except Exception as e:
+                console.print(f"[red]Error executing command:[/red] {e}")
+                return False
+        
+        return True
+
     def run(self):
         """Run the interactive shell."""
         self.running = True
@@ -80,24 +124,8 @@ class ChronixShell:
                 if not user_input:
                     continue
                 
-                parts = user_input.split()
-                command_name = parts[0]
-                args = parts[1:]
-                
-                if command_name not in self.commands:
-                    console.print(f"[yellow]Unknown command:[/yellow] {command_name}")
-                    console.print("[dim]Type 'help' for available commands.[/dim]")
-                    continue
-                
-                command = self.commands[command_name]
-                try:
-                    command(args)
-                except KeyboardInterrupt:
-                    console.print("\n^C")
-                    continue
-                except Exception as e:
-                    console.print(f"[red]Error executing command:[/red] {e}")
-                    console.print("[dim]The shell will continue running.[/dim]")
+                user_input = self._read_continued_input(user_input)
+                self._execute_command_chain(user_input)
             
             except KeyboardInterrupt:
                 console.print("\n[dim]Use 'exit' or 'quit' to leave the shell.[/dim]")
