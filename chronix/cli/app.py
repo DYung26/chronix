@@ -72,36 +72,56 @@ class ChronixShell:
         return combined
     
     def _execute_command_chain(self, user_input: str) -> bool:
-        """Execute command chain with && support. Returns True if successful."""
-        commands = user_input.split('&&')
+        """Execute command chain with && and ; support. Returns True if successful.
         
-        for command_str in commands:
-            command_str = command_str.strip()
-            if not command_str:
+        ; (semicolon) has lower precedence: segments are unconditional.
+        && (ampersand-ampersand) has higher precedence: conditional within segment.
+        """
+        semicolon_segments = user_input.split(';')
+        overall_success = True
+        
+        for segment in semicolon_segments:
+            segment = segment.strip()
+            if not segment:
                 continue
             
-            parts = command_str.split()
-            command_name = parts[0]
-            args = parts[1:]
+            and_commands = segment.split('&&')
+            segment_success = True
             
-            if command_name not in self.commands:
-                console.print(f"[yellow]Unknown command:[/yellow] {command_name}")
-                console.print("[dim]Type 'help' for available commands.[/dim]")
-                return False
+            for command_str in and_commands:
+                command_str = command_str.strip()
+                if not command_str:
+                    continue
+                
+                parts = command_str.split()
+                command_name = parts[0]
+                args = parts[1:]
+                
+                if command_name not in self.commands:
+                    console.print(f"[yellow]Unknown command:[/yellow] {command_name}")
+                    console.print("[dim]Type 'help' for available commands.[/dim]")
+                    segment_success = False
+                    break
+                
+                command = self.commands[command_name]
+                try:
+                    result = command(args)
+                    if result != 0:
+                        segment_success = False
+                        break
+                except KeyboardInterrupt:
+                    console.print("\n^C")
+                    segment_success = False
+                    break
+                except Exception as e:
+                    console.print(f"[red]Error executing command:[/red] {e}")
+                    segment_success = False
+                    break
             
-            command = self.commands[command_name]
-            try:
-                result = command(args)
-                if result != 0:
-                    return False
-            except KeyboardInterrupt:
-                console.print("\n^C")
-                return False
-            except Exception as e:
-                console.print(f"[red]Error executing command:[/red] {e}")
-                return False
+            if not segment_success:
+                overall_success = False
         
-        return True
+        return overall_success
 
     def run(self):
         """Run the interactive shell."""
