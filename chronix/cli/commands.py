@@ -1,9 +1,10 @@
 """Command implementations for the chronix CLI."""
 
-from datetime import datetime, timezone, timedelta, date
+from datetime import datetime, timezone, timedelta, date, time
 from typing import Optional
 from pathlib import Path
 import json
+from zoneinfo import ZoneInfo
 
 from chronix.integrations.google_docs.client import GoogleDocsClient
 from chronix.integrations.google_docs.parser import GoogleDocsParser
@@ -26,6 +27,72 @@ from chronix.cli.formatting import (
     print_success,
     print_info,
 )
+
+
+def parse_clock_time(value: str) -> time:
+    """
+    Parse HH:MM time format from string.
+    
+    Args:
+        value: Time string in HH:MM 24-hour format
+        
+    Returns:
+        time object
+        
+    Raises:
+        ValueError: If format is invalid or values are out of range
+    """
+    if not isinstance(value, str):
+        raise ValueError(f"Invalid time '{value}'. Expected HH:MM in 24-hour format.")
+    
+    parts = value.split(':')
+    if len(parts) != 2:
+        raise ValueError(f"Invalid time '{value}'. Expected HH:MM in 24-hour format.")
+    
+    # Enforce exactly 2 digits for both hour and minute
+    if len(parts[0]) != 2 or len(parts[1]) != 2:
+        raise ValueError(f"Invalid time '{value}'. Expected HH:MM in 24-hour format.")
+    
+    try:
+        hour = int(parts[0])
+        minute = int(parts[1])
+    except ValueError:
+        raise ValueError(f"Invalid time '{value}'. Expected HH:MM in 24-hour format.")
+    
+    if hour < 0 or hour > 23:
+        raise ValueError(f"Invalid time '{value}'. Hour must be between 00 and 23.")
+    
+    if minute < 0 or minute > 59:
+        raise ValueError(f"Invalid time '{value}'. Minute must be between 00 and 59.")
+    
+    return time(hour=hour, minute=minute)
+
+
+def resolve_today_start_datetime(
+    time_override: Optional[str],
+    today_date: date,
+    tz: ZoneInfo
+) -> datetime:
+    """
+    Resolve the effective start datetime for today's schedule.
+    
+    Args:
+        time_override: Optional HH:MM time string, or None for current time
+        today_date: Today's date in the configured timezone
+        tz: Timezone to use
+        
+    Returns:
+        timezone-aware datetime for the schedule start point
+        
+    Raises:
+        ValueError: If time_override format is invalid
+    """
+    if time_override is None:
+        now = datetime.now(tz)
+        return now
+    
+    parsed_time = parse_clock_time(time_override)
+    return datetime.combine(today_date, parsed_time, tzinfo=tz)
 
 
 class ChronixContext:
@@ -156,18 +223,36 @@ def today_command(args: list[str]) -> int:
     """
     Today command: Display today's scheduled tasks.
 
-    Usage: today
+    Usage: today [HH:MM]
+    
+    Optional HH:MM argument specifies the start time for scheduling today.
+    If not provided, uses current time. Times are in 24-hour format.
     """
     try:
+        # Validate arguments
+        if len(args) > 1:
+            print_error(f"today command takes at most 1 argument, got {len(args)}")
+            return 1
+        
+        time_override = args[0] if args else None
+        
+        # Validate time format if provided
+        if time_override is not None:
+            try:
+                parse_clock_time(time_override)
+            except ValueError as e:
+                print_error(str(e))
+                return 1
+        
         if not _context.projects:
             print_warning("No projects loaded. Run 'sync' first.")
             return 1
 
         console.print("[dim]Generating today's schedule...[/dim]")
 
+
         # Load configuration
         from chronix.config import ChronixConfig, config_to_time_blocks, get_work_window
-        from zoneinfo import ZoneInfo
 
         config = _context.config or ChronixConfig.load_or_default()
         tz = ZoneInfo(config.scheduling.timezone)
@@ -187,9 +272,14 @@ def today_command(args: list[str]) -> int:
         # Get work window from config
         work_start, work_end = get_work_window(config, today)
 
-        # If it's already past work start, use current time
-        if now > work_start:
-            work_start = now
+        # Determine the effective start time
+        if time_override is not None:
+            # User provided explicit time; use it even if it's in the past
+            work_start = resolve_today_start_datetime(time_override, today, tz)
+        else:
+            # Use current time if already past work start
+            if now > work_start:
+                work_start = now
 
         # Ensure work_end doesn't go past midnight (limit to current day)
         end_of_today = datetime.combine(
@@ -445,7 +535,7 @@ def help_command(args: list[str]) -> int:
     
     commands_table = [
         ("sync", "Fetch and parse all configured project documents"),
-        ("today", "Display today's scheduled tasks (until end of day)"),
+        ("today [HH:MM]", "Display today's scheduled tasks from optional start time"),
         ("schedule [days]", "Display multi-day schedule (default: 3 days)"),
         ("explain <task_id>", "Show details and scheduling info for a task"),
         ("config <cmd>", "Manage configuration (init, show, validate)"),
