@@ -95,6 +95,100 @@ def resolve_today_start_datetime(
     return datetime.combine(today_date, parsed_time, tzinfo=tz)
 
 
+def _generate_today_schedule(time_override: Optional[str] = None) -> tuple[DaySchedule, datetime, datetime]:
+    """
+    Generate today's schedule (shared logic for `today` and `calendar` commands).
+    
+    Returns:
+        Tuple of (day_schedule, work_start, work_end)
+        
+    Raises:
+        RuntimeError: If no projects loaded
+        ValueError: If time override format is invalid
+    """
+    if not _context.projects:
+        raise RuntimeError("No projects loaded. Run 'sync' first.")
+    
+    from chronix.config import ChronixConfig, config_to_time_blocks, get_work_window
+    
+    config = _context.config or ChronixConfig.load_or_default()
+    tz = ZoneInfo(config.scheduling.timezone)
+    
+    # Validate time format early if provided
+    if time_override is not None:
+        try:
+            parse_clock_time(time_override)
+        except ValueError as e:
+            raise ValueError(str(e))
+    
+    # Aggregate all tasks
+    aggregator = TaskAggregator()
+    aggregated_tasks = aggregator.aggregate(_context.projects)
+    task_pool = aggregator.get_task_pool(aggregated_tasks)
+    incomplete_tasks = [t for t in task_pool if not t.completed]
+    
+    # Get today's date and time
+    now = datetime.now(tz)
+    today = now.date()
+    
+    # Get work window from config
+    work_start, work_end = get_work_window(config, today)
+    
+    # Determine effective start time
+    if time_override is not None:
+        work_start = resolve_today_start_datetime(time_override, today, tz)
+    else:
+        if now > work_start:
+            work_start = now
+    
+    # Limit work_end to end of day
+    end_of_today = datetime.combine(
+        today,
+        datetime.max.time(),
+        tzinfo=tz
+    ).replace(hour=23, minute=59, second=59)
+    
+    if work_end > end_of_today:
+        work_end = end_of_today
+    
+    # Get blocked time
+    blocked_time = config_to_time_blocks(config, today)
+    
+    # Add ad-hoc meetings as blocked time
+    for meeting in _context.ad_hoc_meetings:
+        if meeting.start.date() == today:
+            blocked_time.append(meeting.to_time_block())
+    
+    # Filter blocked time to work hours
+    blocked_time = [
+        block for block in blocked_time
+        if block.start < work_end and block.end > work_start
+    ]
+    
+    # Schedule tasks
+    scheduler = SchedulingEngine()
+    day_schedule = scheduler.schedule_tasks(
+        tasks=incomplete_tasks,
+        start_time=work_start,
+        blocked_time=blocked_time
+    )
+    
+    # Filter to today's tasks
+    today_scheduled_tasks = [
+        st for st in day_schedule.scheduled_tasks
+        if st.start.date() == today
+    ]
+    
+    day_schedule = DaySchedule(
+        date=day_schedule.date,
+        scheduled_tasks=today_scheduled_tasks,
+        blocked_time=day_schedule.blocked_time,
+        conflicts=day_schedule.conflicts
+    )
+    
+    return day_schedule, work_start, work_end
+
+
 class ChronixContext:
     """Shared context for chronix commands."""
 
@@ -236,101 +330,12 @@ def today_command(args: list[str]) -> int:
         
         time_override = args[0] if args else None
         
-        # Validate time format if provided
-        if time_override is not None:
-            try:
-                parse_clock_time(time_override)
-            except ValueError as e:
-                print_error(str(e))
-                return 1
-        
-        if not _context.projects:
-            print_warning("No projects loaded. Run 'sync' first.")
-            return 1
-
         console.print("[dim]Generating today's schedule...[/dim]")
-
-
-        # Load configuration
-        from chronix.config import ChronixConfig, config_to_time_blocks, get_work_window
-
-        config = _context.config or ChronixConfig.load_or_default()
-        tz = ZoneInfo(config.scheduling.timezone)
-
-        # Aggregate all tasks
-        aggregator = TaskAggregator()
-        aggregated_tasks = aggregator.aggregate(_context.projects)
-        task_pool = aggregator.get_task_pool(aggregated_tasks)
-
-        # Filter incomplete tasks only
-        incomplete_tasks = [t for t in task_pool if not t.completed]
-
-        # Get today's date and time
-        now = datetime.now(tz)
-        today = now.date()
-
-        # Get work window from config
-        work_start, work_end = get_work_window(config, today)
-
-        # Determine the effective start time
-        if time_override is not None:
-            # User provided explicit time; use it even if it's in the past
-            work_start = resolve_today_start_datetime(time_override, today, tz)
-        else:
-            # Use current time if already past work start
-            if now > work_start:
-                work_start = now
-
-        # Ensure work_end doesn't go past midnight (limit to current day)
-        end_of_today = datetime.combine(
-            today,
-            datetime.max.time(),
-            tzinfo=tz
-        ).replace(hour=23, minute=59, second=59)
-
-        if work_end > end_of_today:
-            work_end = end_of_today
-
-        # Get blocked time from configuration
-        blocked_time = config_to_time_blocks(config, today)
-
-        # Add ad-hoc meetings as blocked time
-        today_date = today
-        for meeting in _context.ad_hoc_meetings:
-            if meeting.start.date() == today_date:
-                blocked_time.append(meeting.to_time_block())
-
-        # Filter blocked time to only include blocks within work hours
-        blocked_time = [
-            block for block in blocked_time
-            if block.start < work_end and block.end > work_start
-        ]
-
-        # Schedule tasks
-        scheduler = SchedulingEngine()
-        day_schedule = scheduler.schedule_tasks(
-            tasks=incomplete_tasks,
-            start_time=work_start,
-            blocked_time=blocked_time
-        )
         
-        # Filter scheduled tasks to only include segments within today
-        # This prevents showing tasks that spill into tomorrow
-        today_scheduled_tasks = [
-            st for st in day_schedule.scheduled_tasks
-            if st.start.date() == today
-        ]
+        day_schedule, work_start, work_end = _generate_today_schedule(time_override)
         
-        # Update the day_schedule with filtered tasks
-        day_schedule = DaySchedule(
-            date=day_schedule.date,
-            scheduled_tasks=today_scheduled_tasks,
-            blocked_time=day_schedule.blocked_time,
-            conflicts=day_schedule.conflicts
-        )
-
         # Display schedule
-        print_schedule_header(day_schedule.date, work_start, work_end, config.scheduling.timezone)
+        print_schedule_header(day_schedule.date, work_start, work_end, "UTC")
         
         _display_continuous_timeline(day_schedule, work_start, work_end)
         
@@ -352,8 +357,102 @@ def today_command(args: list[str]) -> int:
         
         return 0
     
+    except (RuntimeError, ValueError) as e:
+        print_error(f"Failed to generate schedule: {str(e)}")
+        return 1
     except Exception as e:
         print_error(f"Failed to generate schedule: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+def calendar_command(args: list[str]) -> int:
+    """
+    Calendar command: Sync today's schedule to Google Calendar.
+
+    Usage: calendar [HH:MM] [--force]
+    
+    Optional HH:MM argument specifies the start time for scheduling today.
+    --force flag allows overwriting conflicting non-Chronix calendar events.
+    """
+    try:
+        # Parse arguments
+        time_override = None
+        force = False
+        
+        for arg in args:
+            if arg == '--force':
+                force = True
+            elif arg.startswith('--'):
+                print_error(f"Unknown flag: {arg}")
+                return 1
+            else:
+                if time_override is not None:
+                    print_error(f"calendar command takes at most 1 time argument")
+                    return 1
+                time_override = arg
+        
+        console.print("[dim]Generating and syncing today's schedule to Google Calendar...[/dim]")
+        
+        day_schedule, work_start, work_end = _generate_today_schedule(time_override)
+        
+        # Sync to Google Calendar
+        from chronix.integrations.google_calendar import CalendarSyncService
+        sync_service = CalendarSyncService()
+        
+        sync_result = sync_service.sync(
+            day_schedule=day_schedule,
+            sync_start=work_start,
+            sync_end=work_end,
+            force=force
+        )
+        
+        if not sync_result.success:
+            if sync_result.conflicts:
+                print_error("Calendar sync failed due to conflicting events:")
+                for conflict in sync_result.conflicts:
+                    print_error(f"  - {conflict.calendar_event_title} ({conflict.calendar_event_start} - {conflict.calendar_event_end})")
+                    print_error(f"    conflicts with {conflict.chronix_task_title}")
+                print_info("Rerun with --force to overwrite, or resolve conflicts manually.")
+            else:
+                print_error(f"Calendar sync failed: {sync_result.error_message}")
+            return 1
+        
+        # Print sync summary
+        print_success(f"Calendar sync completed:")
+        print_info(f"  Created: {sync_result.created_count} events")
+        print_info(f"  Updated: {sync_result.updated_count} events")
+        print_info(f"  Deleted: {sync_result.deleted_count} events")
+        print_info(f"  Shortened: {sync_result.shortened_count} events")
+        print()
+        
+        # Display schedule (same as today command)
+        print_schedule_header(day_schedule.date, work_start, work_end, "UTC")
+        
+        _display_continuous_timeline(day_schedule, work_start, work_end)
+        
+        # Show conflicts
+        if day_schedule.conflicts:
+            print_conflicts(day_schedule.conflicts)
+        
+        # Summary
+        total_duration = sum(
+            (st.end - st.start for st in day_schedule.scheduled_tasks),
+            timedelta()
+        )
+        
+        print_timeline_footer(
+            total_duration=total_duration,
+            num_scheduled=len(day_schedule.scheduled_tasks),
+            num_conflicts=len(day_schedule.conflicts)
+        )
+        
+        return 0
+    
+    except (RuntimeError, ValueError) as e:
+        print_error(f"Failed to sync calendar: {str(e)}")
+        return 1
+    except Exception as e:
+        print_error(f"Failed to sync calendar: {e}")
         import traceback
         traceback.print_exc()
         return 1
@@ -536,6 +635,7 @@ def help_command(args: list[str]) -> int:
     commands_table = [
         ("sync", "Fetch and parse all configured project documents"),
         ("today [HH:MM]", "Display today's scheduled tasks from optional start time"),
+        ("calendar [HH:MM] [--force]", "Sync today's schedule to Google Calendar"),
         ("schedule [days]", "Display multi-day schedule (default: 3 days)"),
         ("explain <task_id>", "Show details and scheduling info for a task"),
         ("config <cmd>", "Manage configuration (init, show, validate)"),
