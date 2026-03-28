@@ -63,7 +63,8 @@ class TaskParser:
     
     METADATA_PATTERN = re.compile(r'^(.*?)\s*:::\s*(.+)$')
     DURATION_PATTERN = re.compile(r'^(\d+)(hours?|minutes?)$', re.IGNORECASE)
-    TASK_IDENTIFIER = "TASKS ::: duration; external_deadline; user_deadline; ref; depends"
+    TASK_IDENTIFIER = "TASKS ::: duration; external_deadline; user_deadline; ref; depends; mode"
+    VALID_MODES = {"atomic", "flex", "contiguous_preferred"}
 
     def parse_task_line(
         self, 
@@ -145,6 +146,7 @@ class TaskParser:
 
         ref = None
         depends_on = []
+        execution_mode = None
 
         for field_str in extra_fields:
             if '=' not in field_str:
@@ -159,19 +161,35 @@ class TaskParser:
             elif key == 'depends':
                 if value:
                     depends_on = [d.strip() for d in value.split(',') if d.strip()]
+            elif key == 'mode':
+                if value:
+                    if value not in self.VALID_MODES:
+                        raise TaskParseError(
+                            message=f"Invalid execution mode: '{value}'. "
+                                    f"Valid modes: atomic, flex, contiguous_preferred",
+                            raw_text=text,
+                            field="mode",
+                            value=value
+                        )
+                    execution_mode = value
 
         completed = bullet.get('has_strikethrough', False)
 
-        return Task(
-            title=title,
-            estimated_duration=duration,
-            deadline_external=external_deadline,
-            deadline_user=user_deadline,
-            completed=completed,
-            source=source,
-            ref=ref,
-            depends_on=depends_on
-        )
+        task_kwargs = {
+            'title': title,
+            'estimated_duration': duration,
+            'deadline_external': external_deadline,
+            'deadline_user': user_deadline,
+            'completed': completed,
+            'source': source,
+            'ref': ref,
+            'depends_on': depends_on
+        }
+        
+        if execution_mode is not None:
+            task_kwargs['execution_mode'] = execution_mode
+
+        return Task(**task_kwargs)
 
     def _parse_duration(self, duration_str: str, raw_text: Optional[str] = None) -> timedelta:
         """Parse duration string into timedelta."""

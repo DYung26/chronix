@@ -1,9 +1,12 @@
 """Domain models for tasks and related entities."""
 
 from datetime import datetime, date, timedelta, timezone
-from typing import Optional
+from typing import Optional, Literal
 from pydantic import BaseModel, field_validator, model_validator
 import secrets
+
+
+ExecutionMode = Literal["atomic", "flex", "contiguous_preferred"]
 
 
 class Task(BaseModel):
@@ -20,6 +23,7 @@ class Task(BaseModel):
     source: str
     ref: Optional[str] = None
     depends_on: list[str] = []
+    execution_mode: ExecutionMode = "atomic"
 
     @model_validator(mode="before")
     @classmethod
@@ -27,6 +31,25 @@ class Task(BaseModel):
         if isinstance(values, dict):
             if not values.get("id"):
                 values["id"] = secrets.token_urlsafe(6)
+        return values
+
+    @model_validator(mode="before")
+    @classmethod
+    def set_default_execution_mode(cls, values):
+        if isinstance(values, dict) and "execution_mode" not in values:
+            duration = values.get("estimated_duration")
+            if duration is not None:
+                if isinstance(duration, timedelta):
+                    total_minutes = duration.total_seconds() / 60
+                elif isinstance(duration, (int, float)):
+                    total_minutes = duration / 60 if duration > 60 else duration
+                else:
+                    total_minutes = 0
+                
+                if total_minutes <= 90:
+                    values["execution_mode"] = "atomic"
+                else:
+                    values["execution_mode"] = "flex"
         return values
 
     @field_validator("estimated_duration")
