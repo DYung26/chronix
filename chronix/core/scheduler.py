@@ -7,6 +7,13 @@ from collections import defaultdict
 from chronix.core.models import Task, TimeBlock, ScheduledTask, DaySchedule
 
 
+# Chunk policy constants
+WHOLE_TASK_THRESHOLD = timedelta(minutes=90)
+DEFAULT_TARGET_CHUNK = timedelta(minutes=90)
+DEFAULT_MIN_CHUNK = timedelta(minutes=60)
+DEFAULT_MAX_CHUNKS_PER_DAY = 2
+
+
 class SchedulingEngine:
     """Places ordered tasks into time slots while respecting blocked time."""
 
@@ -147,6 +154,7 @@ class SchedulingEngine:
         - Handles task interleaving and resumption
         - Still schedules tasks even when deadlines are impossible (flags violations)
         - Respects dependency constraints (tasks cannot start until dependencies complete)
+        - Applies execution mode policies: atomic, flex, contiguous_preferred
         
         Returns:
             (list of scheduled task segments, list of conflict messages)
@@ -168,6 +176,9 @@ class SchedulingEngine:
         # Track segments as (task, start, end) tuples
         segments_by_task = defaultdict(list)
         
+        # Track chunks scheduled per task per calendar day
+        chunks_scheduled_today = defaultdict(lambda: defaultdict(int))
+        
         # Keep scheduling until all work is done
         while any(duration > timedelta(0) for duration in remaining_work.values()):
             # Find the next task to schedule
@@ -176,7 +187,8 @@ class SchedulingEngine:
                 remaining_work,
                 current_time,
                 blocked_time,
-                completion_times
+                completion_times,
+                chunks_scheduled_today
             )
             
             if task_to_schedule is None:
@@ -192,11 +204,22 @@ class SchedulingEngine:
                     dep_completion = completion_times[dep_task.id]
                     earliest_allowed_start = max(earliest_allowed_start, dep_completion)
             
-            # Schedule a segment of this task
-            segment, next_time = self._schedule_task_segment(
+            # Determine chunk size based on execution mode
+            desired_chunk = self._determine_desired_chunk(
+                task_to_schedule,
+                remaining_work[task_to_schedule.id],
+                current_time,
+                earliest_allowed_start,
+                blocked_time,
+                chunks_scheduled_today
+            )
+            
+            # Schedule a segment of this chunk
+            segment, next_time = self._schedule_task_chunk(
                 task=task_to_schedule,
                 earliest_start=earliest_allowed_start,
                 blocked_time=blocked_time,
+                desired_chunk_duration=desired_chunk,
                 remaining_duration=remaining_work[task_to_schedule.id]
             )
             
@@ -205,6 +228,10 @@ class SchedulingEngine:
                 segments_by_task[task_to_schedule.id].append((task_to_schedule, start, end))
                 segment_duration = end - start
                 remaining_work[task_to_schedule.id] -= segment_duration
+                
+                # Track chunk completion
+                day_date = start.date()
+                chunks_scheduled_today[task_to_schedule.id][day_date] += 1
                 
                 if remaining_work[task_to_schedule.id] <= timedelta(0):
                     completion_times[task_to_schedule.id] = end
@@ -225,7 +252,8 @@ class SchedulingEngine:
         remaining_work: dict[str, timedelta],
         current_time: datetime,
         blocked_time: list[TimeBlock],
-        completion_times: Optional[dict[str, datetime]] = None
+        completion_times: Optional[dict[str, datetime]] = None,
+        chunks_scheduled_today: Optional[dict[str, dict]] = None
     ) -> Optional[Task]:
         """
         Select the next task to schedule using urgency-aware logic.
@@ -237,11 +265,15 @@ class SchedulingEngine:
         4. Prioritize tasks that:
            - Have all dependencies completed
            - Have deadlines that are becoming critical
+           - Can place a valid chunk now under mode rules
            - Can fit without violating other critical deadlines
         5. Fall back to sorted order if no urgency differentiation
         """
         if completion_times is None:
             completion_times = {}
+        
+        if chunks_scheduled_today is None:
+            chunks_scheduled_today = defaultdict(lambda: defaultdict(int))
         
         candidates = [t for t in tasks if remaining_work.get(t.id, timedelta(0)) > timedelta(0)]
         
@@ -260,7 +292,21 @@ class SchedulingEngine:
                     return False
             return True
         
-        available = [t for t in candidates if deps_satisfied(t)]
+        def can_place_chunk(task: Task) -> bool:
+            chunk = self._determine_desired_chunk(
+                task,
+                remaining_work.get(task.id, timedelta(0)),
+                current_time,
+                current_time,
+                blocked_time,
+                chunks_scheduled_today
+            )
+            return chunk > timedelta(0)
+        
+        available = [
+            t for t in candidates 
+            if deps_satisfied(t) and can_place_chunk(t)
+        ]
         
         if not available:
             return None
@@ -273,7 +319,7 @@ class SchedulingEngine:
         urgency_scores.sort(key=lambda x: x[0])
         
         for urgency, task in urgency_scores:
-            if self._is_safe_to_schedule(task, current_time, remaining_work, available, blocked_time):
+            if self._is_safe_to_schedule_chunk(task, current_time, remaining_work, available, blocked_time):
                 return task
         
         return urgency_scores[0][1] if urgency_scores else None
@@ -338,13 +384,15 @@ class SchedulingEngine:
         - It's an external deadline (hard constraint)
         - OR it's a user deadline that's becoming urgent (less than 2x the time needed)
         
+        This version reasons about a typical chunk, not the entire remaining task.
         Returns True if safe to schedule, False if it would endanger critical deadlines.
         """
-        # Estimate when this task would finish if scheduled now
+        # Estimate when a typical chunk of this task would finish if scheduled now
         task_remaining = remaining_work.get(task.id, timedelta(0))
-        estimated_end = self._estimate_completion_time(
-            current_time, task_remaining, blocked_time
+        typical_chunk = self._determine_desired_chunk(
+            task, task_remaining, current_time, current_time, blocked_time, {}
         )
+        estimated_end = self._estimate_completion_time(current_time, typical_chunk, blocked_time)
         
         # Check each other task with a deadline
         for other_task in all_tasks:
@@ -381,6 +429,17 @@ class SchedulingEngine:
                 return False
         
         return True
+
+    def _is_safe_to_schedule_chunk(
+        self,
+        task: Task,
+        current_time: datetime,
+        remaining_work: dict[str, timedelta],
+        all_tasks: list[Task],
+        blocked_time: list[TimeBlock]
+    ) -> bool:
+        """Alias for _is_safe_to_schedule for clarity in chunk-aware context."""
+        return self._is_safe_to_schedule(task, current_time, remaining_work, all_tasks, blocked_time)
 
     def _estimate_completion_time(
         self,
@@ -423,6 +482,120 @@ class SchedulingEngine:
         """Calculate effective duration needed accounting for blocked time."""
         completion_time = self._estimate_completion_time(start, duration, blocked_time)
         return completion_time - start
+
+    def _determine_desired_chunk(
+        self,
+        task: Task,
+        remaining_work: timedelta,
+        current_time: datetime,
+        earliest_start: datetime,
+        blocked_time: list[TimeBlock],
+        chunks_scheduled_today: dict[str, dict]
+    ) -> timedelta:
+        """
+        Determine the desired chunk size for a task based on execution mode.
+        
+        Returns the duration to try to schedule, or timedelta(0) if chunk cap exceeded
+        without deadline pressure.
+        """
+        if remaining_work <= timedelta(0):
+            return timedelta(0)
+        
+        day_date = earliest_start.date()
+        chunks_today = chunks_scheduled_today.get(task.id, {}).get(day_date, 0)
+        
+        if task.execution_mode == "atomic":
+            # Atomic: try to schedule entire remaining work as one chunk
+            return remaining_work
+        
+        elif task.execution_mode == "flex":
+            # Flex: intelligent chunking with daily cap
+            if remaining_work <= WHOLE_TASK_THRESHOLD:
+                # Small task: schedule as one chunk
+                return remaining_work
+            
+            # Large task: chunk it
+            # Check daily cap
+            if chunks_today >= DEFAULT_MAX_CHUNKS_PER_DAY:
+                # Cap reached; can schedule smaller chunk if deadline pressure exists
+                if task.effective_deadline:
+                    time_until_deadline = task.effective_deadline - current_time
+                    if time_until_deadline <= timedelta(minutes=120):  # Deadline in 2 hours or less
+                        return min(remaining_work, DEFAULT_MIN_CHUNK)
+                # No deadline pressure; defer to next day
+                return timedelta(0)
+            
+            # Within daily cap; schedule target chunk
+            if remaining_work < DEFAULT_TARGET_CHUNK:
+                return remaining_work
+            elif remaining_work < DEFAULT_MIN_CHUNK:
+                return remaining_work
+            else:
+                return DEFAULT_TARGET_CHUNK
+        
+        elif task.execution_mode == "contiguous_preferred":
+            # Contiguous preferred: larger chunk first, then fallback
+            if remaining_work <= WHOLE_TASK_THRESHOLD:
+                return remaining_work
+            
+            # Check daily cap
+            if chunks_today >= DEFAULT_MAX_CHUNKS_PER_DAY:
+                if task.effective_deadline:
+                    time_until_deadline = task.effective_deadline - current_time
+                    if time_until_deadline <= timedelta(minutes=120):
+                        return min(remaining_work, DEFAULT_MIN_CHUNK)
+                return timedelta(0)
+            
+            # Try larger chunk (1.5x target)
+            larger_chunk = DEFAULT_TARGET_CHUNK + timedelta(minutes=45)
+            if remaining_work >= larger_chunk:
+                return larger_chunk
+            elif remaining_work >= DEFAULT_TARGET_CHUNK:
+                return DEFAULT_TARGET_CHUNK
+            elif remaining_work >= DEFAULT_MIN_CHUNK:
+                return remaining_work
+            else:
+                return remaining_work
+        
+        # Fallback (should not reach)
+        return remaining_work
+
+    def _schedule_task_chunk(
+        self,
+        task: Task,
+        earliest_start: datetime,
+        blocked_time: list[TimeBlock],
+        desired_chunk_duration: timedelta,
+        remaining_duration: timedelta
+    ) -> tuple[Optional[tuple[datetime, datetime]], datetime]:
+        """
+        Schedule one chunk of a task, using blocked-time-aware segmentation.
+        
+        This method determines how much work to place (the chunk), then uses
+        the existing blocked-time segmentation logic to place it across blocks.
+        
+        Returns ((start, end), next_available_time) or (None, next_available_time)
+        """
+        if desired_chunk_duration <= timedelta(0):
+            # No chunk to place; skip to next available time after any blocks
+            current = earliest_start
+            while True:
+                next_block = self._find_next_block(current, blocked_time)
+                if next_block is None or next_block.start >= current:
+                    break
+                current = next_block.end
+            return None, current
+        
+        # How much work can we actually place?
+        actual_chunk = min(desired_chunk_duration, remaining_duration)
+        
+        # Use existing segment scheduling to handle blocked time
+        return self._schedule_task_segment(
+            task=task,
+            earliest_start=earliest_start,
+            blocked_time=blocked_time,
+            remaining_duration=actual_chunk
+        )
 
     def _schedule_task_segment(
         self,

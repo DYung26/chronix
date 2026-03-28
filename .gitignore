@@ -153,6 +153,6 @@ Thumbs.db
 .settings/
 
 # Project-specific files
-todo.md
-note.md
 docs/
+tests/
+tests/
