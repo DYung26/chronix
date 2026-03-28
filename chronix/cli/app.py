@@ -12,6 +12,7 @@ from chronix.cli.commands import (
     sync_command,
     today_command,
     calendar_command,
+    documents_command,
     schedule_command,
     explain_command,
     help_command
@@ -29,6 +30,7 @@ class ChronixShell:
             'sync': sync_command,
             'today': today_command,
             'calendar': calendar_command,
+            'documents': documents_command,
             'schedule': schedule_command,
             'explain': explain_command,
             'config': config_command,

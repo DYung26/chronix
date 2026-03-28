@@ -144,7 +144,7 @@ chronix config validate  # Validate configuration
 Each Google Docs document must contain a special identifier line in each tab that has tasks. This line identifies the checkbox list used for tasks:
 
 ```
-TASKS ::: duration; external_deadline; user_deadline; ref; depends
+TASKS ::: duration; external_deadline; user_deadline; ref; depends; mode
 ```
 
 **Important**: This identifier line must be a checkbox item, but is NOT treated as a task itself.

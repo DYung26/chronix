@@ -210,13 +210,30 @@ class ChronixContext:
 _context = ChronixContext()
 
 
+def _find_configured_document(document_id: str, config: 'ChronixConfig') -> Optional[str]:
+    """Find a configured document by exact ID. Returns the ID if found, None otherwise."""
+    if document_id in config.google_docs.document_ids:
+        return document_id
+    return None
+
+
 def sync_command(args: list[str]) -> int:
     """
-    Sync command: Fetch and parse all configured project documents.
+    Sync command: Fetch and parse configured project documents.
     
-    Usage: sync
+    Usage: sync [document_id]
+    
+    With no argument: syncs all configured documents
+    With document_id: syncs only that document (must be configured)
     """
     try:
+        # Parse arguments
+        if len(args) > 1:
+            print_error("sync accepts at most one document_id argument")
+            return 1
+        
+        document_id_filter = args[0] if args else None
+        
         console.print("[dim]Starting sync...[/dim]")
 
         # Load configuration
@@ -234,6 +251,14 @@ def sync_command(args: list[str]) -> int:
             print_warning("No documents configured in your config file.")
             console.print(f"Edit [cyan]{ChronixConfig.get_default_path()}[/cyan] and add document_ids to sync.")
             return 1
+        
+        # If a specific document was requested, validate it exists
+        if document_id_filter:
+            if not _find_configured_document(document_id_filter, config):
+                print_error(f"Unknown document ID '{document_id_filter}'")
+                console.print("Run [cyan]chronix documents[/cyan] to see configured documents.")
+                return 1
+            document_ids = [document_id_filter]
 
         # Initialize client and authenticate
         client = _context._ensure_google_client()
@@ -282,9 +307,35 @@ def sync_command(args: list[str]) -> int:
                 console.print(f"  [red]✗[/red] Failed to fetch document {doc_id}: {e}")
                 continue
 
-        # Update context
-        _context.projects = projects
-        _context.ad_hoc_meetings = all_meetings
+        # Update context: merge or replace
+        if document_id_filter:
+            # Single document sync: merge into existing context
+            if _context.projects:
+                # Find and replace the document in existing context
+                updated_projects = []
+                synced_doc_ids = {p.project_context.document_id for p in projects}
+                
+                for existing_project in _context.projects:
+                    if existing_project.project_context.document_id not in synced_doc_ids:
+                        # Keep other documents
+                        updated_projects.append(existing_project)
+                
+                # Add the newly synced document(s)
+                updated_projects.extend(projects)
+                _context.projects = updated_projects
+                _context.ad_hoc_meetings.extend(all_meetings)
+            else:
+                # No prior context: warn user
+                _context.projects = projects
+                _context.ad_hoc_meetings = all_meetings
+                print_warning("Synced single document with no prior context.")
+                console.print("[dim]For complete task aggregation across all documents, run:[/dim]")
+                console.print("[cyan]  chronix sync[/cyan]")
+        else:
+            # Full sync: replace context entirely
+            _context.projects = projects
+            _context.ad_hoc_meetings = all_meetings
+        
         _context.last_sync = datetime.now(timezone.utc)
         _context.config = config
 
@@ -622,6 +673,54 @@ def explain_command(args: list[str]) -> int:
         return 1
 
 
+def documents_command(args: list[str]) -> int:
+    """
+    Documents command: List all configured documents.
+    
+    Usage: documents
+    """
+    if args:
+        print_error("documents command takes no arguments")
+        return 1
+    
+    try:
+        from chronix.config import ChronixConfig
+        
+        config = ChronixConfig.load_or_default()
+        document_ids = config.google_docs.document_ids
+        
+        if not document_ids:
+            print_warning("No documents configured in your config file.")
+            console.print(f"Edit [cyan]{ChronixConfig.get_default_path()}[/cyan] and add document_ids.")
+            return 0
+        
+        console.print()
+        console.print("[bold]Configured documents:[/bold]")
+        console.print()
+        
+        # Get document titles from context if available (from previous sync)
+        doc_titles = {}
+        if _context.projects:
+            doc_titles = {
+                p.project_context.document_id: p.project_context.project_name
+                for p in _context.projects
+                if p.project_context.document_id
+            }
+        
+        for doc_id in document_ids:
+            title = doc_titles.get(doc_id, "(not synced yet)")
+            console.print(f"  [cyan]{doc_id}[/cyan]  {title}")
+        
+        console.print()
+        console.print(f"Use [cyan]sync <document_id>[/cyan] to sync a specific document")
+        console.print()
+        return 0
+    
+    except Exception as e:
+        print_error(f"Failed to list documents: {e}")
+        return 1
+
+
 def help_command(args: list[str]) -> int:
     """
     Help command: Show available commands.
@@ -633,7 +732,9 @@ def help_command(args: list[str]) -> int:
     console.print()
     
     commands_table = [
-        ("sync", "Fetch and parse all configured project documents"),
+        ("sync", "Fetch and parse all configured documents or one by document_id"),
+        ("sync <document_id>", "Sync a specific document"),
+        ("documents", "List all configured documents"),
         ("today [HH:MM]", "Display today's scheduled tasks from optional start time"),
         ("calendar [HH:MM] [--force]", "Sync today's schedule to Google Calendar"),
         ("schedule [days]", "Display multi-day schedule (default: 3 days)"),

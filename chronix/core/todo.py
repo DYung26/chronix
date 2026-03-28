@@ -64,6 +64,7 @@ class TaskParser:
     METADATA_PATTERN = re.compile(r'^(.*?)\s*:::\s*(.+)$')
     DURATION_PATTERN = re.compile(r'^(\d+)(hours?|minutes?)$', re.IGNORECASE)
     TASK_IDENTIFIER = "TASKS ::: duration; external_deadline; user_deadline; ref; depends; mode"
+    OLD_TASK_IDENTIFIER = "TASKS ::: duration; external_deadline; user_deadline; ref; depends"
     VALID_MODES = {"atomic", "flex", "contiguous_preferred"}
 
     def parse_task_line(
@@ -105,8 +106,8 @@ class TaskParser:
         if not text:
             return None
 
-        # Exclude the identifier line itself (it's not a real task)
-        if text == self.TASK_IDENTIFIER:
+        # Exclude both old and new identifier lines (they're not real tasks)
+        if text == self.TASK_IDENTIFIER or text == self.OLD_TASK_IDENTIFIER:
             return None
 
         match = self.METADATA_PATTERN.match(text)
@@ -422,7 +423,7 @@ class TodoDeriver:
                     raise TaskParseError(
                         message=f"No checkbox list ID found in tab '{tab_title}'. "
                                 f"Tab must contain a checkbox line with text: "
-                                f"'TASKS ::: duration; external_deadline; user_deadline; ref; depends'",
+                                f"'TASKS ::: duration; external_deadline; user_deadline; ref; depends; mode'",
                         raw_text=None,
                         field="checkbox_list_id",
                         value=None
