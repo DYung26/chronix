@@ -129,6 +129,9 @@ class ChronixShell:
 
     def run(self):
         """Run the interactive shell."""
+        # Clear terminal on startup
+        os.system('cls' if os.name == 'nt' else 'clear')
+        
         self.running = True
         console.print("[bold cyan]chronix[/bold cyan] [dim]v0.1.0[/dim] — Interactive Shell")
         console.print("[dim]Type 'help' for available commands or 'exit' to quit.[/dim]\n")
@@ -175,6 +178,9 @@ class ChronixShell:
 
 def main():
     """Main CLI entry point."""
+    # Clear terminal on startup
+    os.system('cls' if os.name == 'nt' else 'clear')
+    
     shell = ChronixShell()
     
     if len(sys.argv) > 1:
