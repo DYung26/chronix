@@ -7,6 +7,8 @@ from typing import Optional
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import InMemoryHistory
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.document import Document
 
 from chronix.cli.commands import (
     sync_command,
@@ -43,10 +45,71 @@ class ChronixShell:
         
         # Set up command history with prompt_toolkit
         self.history = InMemoryHistory()
+        
+        # State for history navigation with temporary buffer
+        self.history_nav_buffer = None  # Stores original input when navigating history
+        self.history_nav_index = None   # Tracks current position in history during navigation
+        
+        # Set up key bindings for history navigation
+        kb = self._create_key_bindings()
+        
         self.prompt_session = PromptSession(
             history=self.history,
-            enable_history_search=True
+            enable_history_search=True,
+            key_bindings=kb
         )
+    
+    def _create_key_bindings(self) -> KeyBindings:
+        """Create custom key bindings for history navigation with buffer support."""
+        kb = KeyBindings()
+        
+        @kb.add('up')
+        def _(event):
+            """Navigate to previous command in history, preserving unsaved input."""
+            buffer = event.app.current_buffer
+            history_items = buffer.history.get_strings()
+            
+            # Initialize navigation state if not already navigating
+            if self.history_nav_index is None:
+                self.history_nav_buffer = buffer.text
+                # Start at the end of history (most recent)
+                self.history_nav_index = len(history_items) - 1
+            else:
+                self.history_nav_index -= 1
+            
+            # Ensure index stays within bounds
+            if self.history_nav_index < 0:
+                self.history_nav_index = 0
+            
+            # Get the history item and display it
+            if self.history_nav_index < len(history_items):
+                buffer.document = Document(history_items[self.history_nav_index], 
+                                          len(history_items[self.history_nav_index]))
+        
+        @kb.add('down')
+        def _(event):
+            """Navigate to next command in history, restoring saved input at the end."""
+            buffer = event.app.current_buffer
+            history_items = buffer.history.get_strings()
+            
+            # Only handle down if we're currently navigating history
+            if self.history_nav_index is not None:
+                self.history_nav_index += 1
+                
+                # If we've gone past the last history item, restore the original input
+                if self.history_nav_index >= len(history_items):
+                    buffer.document = Document(
+                        self.history_nav_buffer,
+                        len(self.history_nav_buffer)
+                    )
+                    self.history_nav_index = None
+                    self.history_nav_buffer = None
+                else:
+                    # Display the next history item
+                    buffer.document = Document(history_items[self.history_nav_index],
+                                              len(history_items[self.history_nav_index]))
+        
+        return kb
     
     def _exit_command(self, args: list[str]) -> int:
         """Exit the shell."""
@@ -153,9 +216,16 @@ class ChronixShell:
                 
                 user_input = self._read_continued_input(user_input)
                 self._execute_command_chain(user_input)
+                
+                # Reset history navigation state after command execution
+                self.history_nav_buffer = None
+                self.history_nav_index = None
             
             except KeyboardInterrupt:
                 console.print("\n[dim]Use 'exit' or 'quit' to leave the shell.[/dim]")
+                # Reset navigation state on interrupt
+                self.history_nav_buffer = None
+                self.history_nav_index = None
                 continue
             except EOFError:
                 console.print("\n[dim]Goodbye![/dim]")
