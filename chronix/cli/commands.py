@@ -159,18 +159,17 @@ def _generate_today_schedule(time_override: Optional[str] = None) -> tuple[DaySc
         if meeting.start.date() == today:
             blocked_time.append(meeting.to_time_block())
     
-    # Filter blocked time to work hours
-    blocked_time = [
+    # Schedule tasks
+    filtered_blocked = [
         block for block in blocked_time
         if block.start < work_end and block.end > work_start
     ]
     
-    # Schedule tasks
     scheduler = SchedulingEngine()
     day_schedule = scheduler.schedule_tasks(
         tasks=incomplete_tasks,
         start_time=work_start,
-        blocked_time=blocked_time
+        blocked_time=filtered_blocked
     )
     
     # Filter to today's tasks
@@ -821,11 +820,15 @@ def _display_continuous_timeline(day_schedule, work_start: datetime, work_end: d
     console.print("[bold]⏰ Today's Timeline[/bold]")
     console.print()
     
+    # Get display timezone from work_start
+    display_tz = work_start.tzinfo if work_start.tzinfo else None
+    
     for i, segment in enumerate(timeline, 1):
         print_timeline_segment(
             index=i,
             start=segment['start'],
             end=segment['end'],
             segment_type=segment['type'],
-            data=segment['data']
+            data=segment['data'],
+            display_tz=display_tz
         )

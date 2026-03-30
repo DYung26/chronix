@@ -78,9 +78,16 @@ def print_timeline_segment(
     start: datetime,
     end: datetime,
     segment_type: str,
-    data: Optional[any] = None
+    data: Optional[any] = None,
+    display_tz=None
 ):
     """Print a single timeline segment."""
+    # Convert to display timezone if provided
+    if display_tz and start.tzinfo:
+        start = start.astimezone(display_tz)
+    if display_tz and end.tzinfo:
+        end = end.astimezone(display_tz)
+    
     time_range = f"{start.strftime('%H:%M')} – {end.strftime('%H:%M')}"
     
     if segment_type == 'task':
