@@ -222,7 +222,7 @@ def sync_command(args: list[str]) -> int:
     
     Usage: sync [document_id]
     
-    With no argument: syncs all configured documents
+    With no argument: syncs all configured documents (continues on document-level failures)
     With document_id: syncs only that document (must be configured)
     """
     try:
@@ -235,7 +235,7 @@ def sync_command(args: list[str]) -> int:
         
         console.print("[dim]Starting sync...[/dim]")
 
-        # Load configuration
+        # Load configuration (global failure)
         from chronix.config import ChronixConfig
 
         try:
@@ -259,7 +259,7 @@ def sync_command(args: list[str]) -> int:
                 return 1
             document_ids = [document_id_filter]
 
-        # Initialize client and authenticate
+        # Initialize client and authenticate (global failure)
         client = _context._ensure_google_client()
         console.print("[dim]Authenticating with Google Docs...[/dim]")
 
@@ -274,37 +274,20 @@ def sync_command(args: list[str]) -> int:
 
         console.print("[dim]✓ Authenticated successfully[/dim]")
 
-        # Fetch and parse documents
+        # Sync each document with retry logic
+        from chronix.cli.sync_helpers import _sync_single_document_with_retries
+        
         projects = []
         all_meetings = []
-        parser = GoogleDocsParser()
-        deriver = TodoDeriver()
+        results = []
 
         for doc_id in document_ids:
-            console.print(f"[dim]Fetching document {doc_id}...[/dim]")
-
-            try:
-                doc = client.fetch_document(doc_id)
-                doc_structure = parser.parse_document(doc)
-
-                project_name = doc_structure.title
-
-                tasks = deriver.derive_todo_list(doc_structure.to_dict())
-                meetings = parse_document_meetings(doc_structure.to_dict())
-
-                project_todo = ProjectTodoList(
-                    project_name=project_name,
-                    tasks=tasks,
-                    document_id=doc_id
-                )
-                projects.append(project_todo)
+            result, project, meetings = _sync_single_document_with_retries(doc_id, client)
+            results.append(result)
+            
+            if result.outcome.value == "success":
+                projects.append(project)
                 all_meetings.extend(meetings)
-
-                console.print(f"  [green]✓[/green] [bold]{project_name}[/bold]: [cyan]{len(tasks)}[/cyan] tasks, [cyan]{len(meetings)}[/cyan] meetings")
-
-            except Exception as e:
-                console.print(f"  [red]✗[/red] Failed to fetch document {doc_id}: {e}")
-                continue
 
         # Update context: merge or replace
         if document_id_filter:
@@ -353,10 +336,13 @@ def sync_command(args: list[str]) -> int:
             num_projects=len(projects),
             total_tasks=total_tasks,
             incomplete_tasks=incomplete_tasks,
-            completed_tasks=completed_tasks
+            completed_tasks=completed_tasks,
+            sync_results=results
         )
 
-        return 0
+        # Determine exit code based on whether all syncs succeeded
+        has_failures = any(r.outcome.value != "success" for r in results)
+        return 1 if has_failures else 0
 
     except Exception as e:
         print_error(f"Sync failed: {e}")
