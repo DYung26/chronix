@@ -222,7 +222,7 @@ def sync_command(args: list[str]) -> int:
     
     Usage: sync [document_id]
     
-    With no argument: syncs all configured documents
+    With no argument: syncs all configured documents (continues on document-level failures)
     With document_id: syncs only that document (must be configured)
     """
     try:
@@ -235,7 +235,7 @@ def sync_command(args: list[str]) -> int:
         
         console.print("[dim]Starting sync...[/dim]")
 
-        # Load configuration
+        # Load configuration (global failure)
         from chronix.config import ChronixConfig
 
         try:
@@ -259,7 +259,7 @@ def sync_command(args: list[str]) -> int:
                 return 1
             document_ids = [document_id_filter]
 
-        # Initialize client and authenticate
+        # Initialize client and authenticate (global failure)
         client = _context._ensure_google_client()
         console.print("[dim]Authenticating with Google Docs...[/dim]")
 
@@ -274,37 +274,20 @@ def sync_command(args: list[str]) -> int:
 
         console.print("[dim]✓ Authenticated successfully[/dim]")
 
-        # Fetch and parse documents
+        # Sync each document with retry logic
+        from chronix.cli.sync_helpers import _sync_single_document_with_retries
+        
         projects = []
         all_meetings = []
-        parser = GoogleDocsParser()
-        deriver = TodoDeriver()
+        results = []
 
         for doc_id in document_ids:
-            console.print(f"[dim]Fetching document {doc_id}...[/dim]")
-
-            try:
-                doc = client.fetch_document(doc_id)
-                doc_structure = parser.parse_document(doc)
-
-                project_name = doc_structure.title
-
-                tasks = deriver.derive_todo_list(doc_structure.to_dict())
-                meetings = parse_document_meetings(doc_structure.to_dict())
-
-                project_todo = ProjectTodoList(
-                    project_name=project_name,
-                    tasks=tasks,
-                    document_id=doc_id
-                )
-                projects.append(project_todo)
+            result, project, meetings = _sync_single_document_with_retries(doc_id, client)
+            results.append(result)
+            
+            if result.outcome.value == "success":
+                projects.append(project)
                 all_meetings.extend(meetings)
-
-                console.print(f"  [green]✓[/green] [bold]{project_name}[/bold]: [cyan]{len(tasks)}[/cyan] tasks, [cyan]{len(meetings)}[/cyan] meetings")
-
-            except Exception as e:
-                console.print(f"  [red]✗[/red] Failed to fetch document {doc_id}: {e}")
-                continue
 
         # Update context: merge or replace
         if document_id_filter:
@@ -353,10 +336,13 @@ def sync_command(args: list[str]) -> int:
             num_projects=len(projects),
             total_tasks=total_tasks,
             incomplete_tasks=incomplete_tasks,
-            completed_tasks=completed_tasks
+            completed_tasks=completed_tasks,
+            sync_results=results
         )
 
-        return 0
+        # Determine exit code based on whether all syncs succeeded
+        has_failures = any(r.outcome.value != "success" for r in results)
+        return 1 if has_failures else 0
 
     except Exception as e:
         print_error(f"Sync failed: {e}")
@@ -514,7 +500,8 @@ def schedule_command(args: list[str]) -> int:
 
     Usage: schedule [days]
     
-    If days is not specified, defaults to 3 days.
+    If days is not specified, schedules all tasks until completion (no day limit).
+    If days is specified, limits scheduling to that number of days.
     """
     try:
         if not _context.projects:
@@ -522,8 +509,11 @@ def schedule_command(args: list[str]) -> int:
             return 1
 
         # Parse number of days
-        num_days = 3
+        num_days: int | None = None  # None means unlimited
         if args:
+            if len(args) > 1:
+                print_error("Usage: schedule [days] - too many arguments")
+                return 1
             try:
                 num_days = int(args[0])
                 if num_days < 1:
@@ -533,7 +523,10 @@ def schedule_command(args: list[str]) -> int:
                 print_error(f"Invalid number of days: {args[0]}")
                 return 1
 
-        console.print(f"[dim]Generating {num_days}-day schedule...[/dim]")
+        if num_days is None:
+            console.print(f"[dim]Generating unlimited schedule...[/dim]")
+        else:
+            console.print(f"[dim]Generating {num_days}-day schedule...[/dim]")
 
         # Load configuration
         from chronix.config import ChronixConfig, config_to_time_blocks, get_work_window
@@ -576,10 +569,13 @@ def schedule_command(args: list[str]) -> int:
             daily_blocked_time_fn=get_daily_blocked_time
         )
         
-        # Display each day's schedule
+        # Display each day's schedule with continuous task numbering
         all_conflicts = []
-        for day_offset in range(num_days):
-            day_date = now.date() + timedelta(days=day_offset)
+        task_counter = 1  # Global task counter across all days (starts at 1)
+        for day_offset, day_date in enumerate(sorted(schedules_by_day.keys())):
+            # Break after num_days if specified
+            if num_days is not None and day_offset >= num_days:
+                break
             
             if day_date not in schedules_by_day:
                 continue
@@ -596,7 +592,7 @@ def schedule_command(args: list[str]) -> int:
                 console.print("\n" + "─" * 60 + "\n")
             
             print_schedule_header(day_schedule.date, work_start, work_end, config.scheduling.timezone)
-            _display_continuous_timeline(day_schedule, work_start, work_end)
+            task_counter = _display_continuous_timeline(day_schedule, work_start, work_end, start_index=task_counter)
             
             # Collect conflicts
             if day_schedule.conflicts:
@@ -736,7 +732,7 @@ def help_command(args: list[str]) -> int:
         ("documents", "List all configured documents"),
         ("today [HH:MM]", "Display today's scheduled tasks from optional start time"),
         ("calendar [HH:MM] [--force]", "Sync today's schedule to Google Calendar"),
-        ("schedule [days]", "Display multi-day schedule (default: 3 days)"),
+        ("schedule [days]", "Display multi-day schedule (default: unlimited days)"),
         ("explain <task_id>", "Show details and scheduling info for a task"),
         ("config <cmd>", "Manage configuration (init, show, validate)"),
         ("clear / cls", "Clear the terminal screen"),
@@ -761,8 +757,19 @@ def _format_duration(duration: timedelta) -> str:
     return format_duration(duration)
 
 
-def _display_continuous_timeline(day_schedule, work_start: datetime, work_end: datetime) -> None:
-    """Display a continuous timeline including tasks, blocked time, and empty slots."""
+def _display_continuous_timeline(day_schedule, work_start: datetime, work_end: datetime, start_index: int = 1) -> int:
+    """
+    Display a continuous timeline including tasks, blocked time, and empty slots.
+    
+    Args:
+        day_schedule: The day's schedule to display
+        work_start: Start of work day
+        work_end: End of work day
+        start_index: Starting index for task numbering (for continuous numbering across days)
+    
+    Returns:
+        The next index to use for the next day (last_index + 1)
+    """
     from chronix.core.models import DaySchedule
     
     # Build a list of all time segments
@@ -823,12 +830,17 @@ def _display_continuous_timeline(day_schedule, work_start: datetime, work_end: d
     # Get display timezone from work_start
     display_tz = work_start.tzinfo if work_start.tzinfo else None
     
-    for i, segment in enumerate(timeline, 1):
+    current_index = start_index
+    for segment in timeline:
         print_timeline_segment(
-            index=i,
+            index=current_index,
             start=segment['start'],
             end=segment['end'],
             segment_type=segment['type'],
             data=segment['data'],
             display_tz=display_tz
         )
+        current_index += 1
+    
+    return current_index
+

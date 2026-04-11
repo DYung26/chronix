@@ -69,7 +69,7 @@ class SchedulingEngine:
         self,
         tasks: list[Task],
         start_time: datetime,
-        num_days: int,
+        num_days: int | None,
         daily_blocked_time_fn
     ) -> dict[date, DaySchedule]:
         """
@@ -78,7 +78,7 @@ class SchedulingEngine:
         Args:
             tasks: Ordered list of tasks to schedule
             start_time: When to start scheduling (timezone-aware)
-            num_days: Number of days to schedule
+            num_days: Number of days to schedule. If None, schedules all tasks (with no day limit)
             daily_blocked_time_fn: Function that takes a date and returns blocked time for that day
         
         Returns:
@@ -87,9 +87,19 @@ class SchedulingEngine:
         if start_time.tzinfo is None:
             raise ValueError("start_time must be timezone-aware")
         
+        # Determine lookahead days for collecting blocked time
+        # For unlimited scheduling, use a large buffer based on total task work
+        if num_days is None:
+            total_work = sum(t.estimated_duration.total_seconds() for t in tasks if not t.completed)
+            # Estimate: ~8 hours per day = 28800 seconds; add 20% buffer for blocked time
+            estimated_days_needed = max(10, int((total_work / 28800) * 1.2) + 5)
+            lookahead_days = estimated_days_needed
+        else:
+            lookahead_days = num_days
+        
         # Collect all blocked time across all days
         all_blocked_time = []
-        for day_offset in range(num_days + 1):  # Extra day to handle overflow
+        for day_offset in range(lookahead_days + 1):  # Extra day to handle overflow
             day_date = start_time.date() + timedelta(days=day_offset)
             day_blocks = daily_blocked_time_fn(day_date)
             all_blocked_time.extend(day_blocks)
@@ -107,7 +117,18 @@ class SchedulingEngine:
         # Partition scheduled tasks and blocked time by day
         schedules_by_day = {}
         
-        for day_offset in range(num_days):
+        # Determine the actual number of days to return
+        if num_days is None:
+            # Find the last day with scheduled tasks
+            max_day_offset = 0
+            for st in scheduled_tasks:
+                day_offset = (st.end.date() - start_time.date()).days
+                max_day_offset = max(max_day_offset, day_offset)
+            days_to_return = max_day_offset + 1
+        else:
+            days_to_return = num_days
+        
+        for day_offset in range(days_to_return):
             day_date = start_time.date() + timedelta(days=day_offset)
             day_start = datetime.combine(day_date, datetime.min.time(), tzinfo=start_time.tzinfo)
             day_end = datetime.combine(day_date, datetime.max.time(), tzinfo=start_time.tzinfo).replace(

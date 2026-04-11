@@ -38,23 +38,70 @@ def print_sync_summary(
     num_projects: int,
     total_tasks: int,
     incomplete_tasks: int,
-    completed_tasks: int
+    completed_tasks: int,
+    sync_results: list = None
 ):
-    """Print the sync summary with clean formatting."""
-    console.print()
-    console.print("✓ [bold green]Sync complete![/bold green]")
+    """Print the sync summary with clean formatting, including per-document outcomes if provided."""
     console.print()
     
-    table = Table(show_header=False, box=None, padding=(0, 2))
-    table.add_column("Label", style="dim")
-    table.add_column("Value", style="bold cyan")
+    if sync_results:
+        success_count = sum(1 for r in sync_results if r.outcome.value == "success")
+        not_found_count = sum(1 for r in sync_results if r.outcome.value == "not_found")
+        failed_count = sum(1 for r in sync_results if r.outcome.value == "failed_after_retries")
+        
+        if failed_count > 0 or not_found_count > 0:
+            console.print("⚠  [bold yellow]Sync completed with issues[/bold yellow]")
+        else:
+            console.print("✓ [bold green]Sync complete![/bold green]")
+        console.print()
+        
+        table = Table(show_header=False, box=None, padding=(0, 2))
+        table.add_column("Label", style="dim")
+        table.add_column("Value", style="bold cyan")
+        
+        table.add_row("Projects", f"{success_count} synced")
+        if not_found_count > 0:
+            table.add_row("", f"{not_found_count} not found")
+        if failed_count > 0:
+            table.add_row("", f"{failed_count} failed after retries")
+        
+        if num_projects > 0:
+            table.add_row("Total tasks", str(total_tasks))
+            table.add_row("Incomplete", str(incomplete_tasks))
+            table.add_row("Completed", str(completed_tasks))
+        
+        console.print(table)
+        
+        if failed_count > 0 or not_found_count > 0:
+            console.print()
+            console.print("[dim]Document outcomes:[/dim]")
+            for result in sync_results:
+                if result.outcome.value == "success":
+                    status_icon = "[green]✓[/green]"
+                elif result.outcome.value == "not_found":
+                    status_icon = "[yellow]⊘[/yellow]"
+                else:
+                    status_icon = "[red]✗[/red]"
+                
+                outcome_text = result.outcome.value.replace("_", " ")
+                console.print(f"  {status_icon} {result.document_id}: {outcome_text}")
+                if result.error and result.outcome.value != "not_found":
+                    console.print(f"      [dim]{result.error}[/dim]")
+    else:
+        console.print("✓ [bold green]Sync complete![/bold green]")
+        console.print()
+        
+        table = Table(show_header=False, box=None, padding=(0, 2))
+        table.add_column("Label", style="dim")
+        table.add_column("Value", style="bold cyan")
+        
+        table.add_row("Projects", str(num_projects))
+        table.add_row("Total tasks", str(total_tasks))
+        table.add_row("Incomplete", str(incomplete_tasks))
+        table.add_row("Completed", str(completed_tasks))
+        
+        console.print(table)
     
-    table.add_row("Projects", str(num_projects))
-    table.add_row("Total tasks", str(total_tasks))
-    table.add_row("Incomplete", str(incomplete_tasks))
-    table.add_row("Completed", str(completed_tasks))
-    
-    console.print(table)
     console.print()
 
 
