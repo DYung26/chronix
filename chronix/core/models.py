@@ -16,6 +16,7 @@ class Task(BaseModel):
     title: str
     project: Optional[str] = None
     section: Optional[str] = None
+    document_title: Optional[str] = None
     estimated_duration: timedelta
     deadline_user: Optional[datetime] = None
     deadline_external: Optional[datetime] = None

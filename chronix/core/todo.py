@@ -404,6 +404,7 @@ class TodoDeriver:
         exclude_normalized = [t.lower() for t in exclude_tab_titles]
 
         tasks = []
+        document_title = document_structure.get('title', '').strip()
 
         # Process each tab
         tabs = document_structure.get('tabs', [])
@@ -444,7 +445,9 @@ class TodoDeriver:
                     try:
                         task = self.parser.parse_task_line(paragraph, checkbox_list_id)
                         if task:
-                            # Optionally add tab context
+                            # Add document and tab context
+                            if document_title:
+                                task.document_title = document_title
                             if tab_title:
                                 task.section = tab_title
                             tasks.append(task)
@@ -526,9 +529,12 @@ def parse_document_tasks(
     """Parse all tasks from a document structure with tabs."""
     parser = TaskParser()
     tasks = []
+    document_title = document_structure.get('title', '').strip()
     
     tabs = document_structure.get('tabs', [])
     for tab in tabs:
+        tab_title = tab.get('title', '').strip()
+        
         # Get the checkbox list ID for this tab
         checkbox_list_id = tab.get('checkbox_list_id')
         
@@ -541,6 +547,10 @@ def parse_document_tasks(
             try:
                 task = parser.parse_task_line(paragraph, checkbox_list_id, source=source)
                 if task:
+                    if document_title:
+                        task.document_title = document_title
+                    if tab_title:
+                        task.section = tab_title
                     tasks.append(task)
             except TaskParseError:
                 continue

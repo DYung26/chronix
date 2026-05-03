@@ -687,17 +687,31 @@ class SchedulingEngine:
             violates_external = self._violates_deadline(final_end, task.deadline_external)
             
             # Generate conflict messages if violations exist
+            # Build source context (document title + tab name)
+            source_parts = []
+            if task.document_title:
+                source_parts.append(f"[{task.document_title}]")
+            if task.section:
+                source_parts.append(f"• {task.section}")
+            source_context = " ".join(source_parts) if source_parts else ""
+            
             if violates_user and task.deadline_user:
-                conflicts.append(
+                conflict_msg = (
                     f"Task '{task.title}' ends at {final_end.strftime('%Y-%m-%d %H:%M')} "
                     f"but user deadline is {task.deadline_user.strftime('%Y-%m-%d %H:%M')}"
                 )
+                if source_context:
+                    conflict_msg = f"{source_context} — {conflict_msg}"
+                conflicts.append(conflict_msg)
             
             if violates_external and task.deadline_external:
-                conflicts.append(
+                conflict_msg = (
                     f"Task '{task.title}' ends at {final_end.strftime('%Y-%m-%d %H:%M')} "
                     f"but external deadline is {task.deadline_external.strftime('%Y-%m-%d %H:%M')}"
                 )
+                if source_context:
+                    conflict_msg = f"{source_context} — {conflict_msg}"
+                conflicts.append(conflict_msg)
             
             # Create ScheduledTask for each segment
             for idx, (_, start, end) in enumerate(segments, start=1):
@@ -854,17 +868,32 @@ class SchedulingEngine:
         conflicts = []
         task = scheduled_task.task
 
+        # Build source context (document title + tab name)
+        source_parts = []
+        if task.document_title:
+            source_parts.append(task.document_title)
+        if task.section:
+            source_parts.append(task.section)
+        
+        source_context = " • ".join(source_parts) if source_parts else ""
+
         if scheduled_task.violates_deadline_user:
-            conflicts.append(
+            conflict_msg = (
                 f"Task '{task.title}' ends at {scheduled_task.end.strftime('%Y-%m-%d %H:%M')} "
                 f"but user deadline is {task.deadline_user.strftime('%Y-%m-%d %H:%M')}"
             )
+            if source_context:
+                conflict_msg = f"{source_context} — {conflict_msg}"
+            conflicts.append(conflict_msg)
 
         if scheduled_task.violates_deadline_external:
-            conflicts.append(
+            conflict_msg = (
                 f"Task '{task.title}' ends at {scheduled_task.end.strftime('%Y-%m-%d %H:%M')} "
                 f"but external deadline is {task.deadline_external.strftime('%Y-%m-%d %H:%M')}"
             )
+            if source_context:
+                conflict_msg = f"{source_context} — {conflict_msg}"
+            conflicts.append(conflict_msg)
 
         return conflicts
 

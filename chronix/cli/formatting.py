@@ -174,18 +174,23 @@ def _print_task_segment(index: int, time_range: str, scheduled_task):
     
     console.print(task_line)
     
-    # Origin line (project + section/tab) - escape square brackets for rich markup
-    origin_parts = []
-    if task.project:
-        # Escape square brackets that would be interpreted as markup
-        project_display = task.project.replace("[", r"\[").replace("]", r"\]")
-        origin_parts.append(f"[{project_display}]")
+    # Source line (document title + tab name)
+    source_parts = []
+    if task.document_title:
+        source_parts.append(f"[{task.document_title}]")
     if task.section:
-        origin_parts.append(f"• {task.section}")
+        source_parts.append(f"• {task.section}")
     
-    if origin_parts:
-        origin_text = " ".join(origin_parts)
-        console.print(f"    [dim]{origin_text}[/dim]")
+    if source_parts:
+        source_text = " ".join(source_parts)
+        # Use Text object to avoid Rich markup interpretation
+        source_line = Text("    " + source_text, style="dim")
+        console.print(source_line)
+    elif task.project:
+        # Fallback to project if no document/section info
+        project_text = f"    [{task.project}]"
+        project_line = Text(project_text, style="dim")
+        console.print(project_line)
     
     # Duration and ID line
     duration_str = format_duration(task.estimated_duration)
@@ -281,7 +286,9 @@ def print_conflicts(conflicts: list[str]):
     console.print()
     
     for conflict in conflicts:
-        console.print(f"   [yellow]•[/yellow] {conflict}")
+        # Use Text object to avoid Rich markup interpretation of brackets
+        conflict_line = Text("   • " + conflict)
+        console.print(conflict_line)
     
     console.print()
 
