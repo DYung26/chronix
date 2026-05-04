@@ -287,7 +287,10 @@ def print_conflicts(conflicts: list[str]):
     
     for conflict in conflicts:
         # Use Text object to avoid Rich markup interpretation of brackets
-        conflict_line = Text("   • " + conflict)
+        # Apply yellow color to bullet, rest is normal style
+        conflict_line = Text("   ")
+        conflict_line.append("•", style="yellow")
+        conflict_line.append(" " + conflict)
         console.print(conflict_line)
     
     console.print()
