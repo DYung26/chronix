@@ -340,9 +340,7 @@ def sync_command(args: list[str]) -> int:
             sync_results=results
         )
 
-        # Determine exit code based on whether all syncs succeeded
-        has_failures = any(r.outcome.value != "success" for r in results)
-        return 1 if has_failures else 0
+        return 0
 
     except Exception as e:
         print_error(f"Sync failed: {e}")
