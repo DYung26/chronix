@@ -220,18 +220,13 @@ def sync_command(args: list[str]) -> int:
     """
     Sync command: Fetch and parse configured project documents.
     
-    Usage: sync [document_id]
+    Usage: sync [document_id ...]
     
     With no argument: syncs all configured documents (continues on document-level failures)
-    With document_id: syncs only that document (must be configured)
+    With one or more document_ids: syncs only those documents (all must be configured)
     """
     try:
-        # Parse arguments
-        if len(args) > 1:
-            print_error("sync accepts at most one document_id argument")
-            return 1
-        
-        document_id_filter = args[0] if args else None
+        document_id_filters = args if args else None
         
         console.print("[dim]Starting sync...[/dim]")
 
@@ -251,13 +246,15 @@ def sync_command(args: list[str]) -> int:
             console.print(f"Edit [cyan]{ChronixConfig.get_default_path()}[/cyan] and add document_ids to sync.")
             return 1
         
-        # If a specific document was requested, validate it exists
-        if document_id_filter:
-            if not _find_configured_document(document_id_filter, config):
-                print_error(f"Unknown document ID '{document_id_filter}'")
+        # If specific documents were requested, validate all before fetching any
+        if document_id_filters:
+            unknown = [d for d in document_id_filters if not _find_configured_document(d, config)]
+            if unknown:
+                for doc_id in unknown:
+                    print_error(f"Unknown document ID '{doc_id}'")
                 console.print("Run [cyan]chronix documents[/cyan] to see configured documents.")
                 return 1
-            document_ids = [document_id_filter]
+            document_ids = document_id_filters
 
         # Initialize client and authenticate (global failure)
         client = _context._ensure_google_client()
@@ -290,27 +287,21 @@ def sync_command(args: list[str]) -> int:
                 all_meetings.extend(meetings)
 
         # Update context: merge or replace
-        if document_id_filter:
-            # Single document sync: merge into existing context
+        if document_id_filters:
+            # Partial sync: merge into existing context
             if _context.projects:
-                # Find and replace the document in existing context
-                updated_projects = []
                 synced_doc_ids = {p.project_context.document_id for p in projects}
-                
-                for existing_project in _context.projects:
-                    if existing_project.project_context.document_id not in synced_doc_ids:
-                        # Keep other documents
-                        updated_projects.append(existing_project)
-                
-                # Add the newly synced document(s)
+                updated_projects = [
+                    p for p in _context.projects
+                    if p.project_context.document_id not in synced_doc_ids
+                ]
                 updated_projects.extend(projects)
                 _context.projects = updated_projects
                 _context.ad_hoc_meetings.extend(all_meetings)
             else:
-                # No prior context: warn user
                 _context.projects = projects
                 _context.ad_hoc_meetings = all_meetings
-                print_warning("Synced single document with no prior context.")
+                print_warning("Synced specific documents with no prior context.")
                 console.print("[dim]For complete task aggregation across all documents, run:[/dim]")
                 console.print("[cyan]  chronix sync[/cyan]")
         else:
@@ -705,7 +696,7 @@ def documents_command(args: list[str]) -> int:
             console.print(f"  [cyan]{doc_id}[/cyan]  {title}")
         
         console.print()
-        console.print(f"Use [cyan]sync <document_id>[/cyan] to sync a specific document")
+        console.print(f"Use [cyan]sync <id> [id ...][/cyan] to sync specific documents")
         console.print()
         return 0
     
@@ -725,8 +716,8 @@ def help_command(args: list[str]) -> int:
     console.print()
     
     commands_table = [
-        ("sync", "Fetch and parse all configured documents or one by document_id"),
-        ("sync <document_id>", "Sync a specific document"),
+        ("sync", "Fetch and parse all configured documents or specific ones by document_id"),
+        ("sync <id> [id ...]", "Sync one or more specific documents"),
         ("documents", "List all configured documents"),
         ("today [HH:MM]", "Display today's scheduled tasks from optional start time"),
         ("calendar [HH:MM] [--force]", "Sync today's schedule to Google Calendar"),

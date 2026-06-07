@@ -97,6 +97,7 @@ The REPL automatically runs `sync` on startup to fetch the latest tasks.
 
 Available commands:
 - `sync` - Fetch and parse all configured documents
+- `sync <id> [id ...]` - Sync one or more specific documents
 - `today` - Display today's complete schedule
 - `explain <task_id>` - Show detailed information about a specific task
 - `clear` or `cls` - Clear the terminal screen
@@ -121,7 +122,8 @@ Available commands:
 Run commands directly without entering the REPL:
 
 ```bash
-chronix sync          # Sync tasks from Google Docs
+chronix sync                      # Sync all documents
+chronix sync <id> [id ...]        # Sync specific documents
 chronix today         # View today's schedule
 chronix explain xyz   # Get details about task with ID xyz
 ```
