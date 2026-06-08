@@ -4,6 +4,7 @@ from chronix.config.settings import (
     ChronixConfig,
     SchedulingConfig,
     GoogleDocsConfig,
+    DocumentConfig,
     TimeBlockConfig,
 )
 from chronix.config.converters import (
@@ -15,6 +16,7 @@ __all__ = [
     "ChronixConfig",
     "SchedulingConfig",
     "GoogleDocsConfig",
+    "DocumentConfig",
     "TimeBlockConfig",
     "config_to_time_blocks",
     "get_work_window",

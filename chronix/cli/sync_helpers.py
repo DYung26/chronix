@@ -26,9 +26,16 @@ class DocumentSyncResult:
     """Result of syncing a single document."""
     document_id: str
     outcome: SyncOutcome
+    alias: Optional[str] = None
     error: Optional[str] = None
     retry_count: int = 0
     data: Optional[Any] = None
+
+    def document_label(self) -> str:
+        """Format for display: 'alias (document_id)' or just 'document_id'."""
+        if self.alias:
+            return f"{self.alias} ({self.document_id})"
+        return self.document_id
 
 
 def classify_sync_error(error: Exception) -> SyncErrorType:
@@ -73,7 +80,11 @@ def is_global_failure(error: Exception) -> bool:
     return False
 
 
-def _sync_single_document_with_retries(doc_id: str, client: Any) -> tuple[DocumentSyncResult, Optional[Any], list]:
+def _sync_single_document_with_retries(
+    doc_id: str,
+    client: Any,
+    alias: Optional[str] = None,
+) -> tuple[DocumentSyncResult, Optional[Any], list]:
     """
     Sync a single document with retry logic for transient failures.
     
@@ -90,7 +101,8 @@ def _sync_single_document_with_retries(doc_id: str, client: Any) -> tuple[Docume
     parser = GoogleDocsParser()
     deriver = TodoDeriver()
     
-    console.print(f"[dim]Fetching document {doc_id}...[/dim]")
+    label = f"{alias} ({doc_id})" if alias else doc_id
+    console.print(f"[dim]Fetching document {label}...[/dim]")
     
     last_error = None
     for attempt in range(MAX_RETRIES):
@@ -105,7 +117,8 @@ def _sync_single_document_with_retries(doc_id: str, client: Any) -> tuple[Docume
             project_todo = ProjectTodoList(
                 project_name=project_name,
                 tasks=tasks,
-                document_id=doc_id
+                document_id=doc_id,
+                alias=alias,
             )
             
             console.print(f"  [green]✓[/green] [bold]{project_name}[/bold]: [cyan]{len(tasks)}[/cyan] tasks, [cyan]{len(meetings)}[/cyan] meetings")
@@ -113,6 +126,7 @@ def _sync_single_document_with_retries(doc_id: str, client: Any) -> tuple[Docume
             result = DocumentSyncResult(
                 document_id=doc_id,
                 outcome=SyncOutcome.SUCCESS,
+                alias=alias,
                 retry_count=attempt,
                 data=(project_todo, meetings)
             )
@@ -123,35 +137,37 @@ def _sync_single_document_with_retries(doc_id: str, client: Any) -> tuple[Docume
             error_type = classify_sync_error(e)
             
             if error_type == SyncErrorType.DOCUMENT_NOT_FOUND:
-                console.print(f"  [yellow]⊘[/yellow] Document not found: {doc_id}")
+                console.print(f"  [yellow]⊘[/yellow] Document not found: {label}")
                 result = DocumentSyncResult(
                     document_id=doc_id,
                     outcome=SyncOutcome.NOT_FOUND,
+                    alias=alias,
                     error=str(e),
                     retry_count=0
                 )
                 return result, None, []
             
             if error_type == SyncErrorType.NON_RETRYABLE:
-                console.print(f"  [red]✗[/red] Failed to fetch document {doc_id}: {e}")
+                console.print(f"  [red]✗[/red] Failed to fetch document {label}: {e}")
                 result = DocumentSyncResult(
                     document_id=doc_id,
                     outcome=SyncOutcome.FAILED_AFTER_RETRIES,
+                    alias=alias,
                     error=str(e),
                     retry_count=0
                 )
                 return result, None, []
             
-            # Retryable error
             if attempt < MAX_RETRIES - 1:
-                console.print(f"  [yellow]⚠[/yellow] Failed to fetch document {doc_id}, retrying ({attempt + 1}/{MAX_RETRIES}): {e}")
+                console.print(f"  [yellow]⚠[/yellow] Failed to fetch document {label}, retrying ({attempt + 1}/{MAX_RETRIES}): {e}")
                 time.sleep(RETRY_BACKOFF_SECONDS)
                 continue
             else:
-                console.print(f"  [red]✗[/red] Failed to fetch document {doc_id} after {MAX_RETRIES} attempts: {e}")
+                console.print(f"  [red]✗[/red] Failed to fetch document {label} after {MAX_RETRIES} attempts: {e}")
                 result = DocumentSyncResult(
                     document_id=doc_id,
                     outcome=SyncOutcome.FAILED_AFTER_RETRIES,
+                    alias=alias,
                     error=str(last_error),
                     retry_count=MAX_RETRIES
                 )
@@ -160,8 +176,8 @@ def _sync_single_document_with_retries(doc_id: str, client: Any) -> tuple[Docume
     result = DocumentSyncResult(
         document_id=doc_id,
         outcome=SyncOutcome.FAILED_AFTER_RETRIES,
+        alias=alias,
         error=str(last_error),
         retry_count=MAX_RETRIES
     )
     return result, None, []
-

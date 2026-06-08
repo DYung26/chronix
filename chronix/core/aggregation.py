@@ -16,6 +16,7 @@ class ProjectContext:
     project_name: str
     source: str = "google_docs"
     document_id: Optional[str] = None
+    alias: Optional[str] = None
 
     def __hash__(self):
         return hash((self.project_id, self.source))
@@ -24,6 +25,12 @@ class ProjectContext:
         if not isinstance(other, ProjectContext):
             return False
         return self.project_id == other.project_id and self.source == other.source
+
+    def document_label(self) -> str:
+        """Format for display: 'alias (document_id)' or just 'document_id'."""
+        if self.alias and self.document_id:
+            return f"{self.alias} ({self.document_id})"
+        return self.document_id or self.project_id
 
 
 @dataclass
@@ -51,13 +58,15 @@ class ProjectTodoList:
         tasks: list[Task],
         project_id: Optional[str] = None,
         source: str = "google_docs",
-        document_id: Optional[str] = None
+        document_id: Optional[str] = None,
+        alias: Optional[str] = None,
     ):
         self.project_context = ProjectContext(
             project_id=project_id or self._normalize_project_name(project_name),
             project_name=project_name,
             source=source,
-            document_id=document_id
+            document_id=document_id,
+            alias=alias,
         )
         self.tasks = tasks
 
@@ -251,7 +260,8 @@ def create_project_todo(
     tasks: list[Task],
     project_id: Optional[str] = None,
     source: str = "google_docs",
-    document_id: Optional[str] = None
+    document_id: Optional[str] = None,
+    alias: Optional[str] = None,
 ) -> ProjectTodoList:
     """Create a ProjectTodoList with explicit project identity."""
     return ProjectTodoList(
@@ -259,5 +269,6 @@ def create_project_todo(
         tasks=tasks,
         project_id=project_id,
         source=source,
-        document_id=document_id
+        document_id=document_id,
+        alias=alias,
     )

@@ -57,6 +57,13 @@ class SchedulingConfig(BaseModel):
         return timedelta(minutes=self.default_task_duration_minutes)
 
 
+class DocumentConfig(BaseModel):
+    """Configuration for a single Google Docs document."""
+
+    document_id: str
+    alias: Optional[str] = None
+
+
 class GoogleDocsConfig(BaseModel):
     """Configuration for Google Docs integration."""
 
@@ -64,7 +71,7 @@ class GoogleDocsConfig(BaseModel):
     credentials_path: Optional[Path] = Field(default=None, description="Path to OAuth credentials or service account key")
     token_path: Optional[Path] = Field(default=None, description="Path to OAuth token cache")
 
-    document_ids: list[str] = Field(default_factory=list, description="List of Google Docs document IDs to sync")
+    documents: list[DocumentConfig] = Field(default_factory=list, description="List of Google Docs documents to sync")
 
     @field_validator("credentials_path", "token_path")
     @classmethod
@@ -81,6 +88,46 @@ class GoogleDocsConfig(BaseModel):
         if self.token_path is None:
             self.token_path = Path.home() / ".chronix" / "token.json"
         return self
+
+    @model_validator(mode="after")
+    def validate_alias_uniqueness(self):
+        aliases = [doc.alias for doc in self.documents if doc.alias is not None]
+        seen = set()
+        for alias in aliases:
+            if alias in seen:
+                raise ValueError(f"Duplicate alias '{alias}' found in document configuration")
+            seen.add(alias)
+        return self
+
+    @property
+    def document_ids(self) -> list[str]:
+        """All configured document IDs."""
+        return [doc.document_id for doc in self.documents]
+
+    def resolve(self, token: str) -> Optional[str]:
+        """
+        Resolve a token (alias or document_id) to its canonical document_id.
+
+        Returns the document_id if found, None if not configured.
+        """
+        for doc in self.documents:
+            if doc.alias == token or doc.document_id == token:
+                return doc.document_id
+        return None
+
+    def get_alias(self, document_id: str) -> Optional[str]:
+        """Return the alias for a document_id, or None if no alias is set."""
+        for doc in self.documents:
+            if doc.document_id == document_id:
+                return doc.alias
+        return None
+
+    def format_document_label(self, document_id: str) -> str:
+        """Format a document for display: 'alias (document_id)' or just 'document_id'."""
+        alias = self.get_alias(document_id)
+        if alias:
+            return f"{alias} ({document_id})"
+        return document_id
 
 
 class ChronixConfig(BaseModel):
@@ -104,10 +151,8 @@ class ChronixConfig(BaseModel):
         """Save configuration to TOML file."""
         path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Convert to dict with proper serialization
         data = self.model_dump(mode="json")
 
-        # Convert Path objects to strings for TOML
         if "google_docs" in data:
             if data["google_docs"].get("credentials_path"):
                 data["google_docs"]["credentials_path"] = str(data["google_docs"]["credentials_path"])

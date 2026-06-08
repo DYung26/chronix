@@ -84,7 +84,7 @@ def print_sync_summary(
                     status_icon = "[red]✗[/red]"
                 
                 outcome_text = result.outcome.value.replace("_", " ")
-                console.print(f"  {status_icon} {result.document_id}: {outcome_text}")
+                console.print(f"  {status_icon} {result.document_label()}: {outcome_text}")
                 if result.error and result.outcome.value != "not_found":
                     console.print(f"      [dim]{result.error}[/dim]")
     else:
@@ -316,7 +316,7 @@ def print_task_details(task: Task, project_context):
         console.print(f"   [dim]Section:[/dim] {task.section}")
     console.print(f"   [dim]Source:[/dim] {project_context.source}")
     if project_context and project_context.document_id:
-        console.print(f"   [dim]Document ID:[/dim] [cyan]{project_context.document_id}[/cyan]")
+        console.print(f"   [dim]Document:[/dim] [cyan]{project_context.document_label()}[/cyan]")
     console.print()
     
     # Duration & Deadlines section

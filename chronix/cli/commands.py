@@ -209,24 +209,26 @@ class ChronixContext:
 _context = ChronixContext()
 
 
-def _find_configured_document(document_id: str, config: 'ChronixConfig') -> Optional[str]:
-    """Find a configured document by exact ID. Returns the ID if found, None otherwise."""
-    if document_id in config.google_docs.document_ids:
-        return document_id
-    return None
+def _resolve_document_token(token: str, config: 'ChronixConfig') -> Optional[str]:
+    """
+    Resolve a token (alias or document_id) to its canonical document_id.
+
+    Returns the document_id if the token matches a configured alias or ID, else None.
+    """
+    return config.google_docs.resolve(token)
 
 
 def sync_command(args: list[str]) -> int:
     """
     Sync command: Fetch and parse configured project documents.
     
-    Usage: sync [document_id ...]
+    Usage: sync [id|alias ...]
     
     With no argument: syncs all configured documents (continues on document-level failures)
-    With one or more document_ids: syncs only those documents (all must be configured)
+    With one or more id/alias tokens: syncs only those documents (all must be configured)
     """
     try:
-        document_id_filters = args if args else None
+        tokens = args if args else None
         
         console.print("[dim]Starting sync...[/dim]")
 
@@ -240,21 +242,36 @@ def sync_command(args: list[str]) -> int:
             console.print("Run [cyan]chronix config init[/cyan] to create a default configuration.")
             return 1
 
-        document_ids = config.google_docs.document_ids
-        if not document_ids:
+        all_document_ids = config.google_docs.document_ids
+        if not all_document_ids:
             print_warning("No documents configured in your config file.")
             console.print(f"Edit [cyan]{ChronixConfig.get_default_path()}[/cyan] and add document_ids to sync.")
             return 1
-        
-        # If specific documents were requested, validate all before fetching any
-        if document_id_filters:
-            unknown = [d for d in document_id_filters if not _find_configured_document(d, config)]
+
+        # If specific tokens were requested, resolve and validate all before fetching any
+        if tokens:
+            unknown = [t for t in tokens if _resolve_document_token(t, config) is None]
             if unknown:
-                for doc_id in unknown:
-                    print_error(f"Unknown document ID '{doc_id}'")
-                console.print("Run [cyan]chronix documents[/cyan] to see configured documents.")
+                for token in unknown:
+                    print_error(f"Unknown document '{token}'")
+                configured_labels = [
+                    config.google_docs.format_document_label(doc_id)
+                    for doc_id in all_document_ids
+                ]
+                console.print("Configured documents:")
+                for label in configured_labels:
+                    console.print(f"  [cyan]{label}[/cyan]")
                 return 1
-            document_ids = document_id_filters
+            # Resolve tokens to canonical document IDs (deduplicated, preserving order)
+            seen: set[str] = set()
+            document_ids: list[str] = []
+            for t in tokens:
+                resolved = _resolve_document_token(t, config)
+                if resolved not in seen:
+                    seen.add(resolved)
+                    document_ids.append(resolved)
+        else:
+            document_ids = all_document_ids
 
         # Initialize client and authenticate (global failure)
         client = _context._ensure_google_client()
@@ -279,7 +296,8 @@ def sync_command(args: list[str]) -> int:
         results = []
 
         for doc_id in document_ids:
-            result, project, meetings = _sync_single_document_with_retries(doc_id, client)
+            alias = config.google_docs.get_alias(doc_id)
+            result, project, meetings = _sync_single_document_with_retries(doc_id, client, alias=alias)
             results.append(result)
             
             if result.outcome.value == "success":
@@ -287,7 +305,7 @@ def sync_command(args: list[str]) -> int:
                 all_meetings.extend(meetings)
 
         # Update context: merge or replace
-        if document_id_filters:
+        if tokens:
             # Partial sync: merge into existing context
             if _context.projects:
                 synced_doc_ids = {p.project_context.document_id for p in projects}
@@ -671,9 +689,9 @@ def documents_command(args: list[str]) -> int:
         from chronix.config import ChronixConfig
         
         config = ChronixConfig.load_or_default()
-        document_ids = config.google_docs.document_ids
+        documents = config.google_docs.documents
         
-        if not document_ids:
+        if not documents:
             print_warning("No documents configured in your config file.")
             console.print(f"Edit [cyan]{ChronixConfig.get_default_path()}[/cyan] and add document_ids.")
             return 0
@@ -691,12 +709,16 @@ def documents_command(args: list[str]) -> int:
                 if p.project_context.document_id
             }
         
-        for doc_id in document_ids:
+        for doc_config in documents:
+            doc_id = doc_config.document_id
             title = doc_titles.get(doc_id, "(not synced yet)")
-            console.print(f"  [cyan]{doc_id}[/cyan]  {title}")
+            if doc_config.alias:
+                console.print(f"  [cyan]{doc_config.alias}[/cyan] [dim]({doc_id})[/dim]  {title}")
+            else:
+                console.print(f"  [cyan]{doc_id}[/cyan]  {title}")
         
         console.print()
-        console.print(f"Use [cyan]sync <id> [id ...][/cyan] to sync specific documents")
+        console.print(f"Use [cyan]sync <id|alias> [id|alias ...][/cyan] to sync specific documents")
         console.print()
         return 0
     
@@ -716,9 +738,9 @@ def help_command(args: list[str]) -> int:
     console.print()
     
     commands_table = [
-        ("sync", "Fetch and parse all configured documents or specific ones by document_id"),
-        ("sync <id> [id ...]", "Sync one or more specific documents"),
-        ("documents", "List all configured documents"),
+        ("sync", "Fetch and parse all configured documents"),
+        ("sync <id|alias> [...]", "Sync one or more specific documents by ID or alias"),
+        ("documents", "List all configured documents with aliases"),
         ("today [HH:MM]", "Display today's scheduled tasks from optional start time"),
         ("calendar [HH:MM] [--force]", "Sync today's schedule to Google Calendar"),
         ("schedule [days]", "Display multi-day schedule (default: unlimited days)"),
@@ -730,7 +752,7 @@ def help_command(args: list[str]) -> int:
     ]
     
     for cmd, desc in commands_table:
-        console.print(f"  [cyan]{cmd:20}[/cyan] [dim]{desc}[/dim]")
+        console.print(f"  [cyan]{cmd:28}[/cyan] [dim]{desc}[/dim]")
     
     console.print()
     console.print("[bold]Configuration:[/bold]")
@@ -832,4 +854,3 @@ def _display_continuous_timeline(day_schedule, work_start: datetime, work_end: d
         current_index += 1
     
     return current_index
-
