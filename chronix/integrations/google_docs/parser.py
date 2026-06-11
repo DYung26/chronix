@@ -63,7 +63,13 @@ class DocumentStructure:
 class GoogleDocsParser:
     """Parser for extracting raw structural content from Google Docs API responses."""
 
-    TASK_IDENTIFIER = "TASKS ::: duration; external_deadline; user_deadline; ref; depends; mode"
+    TASK_IDENTIFIER = "TASKS ::: duration; external_deadline; user_deadline; ref; deps; mode"
+    _ALL_TASK_IDENTIFIERS = frozenset([
+        TASK_IDENTIFIER,
+        "TASKS ::: duration; external_deadline; user_deadline; ref; depends; mode",
+        "TASKS ::: duration; external_deadline; user_deadline; ref; depends",
+        "TASKS ::: duration; external_deadline; user_deadline",
+    ])
 
     def parse_document(self, doc: dict[str, Any]) -> DocumentStructure:
         """Extract structural content from a Google Docs document with tabs support."""
@@ -94,12 +100,10 @@ class GoogleDocsParser:
         """Discover the checkbox list ID for a specific tab.
         
         Scans the tab's content for a paragraph with text matching the task identifier.
-        Supports both old and new identifier formats for backward compatibility.
+        Supports all historical identifier formats for backward compatibility.
         
         Sets tab.checkbox_list_id to the bullet.listId of that paragraph, or None if not found.
         """
-        old_identifier = "TASKS ::: duration; external_deadline; user_deadline"
-        
         for element in content:
             if "paragraph" not in element:
                 continue
@@ -122,8 +126,7 @@ class GoogleDocsParser:
             
             combined_text = "".join(text_parts).strip()
             
-            # Check if this is the identifier line (accept both old and new formats)
-            if combined_text == self.TASK_IDENTIFIER or combined_text == old_identifier:
+            if combined_text in self._ALL_TASK_IDENTIFIERS:
                 list_id = paragraph["bullet"].get("listId")
                 tab.checkbox_list_id = list_id
                 return

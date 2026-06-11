@@ -63,8 +63,9 @@ class TaskParser:
     
     METADATA_PATTERN = re.compile(r'^(.*?)\s*:::\s*(.+)$')
     DURATION_PATTERN = re.compile(r'^(\d+)(hours?|minutes?)$', re.IGNORECASE)
-    TASK_IDENTIFIER = "TASKS ::: duration; external_deadline; user_deadline; ref; depends; mode"
-    OLD_TASK_IDENTIFIER = "TASKS ::: duration; external_deadline; user_deadline; ref; depends"
+    TASK_IDENTIFIER = "TASKS ::: duration; external_deadline; user_deadline; ref; deps; mode"
+    OLD_TASK_IDENTIFIER = "TASKS ::: duration; external_deadline; user_deadline; ref; depends; mode"
+    LEGACY_TASK_IDENTIFIER = "TASKS ::: duration; external_deadline; user_deadline; ref; depends"
     VALID_MODES = {"atomic", "flex", "contiguous_preferred"}
 
     def parse_task_line(
@@ -106,8 +107,8 @@ class TaskParser:
         if not text:
             return None
 
-        # Exclude both old and new identifier lines (they're not real tasks)
-        if text == self.TASK_IDENTIFIER or text == self.OLD_TASK_IDENTIFIER:
+        # Exclude all known identifier line variants (they're not real tasks)
+        if text in (self.TASK_IDENTIFIER, self.OLD_TASK_IDENTIFIER, self.LEGACY_TASK_IDENTIFIER):
             return None
 
         match = self.METADATA_PATTERN.match(text)
@@ -159,7 +160,7 @@ class TaskParser:
             
             if key == 'ref':
                 ref = value if value else None
-            elif key == 'depends':
+            elif key in ('deps', 'depends'):
                 if value:
                     depends_on = [d.strip() for d in value.split(',') if d.strip()]
             elif key == 'mode':
@@ -424,7 +425,7 @@ class TodoDeriver:
                     raise TaskParseError(
                         message=f"No checkbox list ID found in tab '{tab_title}'. "
                                 f"Tab must contain a checkbox line with text: "
-                                f"'TASKS ::: duration; external_deadline; user_deadline; ref; depends; mode'",
+                                f"'TASKS ::: duration; external_deadline; user_deadline; ref; deps; mode'",
                         raw_text=None,
                         field="checkbox_list_id",
                         value=None
