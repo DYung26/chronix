@@ -91,6 +91,7 @@ def _sync_single_document_with_retries(
     Returns (result, project, meetings) where project and meetings are None on failure.
     """
     from chronix.integrations.google_docs.parser import GoogleDocsParser
+    from chronix.integrations.google_docs.writer import GoogleDocsTaskWriter
     from chronix.core.todo import TodoDeriver, parse_document_meetings
     from chronix.core.aggregation import ProjectTodoList
     from chronix.cli.formatting import console
@@ -114,6 +115,9 @@ def _sync_single_document_with_retries(
             tasks = deriver.derive_todo_list(doc_structure.to_dict())
             meetings = parse_document_meetings(doc_structure.to_dict())
 
+            writer = GoogleDocsTaskWriter()
+            tasks = writer.backfill_missing_ids(doc_id, tasks, source_data=doc)
+
             project_todo = ProjectTodoList(
                 project_name=project_name,
                 tasks=tasks,
@@ -121,7 +125,9 @@ def _sync_single_document_with_retries(
                 alias=alias,
             )
             
-            console.print(f"  [green]✓[/green] [bold]{project_name}[/bold]: [cyan]{len(tasks)}[/cyan] tasks, [cyan]{len(meetings)}[/cyan] meetings")
+            task_word = "task" if len(tasks) == 1 else "tasks"
+            meeting_word = "meeting" if len(meetings) == 1 else "meetings"
+            console.print(f"  [green]✓[/green] [bold]{project_name}[/bold]: [cyan]{len(tasks)}[/cyan] {task_word}, [cyan]{len(meetings)}[/cyan] {meeting_word}")
             
             result = DocumentSyncResult(
                 document_id=doc_id,

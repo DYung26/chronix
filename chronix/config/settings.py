@@ -34,11 +34,28 @@ class TimeBlockConfig(BaseModel):
         return self
 
 
+class WorkWindowConfig(BaseModel):
+    """A single contiguous work window within a day."""
+
+    start_time: time
+    end_time: time
+
+    @model_validator(mode="after")
+    def validate_times(self):
+        if self.start_time >= self.end_time:
+            raise ValueError("start_time must be before end_time")
+        return self
+
+
 class SchedulingConfig(BaseModel):
     """Configuration for task scheduling behavior."""
-    
-    work_start_time: time = Field(default=time(9, 0), description="Daily work start time")
-    work_end_time: time = Field(default=time(18, 0), description="Daily work end time")
+
+    work_start_time: time = Field(default=time(9, 0), description="Daily work start time (single-window fallback)")
+    work_end_time: time = Field(default=time(18, 0), description="Daily work end time (single-window fallback)")
+    work_windows: list[WorkWindowConfig] = Field(
+        default_factory=list,
+        description="Multiple work windows per day (overrides work_start_time/work_end_time when non-empty)",
+    )
     timezone: str = Field(default="UTC", description="Timezone for scheduling")
     default_task_duration_minutes: int = Field(default=60, ge=1, description="Default task duration if not specified")
 
@@ -48,9 +65,16 @@ class SchedulingConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_work_hours(self):
-        if self.work_start_time >= self.work_end_time:
-            raise ValueError("work_start_time must be before work_end_time")
+        if not self.work_windows:
+            if self.work_start_time >= self.work_end_time:
+                raise ValueError("work_start_time must be before work_end_time")
         return self
+
+    def effective_work_windows(self) -> list["WorkWindowConfig"]:
+        """Return the active work windows, falling back to single-window config."""
+        if self.work_windows:
+            return sorted(self.work_windows, key=lambda w: w.start_time)
+        return [WorkWindowConfig(start_time=self.work_start_time, end_time=self.work_end_time)]
 
     def get_default_task_duration(self) -> timedelta:
         """Get default task duration as timedelta."""

@@ -109,7 +109,7 @@ def _generate_today_schedule(time_override: Optional[str] = None) -> tuple[DaySc
     if not _context.projects:
         raise RuntimeError("No projects loaded. Run 'sync' first.")
     
-    from chronix.config import ChronixConfig, config_to_time_blocks, get_work_window
+    from chronix.config import ChronixConfig, config_to_time_blocks, get_work_window, get_work_windows
     
     config = _context.config or ChronixConfig.load_or_default()
     tz = ZoneInfo(config.scheduling.timezone)
@@ -130,30 +130,40 @@ def _generate_today_schedule(time_override: Optional[str] = None) -> tuple[DaySc
     # Get today's date and time
     now = datetime.now(tz)
     today = now.date()
-    
-    # Get work window from config
-    work_start, work_end = get_work_window(config, today)
-    
+
+    # Get all work windows from config
+    all_windows = get_work_windows(config, today)
+    work_start = all_windows[0][0]
+    work_end = all_windows[-1][1]
+
     # Determine effective start time
     if time_override is not None:
         work_start = resolve_today_start_datetime(time_override, today, tz)
     else:
         if now > work_start:
             work_start = now
-    
+
     # Limit work_end to end of day
     end_of_today = datetime.combine(
         today,
         datetime.max.time(),
         tzinfo=tz
     ).replace(hour=23, minute=59, second=59)
-    
+
     if work_end > end_of_today:
         work_end = end_of_today
-    
-    # Get blocked time
+
+    # Get blocked time from config
     blocked_time = config_to_time_blocks(config, today)
-    
+
+    # Add gap blocks between work windows so the scheduler skips non-work periods
+    for i in range(len(all_windows) - 1):
+        gap_start = all_windows[i][1]
+        gap_end = all_windows[i + 1][0]
+        if gap_start < gap_end:
+            from chronix.core.models import TimeBlock
+            blocked_time.append(TimeBlock(start=gap_start, end=gap_end, kind="blocked", label="off hours"))
+
     # Add ad-hoc meetings as blocked time
     for meeting in _context.ad_hoc_meetings:
         if meeting.start.date() == today:
@@ -536,7 +546,7 @@ def schedule_command(args: list[str]) -> int:
             console.print(f"[dim]Generating {num_days}-day schedule...[/dim]")
 
         # Load configuration
-        from chronix.config import ChronixConfig, config_to_time_blocks, get_work_window
+        from chronix.config import ChronixConfig, config_to_time_blocks, get_work_window, get_work_windows
         from zoneinfo import ZoneInfo
 
         config = _context.config or ChronixConfig.load_or_default()
@@ -563,6 +573,14 @@ def schedule_command(args: list[str]) -> int:
         def get_daily_blocked_time(day_date: date) -> list:
             """Get blocked time for a specific day."""
             blocked = config_to_time_blocks(config, day_date)
+            # Add gap blocks between work windows
+            day_windows = get_work_windows(config, day_date)
+            for i in range(len(day_windows) - 1):
+                gap_start = day_windows[i][1]
+                gap_end = day_windows[i + 1][0]
+                if gap_start < gap_end:
+                    from chronix.core.models import TimeBlock
+                    blocked.append(TimeBlock(start=gap_start, end=gap_end, kind="blocked", label="off hours"))
             # Add ad-hoc meetings for this day
             for meeting in _context.ad_hoc_meetings:
                 if meeting.start.date() == day_date:
@@ -738,21 +756,33 @@ def help_command(args: list[str]) -> int:
     console.print()
     
     commands_table = [
+        ("add <duration> <title> [--doc <id|alias>]", "Create a new task in a Google Docs document"),
+        ("calendar [HH:MM] [--force]", "Sync today's schedule to Google Calendar"),
+        ("config <cmd>", "Manage configuration (init, show, path, validate)"),
+        ("deadline <task_id> <ISO|-> [--user]", "Set external deadline; --user sets user deadline instead"),
+        ("delete <task_id>", "Delete a task from its document"),
+        ("documents", "List all configured documents with aliases"),
+        ("done <task_id> [--doc <id|alias>]", "Complete a task, recording actual duration from sessions"),
+        ("pause <task_id> [--doc <id|alias>]", "Close the current work session"),
+        ("resume <task_id> [--doc <id|alias>]", "Open a new work session starting now"),
+        ("duration <task_id> <dur>", "Change a task's estimated duration (e.g. 2h, 30m)"),
+        ("explain <task_id>", "Show details and scheduling info for a task"),
+        ("meta <task_id> [k=v ...] [--remove k]", "Set or remove arbitrary metadata fields"),
+        ("mode <task_id> <mode>", "Set execution mode (atomic|flex|contiguous_preferred)"),
+        ("rename <task_id> <title>", "Rename a task"),
+        ("schedule [days]", "Display multi-day schedule (default: unlimited days)"),
         ("sync", "Fetch and parse all configured documents"),
         ("sync <id|alias> [...]", "Sync one or more specific documents by ID or alias"),
-        ("documents", "List all configured documents with aliases"),
         ("today [HH:MM]", "Display today's scheduled tasks from optional start time"),
-        ("calendar [HH:MM] [--force]", "Sync today's schedule to Google Calendar"),
-        ("schedule [days]", "Display multi-day schedule (default: unlimited days)"),
-        ("explain <task_id>", "Show details and scheduling info for a task"),
-        ("config <cmd>", "Manage configuration (init, show, validate)"),
+        ("undone <task_id>", "Mark a task as incomplete"),
+        ("update <task_id> [flags]", "Update fields: --title --duration --external-deadline --user-deadline --mode --meta --remove-meta"),
         ("clear / cls", "Clear the terminal screen"),
         ("help", "Show this help message"),
         ("exit / quit", "Exit the interactive shell"),
     ]
     
     for cmd, desc in commands_table:
-        console.print(f"  [cyan]{cmd:28}[/cyan] [dim]{desc}[/dim]")
+        console.print(f"  [cyan]{cmd:42}[/cyan] [dim]{desc}[/dim]")
     
     console.print()
     console.print("[bold]Configuration:[/bold]")
@@ -766,6 +796,106 @@ def help_command(args: list[str]) -> int:
 def _format_duration(duration: timedelta) -> str:
     """Format a timedelta as a human-readable string (legacy compatibility)."""
     return format_duration(duration)
+
+
+def _parse_add_duration(value: str) -> timedelta:
+    """Parse a duration string from the add command into a timedelta.
+
+    Accepts: 2h, 30m, 2hours, 2hour, 30minutes, 30minute
+    """
+    import re
+    v = value.strip().lower()
+    if re.fullmatch(r'\d+h', v):
+        return timedelta(hours=int(v[:-1]))
+    if re.fullmatch(r'\d+m', v):
+        return timedelta(minutes=int(v[:-1]))
+    m = re.fullmatch(r'(\d+)hours?', v)
+    if m:
+        return timedelta(hours=int(m.group(1)))
+    m = re.fullmatch(r'(\d+)minutes?', v)
+    if m:
+        return timedelta(minutes=int(m.group(1)))
+    raise ValueError(
+        f"Invalid duration '{value}'. Use: 2h, 30m, 2hours, 30minutes"
+    )
+
+
+def add_command(args: list[str]) -> int:
+    """
+    Add command: Create a new task in a Google Docs document.
+
+    Usage: add <duration> <title> [--doc <id|alias>]
+
+    Duration examples: 2h, 30m, 2hours, 30minutes
+    """
+    doc_token: Optional[str] = None
+    remaining: list[str] = []
+    i = 0
+    while i < len(args):
+        if args[i] == "--doc" and i + 1 < len(args):
+            doc_token = args[i + 1]
+            i += 2
+        elif args[i].startswith("--"):
+            print_error(f"Unknown flag: {args[i]}")
+            return 1
+        else:
+            remaining.append(args[i])
+            i += 1
+
+    if len(remaining) < 2:
+        print_error("Usage: add <duration> <title> [--doc <id|alias>]")
+        return 1
+
+    duration_str = remaining[0]
+    title = " ".join(remaining[1:])
+
+    try:
+        duration = _parse_add_duration(duration_str)
+    except ValueError as e:
+        print_error(str(e))
+        return 1
+
+    try:
+        from chronix.config import ChronixConfig
+        config = _context.config or ChronixConfig.load_or_default()
+    except Exception as e:
+        print_error(f"Failed to load configuration: {e}")
+        return 1
+
+    all_doc_ids = config.google_docs.document_ids
+    if not all_doc_ids:
+        print_error("No documents configured. Run 'chronix config init' to set up.")
+        return 1
+
+    if doc_token is not None:
+        doc_id = _resolve_document_token(doc_token, config)
+        if doc_id is None:
+            print_error(f"Unknown document: '{doc_token}'")
+            return 1
+    elif len(all_doc_ids) == 1:
+        doc_id = all_doc_ids[0]
+    else:
+        print_error("Multiple documents configured. Specify one with --doc <id|alias>")
+        for doc in config.google_docs.documents:
+            label = f"{doc.alias} ({doc.document_id})" if doc.alias else doc.document_id
+            console.print(f"  [cyan]{label}[/cyan]")
+        return 1
+
+    from chronix.core.models import generate_task_id
+    from chronix.core.writer import NewTask
+    from chronix.integrations.google_docs.writer import GoogleDocsTaskWriter
+
+    try:
+        client = _context._ensure_google_client()
+        writer = GoogleDocsTaskWriter(auth_strategy=client.auth_strategy)
+        task_id = generate_task_id()
+        writer.create_task(doc_id, NewTask(title=title, duration=duration, id=task_id))
+        _resync_document(doc_id, config)
+        print_success(f"Task added: {title} ({duration_str}) [id={task_id}]")
+        return 0
+    except Exception as e:
+        print_error(f"Failed to add task: {e}")
+        return 1
 
 
 def _display_continuous_timeline(day_schedule, work_start: datetime, work_end: datetime, start_index: int = 1) -> int:
@@ -854,3 +984,629 @@ def _display_continuous_timeline(day_schedule, work_start: datetime, work_end: d
         current_index += 1
     
     return current_index
+
+
+# ---------------------------------------------------------------------------
+# Task editing commands
+# ---------------------------------------------------------------------------
+
+
+def _get_task_writer():
+    from chronix.integrations.google_docs.writer import GoogleDocsTaskWriter
+    client = _context._ensure_google_client()
+    return GoogleDocsTaskWriter(auth_strategy=client.auth_strategy)
+
+
+def _resync_document(doc_id: str, config) -> None:
+    """Refresh in-memory task state for a single document after a write.
+
+    Keeps `_context.projects` consistent with the document just written to,
+    so a task just created or edited is immediately visible to subsequent
+    commands without requiring an explicit `sync`. Never raises: a refresh
+    failure here must not be mistaken for the write itself failing.
+    """
+    from chronix.cli.sync_helpers import _sync_single_document_with_retries
+
+    try:
+        client = _context._ensure_google_client()
+        alias = config.google_docs.get_alias(doc_id)
+        result, project, _meetings = _sync_single_document_with_retries(doc_id, client, alias=alias)
+    except Exception:
+        print_warning("Could not refresh local state for this document. Run 'sync' to pick up the change.")
+        return
+
+    if result.outcome.value != "success":
+        print_warning("Could not refresh local state for this document. Run 'sync' to pick up the change.")
+        return
+
+    _context.projects = [
+        p for p in _context.projects if p.project_context.document_id != doc_id
+    ] + [project]
+    _context.last_sync = datetime.now(timezone.utc)
+    _context.config = config
+
+
+def _resolve_edit_doc(doc_token: Optional[str], config) -> Optional[str]:
+    all_doc_ids = config.google_docs.document_ids
+    if not all_doc_ids:
+        return None
+    if doc_token is not None:
+        return _resolve_document_token(doc_token, config)
+    if len(all_doc_ids) == 1:
+        return all_doc_ids[0]
+    return None
+
+
+def _parse_edit_flags(args: list[str]) -> tuple[Optional[str], list[str]]:
+    """Extract --doc <token> from args. Returns (doc_token, remaining_args)."""
+    doc_token: Optional[str] = None
+    remaining: list[str] = []
+    i = 0
+    while i < len(args):
+        if args[i] == "--doc" and i + 1 < len(args):
+            doc_token = args[i + 1]
+            i += 2
+        else:
+            remaining.append(args[i])
+            i += 1
+    return doc_token, remaining
+
+
+def _run_task_update(task_id: str, update, doc_token: Optional[str] = None) -> int:
+    from chronix.core.writer import TaskNotFoundError
+    try:
+        from chronix.config import ChronixConfig
+        config = _context.config or ChronixConfig.load_or_default()
+    except Exception as e:
+        print_error(f"Failed to load configuration: {e}")
+        return 1
+
+    doc_id = _resolve_edit_doc(doc_token, config)
+    if doc_id is None:
+        if not config.google_docs.document_ids:
+            print_error("No documents configured.")
+        else:
+            print_error("Multiple documents configured. Specify one with --doc <id|alias>")
+            for doc in config.google_docs.documents:
+                label = f"{doc.alias} ({doc.document_id})" if doc.alias else doc.document_id
+                console.print(f"  [cyan]{label}[/cyan]")
+        return 1
+
+    try:
+        writer = _get_task_writer()
+        writer.update_task(doc_id, task_id, update)
+        _resync_document(doc_id, config)
+        return 0
+    except TaskNotFoundError:
+        print_error(f"No task with id='{task_id}' found.")
+        return 1
+    except Exception as e:
+        print_error(f"Update failed: {e}")
+        return 1
+
+
+def update_command(args: list[str]) -> int:
+    """
+    Update command: Modify one or more fields of a task by its ID.
+
+    Usage: update <task_id> [--title <title>] [--duration <duration>]
+                            [--external-deadline <ISO|->] [--user-deadline <ISO|->]
+                            [--mode <mode>] [--meta <key=value> ...]
+                            [--remove-meta <key> ...]
+                            [--doc <id|alias>]
+
+    At least one field flag must be supplied.
+    """
+    from chronix.core.metadata import parse_deadline, parse_duration
+    from chronix.core.writer import TaskUpdate
+
+    if not args:
+        print_error("Usage: update <task_id> [--title ...] [--duration ...] [--external-deadline ...] "
+                    "[--user-deadline ...] [--mode ...] [--meta key=value ...] [--remove-meta key ...] "
+                    "[--doc <id|alias>]")
+        return 1
+
+    task_id = args[0]
+    doc_token, flags = _parse_edit_flags(args[1:])
+
+    update = TaskUpdate()
+    i = 0
+    while i < len(flags):
+        flag = flags[i]
+        if flag == "--title":
+            if i + 1 >= len(flags):
+                print_error("--title requires a value")
+                return 1
+            update.title = flags[i + 1]
+            i += 2
+        elif flag == "--duration":
+            if i + 1 >= len(flags):
+                print_error("--duration requires a value")
+                return 1
+            dur = parse_duration(flags[i + 1])
+            if dur is None:
+                print_error(f"Invalid duration: '{flags[i + 1]}'")
+                return 1
+            update.duration = dur
+            i += 2
+        elif flag == "--external-deadline":
+            if i + 1 >= len(flags):
+                print_error("--external-deadline requires a value")
+                return 1
+            try:
+                update.external_deadline = parse_deadline(flags[i + 1])
+            except ValueError as e:
+                print_error(str(e))
+                return 1
+            i += 2
+        elif flag == "--user-deadline":
+            if i + 1 >= len(flags):
+                print_error("--user-deadline requires a value")
+                return 1
+            try:
+                update.user_deadline = parse_deadline(flags[i + 1])
+            except ValueError as e:
+                print_error(str(e))
+                return 1
+            i += 2
+        elif flag == "--mode":
+            if i + 1 >= len(flags):
+                print_error("--mode requires a value")
+                return 1
+            update.mode = flags[i + 1]
+            i += 2
+        elif flag == "--meta":
+            if i + 1 >= len(flags):
+                print_error("--meta requires key=value")
+                return 1
+            pair = flags[i + 1]
+            if "=" not in pair:
+                print_error(f"--meta value must be key=value, got: '{pair}'")
+                return 1
+            k, _, v = pair.partition("=")
+            update.metadata[k.strip()] = v.strip()
+            i += 2
+        elif flag == "--remove-meta":
+            if i + 1 >= len(flags):
+                print_error("--remove-meta requires a key")
+                return 1
+            update.metadata_remove.append(flags[i + 1])
+            i += 2
+        else:
+            print_error(f"Unknown flag: {flag}")
+            return 1
+
+    if not any([
+        update.title,
+        update.duration,
+        update.has_external_deadline_change(),
+        update.has_user_deadline_change(),
+        update.mode,
+        update.metadata,
+        update.metadata_remove,
+        update.completed is not None,
+    ]):
+        print_error("No fields to update. Provide at least one flag.")
+        return 1
+
+    rc = _run_task_update(task_id, update, doc_token)
+    if rc == 0:
+        print_success(f"Task '{task_id}' updated.")
+    return rc
+
+
+def rename_command(args: list[str]) -> int:
+    """
+    Rename command: Change the title of a task.
+
+    Usage: rename <task_id> <new title> [--doc <id|alias>]
+    """
+    from chronix.core.writer import TaskUpdate
+
+    doc_token, remaining = _parse_edit_flags(args)
+    if len(remaining) < 2:
+        print_error("Usage: rename <task_id> <new title> [--doc <id|alias>]")
+        return 1
+
+    task_id = remaining[0]
+    new_title = " ".join(remaining[1:])
+    update = TaskUpdate(title=new_title)
+    rc = _run_task_update(task_id, update, doc_token)
+    if rc == 0:
+        print_success(f"Task '{task_id}' renamed to '{new_title}'.")
+    return rc
+
+
+def duration_command(args: list[str]) -> int:
+    """
+    Duration command: Update the estimated duration of a task.
+
+    Usage: duration <task_id> <duration> [--doc <id|alias>]
+
+    Duration examples: 2h, 30m, 2hours, 30minutes
+    """
+    from chronix.core.metadata import parse_duration
+    from chronix.core.writer import TaskUpdate
+
+    doc_token, remaining = _parse_edit_flags(args)
+    if len(remaining) < 2:
+        print_error("Usage: duration <task_id> <duration> [--doc <id|alias>]")
+        return 1
+
+    task_id = remaining[0]
+    dur = parse_duration(remaining[1])
+    if dur is None:
+        print_error(f"Invalid duration: '{remaining[1]}'")
+        return 1
+
+    update = TaskUpdate(duration=dur)
+    rc = _run_task_update(task_id, update, doc_token)
+    if rc == 0:
+        print_success(f"Task '{task_id}' duration set to '{remaining[1]}'.")
+    return rc
+
+
+def deadline_command(args: list[str]) -> int:
+    """
+    Deadline command: Set the external or user deadline of a task.
+
+    Usage: deadline <task_id> <ISO-date|-> [--user] [--doc <id|alias>]
+
+    Without --user, updates external_deadline.
+    With --user, updates user_deadline.
+    Use '-' to clear a deadline.
+    """
+    from chronix.core.metadata import parse_deadline
+    from chronix.core.writer import TaskUpdate
+
+    use_user = "--user" in args
+    args = [a for a in args if a != "--user"]
+    doc_token, remaining = _parse_edit_flags(args)
+
+    if len(remaining) < 2:
+        print_error("Usage: deadline <task_id> <ISO-date|-> [--user] [--doc <id|alias>]")
+        return 1
+
+    task_id = remaining[0]
+    try:
+        dt = parse_deadline(remaining[1])
+    except ValueError as e:
+        print_error(str(e))
+        return 1
+
+    update = TaskUpdate()
+    if use_user:
+        update.user_deadline = dt
+    else:
+        update.external_deadline = dt
+
+    rc = _run_task_update(task_id, update, doc_token)
+    if rc == 0:
+        kind = "user" if use_user else "external"
+        value = remaining[1]
+        print_success(f"Task '{task_id}' {kind} deadline set to '{value}'.")
+    return rc
+
+
+def mode_command(args: list[str]) -> int:
+    """
+    Mode command: Set the execution mode of a task.
+
+    Usage: mode <task_id> <atomic|flex|contiguous_preferred> [--doc <id|alias>]
+    """
+    from chronix.core.writer import TaskUpdate
+
+    VALID_MODES = {"atomic", "flex", "contiguous_preferred"}
+    doc_token, remaining = _parse_edit_flags(args)
+
+    if len(remaining) < 2:
+        print_error("Usage: mode <task_id> <atomic|flex|contiguous_preferred> [--doc <id|alias>]")
+        return 1
+
+    task_id = remaining[0]
+    new_mode = remaining[1]
+    if new_mode not in VALID_MODES:
+        print_error(f"Invalid mode '{new_mode}'. Valid: atomic, flex, contiguous_preferred")
+        return 1
+
+    update = TaskUpdate(mode=new_mode)
+    rc = _run_task_update(task_id, update, doc_token)
+    if rc == 0:
+        print_success(f"Task '{task_id}' mode set to '{new_mode}'.")
+    return rc
+
+
+def _find_task_in_context(task_id: str) -> Optional[Task]:
+    """Return the Task with the given id from the current context, or None."""
+    if not _context.projects:
+        return None
+    from chronix.core.aggregation import TaskAggregator
+    aggregator = TaskAggregator()
+    for agg_task in aggregator.aggregate(_context.projects):
+        if agg_task.task.id == task_id:
+            return agg_task.task
+    return None
+
+
+def _get_calendar_task_start(task_id: str) -> Optional[datetime]:
+    """Look up the scheduled calendar start time for a task, or return None."""
+    try:
+        from chronix.integrations.google_calendar import CalendarSyncService
+        sync_service = CalendarSyncService()
+        search_start = datetime.now(timezone.utc) - timedelta(days=14)
+        search_end = datetime.now(timezone.utc)
+        return sync_service.find_task_scheduled_start(task_id, search_start, search_end)
+    except Exception:
+        return None
+
+
+def done_command(args: list[str]) -> int:
+    """
+    Done command: Mark a task as complete, recording actual work duration.
+
+    Closes any active session, computes actual_duration from all sessions,
+    and marks the task complete. If no sessions exist and a calendar event
+    is found, a session from the calendar start to now is recorded.
+
+    Usage: done <task_id> [--doc <id|alias>]
+    """
+    from chronix.core.writer import TaskUpdate
+    from chronix.core.models import WorkSession
+    from chronix.core.metadata import (
+        KEY_ACTIVE_SINCE,
+        KEY_ACTUAL_DURATION,
+        KEY_SESSIONS,
+        serialize_duration,
+        serialize_sessions,
+    )
+
+    doc_token, remaining = _parse_edit_flags(args)
+    if not remaining:
+        print_error("Usage: done <task_id> [--doc <id|alias>]")
+        return 1
+
+    task_id = remaining[0]
+    now = datetime.now(timezone.utc)
+
+    update = TaskUpdate(completed=True)
+
+    task = _find_task_in_context(task_id)
+    if task is not None:
+        sessions = list(task.sessions)
+
+        if task.active_since is not None:
+            sessions.append(WorkSession(start=task.active_since, end=now))
+            update.metadata_remove.append(KEY_ACTIVE_SINCE)
+        elif not sessions:
+            calendar_start = _get_calendar_task_start(task_id)
+            if calendar_start is not None:
+                sessions.append(WorkSession(start=calendar_start, end=now))
+            else:
+                print_warning(
+                    f"No work sessions recorded for '{task_id}' and no scheduled calendar event found. "
+                    f"actual_duration will not be set. "
+                    f"Run 'calendar' before completing tasks to enable automatic session tracking."
+                )
+
+        if sessions:
+            actual = sum((s.duration for s in sessions), timedelta())
+            update.metadata[KEY_SESSIONS] = serialize_sessions(sessions)
+            update.metadata[KEY_ACTUAL_DURATION] = serialize_duration(actual)
+
+    rc = _run_task_update(task_id, update, doc_token)
+    if rc == 0:
+        print_success(f"Task '{task_id}' marked as done.")
+    return rc
+
+
+def pause_command(args: list[str]) -> int:
+    """
+    Pause command: Close the currently active work session.
+
+    For the first pause, uses the task's scheduled calendar start as the
+    session start time. Subsequent pauses use the active_since timestamp
+    set by resume.
+
+    Usage: pause <task_id> [--doc <id|alias>]
+    """
+    from chronix.core.writer import TaskUpdate
+    from chronix.core.models import WorkSession
+    from chronix.core.metadata import (
+        KEY_ACTIVE_SINCE,
+        KEY_SESSIONS,
+        serialize_sessions,
+    )
+
+    doc_token, remaining = _parse_edit_flags(args)
+    if not remaining:
+        print_error("Usage: pause <task_id> [--doc <id|alias>]")
+        return 1
+
+    task_id = remaining[0]
+
+    task = _find_task_in_context(task_id)
+    if task is None:
+        print_error(f"Task '{task_id}' not found. Run 'sync' first.")
+        return 1
+
+    if task.is_paused:
+        print_error(f"Task '{task_id}' is already paused.")
+        return 1
+
+    now = datetime.now(timezone.utc)
+
+    if task.active_since is not None:
+        session_start = task.active_since
+    else:
+        session_start = _get_calendar_task_start(task_id)
+        if session_start is None:
+            print_error(
+                f"Task '{task_id}' has no scheduled calendar event. "
+                f"Run 'calendar' first to schedule the task."
+            )
+            return 1
+
+    new_session = WorkSession(start=session_start, end=now)
+    sessions = task.sessions + [new_session]
+
+    update = TaskUpdate(
+        metadata={KEY_SESSIONS: serialize_sessions(sessions)},
+        metadata_remove=[KEY_ACTIVE_SINCE],
+    )
+    rc = _run_task_update(task_id, update, doc_token)
+    if rc == 0:
+        print_success(
+            f"Task '{task_id}' paused. "
+            f"Session: {format_duration(new_session.duration)}"
+        )
+    return rc
+
+
+def resume_command(args: list[str]) -> int:
+    """
+    Resume command: Begin a new work session starting at the current time.
+
+    Usage: resume <task_id> [--doc <id|alias>]
+    """
+    from chronix.core.writer import TaskUpdate
+    from chronix.core.metadata import KEY_ACTIVE_SINCE, serialize_active_since
+
+    doc_token, remaining = _parse_edit_flags(args)
+    if not remaining:
+        print_error("Usage: resume <task_id> [--doc <id|alias>]")
+        return 1
+
+    task_id = remaining[0]
+
+    task = _find_task_in_context(task_id)
+    if task is None:
+        print_error(f"Task '{task_id}' not found. Run 'sync' first.")
+        return 1
+
+    if task.active_since is not None:
+        print_error(f"Task '{task_id}' is already active.")
+        return 1
+
+    now = datetime.now(timezone.utc)
+    update = TaskUpdate(metadata={KEY_ACTIVE_SINCE: serialize_active_since(now)})
+    rc = _run_task_update(task_id, update, doc_token)
+    if rc == 0:
+        print_success(f"Task '{task_id}' resumed.")
+    return rc
+
+
+def undone_command(args: list[str]) -> int:
+    """
+    Undone command: Mark a task as incomplete.
+
+    Usage: undone <task_id> [--doc <id|alias>]
+    """
+    from chronix.core.writer import TaskUpdate
+
+    doc_token, remaining = _parse_edit_flags(args)
+    if not remaining:
+        print_error("Usage: undone <task_id> [--doc <id|alias>]")
+        return 1
+
+    task_id = remaining[0]
+    update = TaskUpdate(completed=False)
+    rc = _run_task_update(task_id, update, doc_token)
+    if rc == 0:
+        print_success(f"Task '{task_id}' marked as incomplete.")
+    return rc
+
+
+def meta_command(args: list[str]) -> int:
+    """
+    Meta command: Set or remove arbitrary metadata fields on a task.
+
+    Usage: meta <task_id> [key=value ...] [--remove key ...] [--doc <id|alias>]
+
+    Examples:
+        meta abc123 priority=high area=work
+        meta abc123 --remove priority
+    """
+    from chronix.core.writer import TaskUpdate
+
+    doc_token, remaining = _parse_edit_flags(args)
+    if not remaining:
+        print_error("Usage: meta <task_id> [key=value ...] [--remove key ...] [--doc <id|alias>]")
+        return 1
+
+    task_id = remaining[0]
+    rest = remaining[1:]
+
+    metadata: dict[str, str] = {}
+    metadata_remove: list[str] = []
+    i = 0
+    while i < len(rest):
+        if rest[i] == "--remove":
+            if i + 1 >= len(rest):
+                print_error("--remove requires a key")
+                return 1
+            metadata_remove.append(rest[i + 1])
+            i += 2
+        elif "=" in rest[i]:
+            k, _, v = rest[i].partition("=")
+            metadata[k.strip()] = v.strip()
+            i += 1
+        else:
+            print_error(f"Expected key=value or --remove, got: '{rest[i]}'")
+            return 1
+
+    if not metadata and not metadata_remove:
+        print_error("No metadata changes specified.")
+        return 1
+
+    update = TaskUpdate(metadata=metadata, metadata_remove=metadata_remove)
+    rc = _run_task_update(task_id, update, doc_token)
+    if rc == 0:
+        print_success(f"Task '{task_id}' metadata updated.")
+    return rc
+
+
+def delete_command(args: list[str]) -> int:
+    """
+    Delete command: Remove a task from its document.
+
+    Usage: delete <task_id> [--doc <id|alias>]
+    """
+    from chronix.core.writer import TaskNotFoundError
+
+    doc_token, remaining = _parse_edit_flags(args)
+    if not remaining:
+        print_error("Usage: delete <task_id> [--doc <id|alias>]")
+        return 1
+
+    task_id = remaining[0]
+
+    try:
+        from chronix.config import ChronixConfig
+        config = _context.config or ChronixConfig.load_or_default()
+    except Exception as e:
+        print_error(f"Failed to load configuration: {e}")
+        return 1
+
+    doc_id = _resolve_edit_doc(doc_token, config)
+    if doc_id is None:
+        if not config.google_docs.document_ids:
+            print_error("No documents configured.")
+        else:
+            print_error("Multiple documents configured. Specify one with --doc <id|alias>")
+            for doc in config.google_docs.documents:
+                label = f"{doc.alias} ({doc.document_id})" if doc.alias else doc.document_id
+                console.print(f"  [cyan]{label}[/cyan]")
+        return 1
+
+    try:
+        writer = _get_task_writer()
+        writer.delete_task(doc_id, task_id)
+        _resync_document(doc_id, config)
+        print_success(f"Task '{task_id}' deleted.")
+        return 0
+    except TaskNotFoundError:
+        print_error(f"No task with id='{task_id}' found.")
+        return 1
+    except Exception as e:
+        print_error(f"Delete failed: {e}")
+        return 1

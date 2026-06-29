@@ -79,7 +79,12 @@ def config_show_command(args: list[str]) -> int:
         
         # Scheduling settings
         print("📅 Scheduling:")
-        print(f"   Work hours: {config.scheduling.work_start_time.strftime('%H:%M')} - {config.scheduling.work_end_time.strftime('%H:%M')}")
+        windows = config.scheduling.effective_work_windows()
+        if len(windows) == 1:
+            print(f"   Work hours: {windows[0].start_time.strftime('%H:%M')} - {windows[0].end_time.strftime('%H:%M')}")
+        else:
+            window_strs = ", ".join(f"{w.start_time.strftime('%H:%M')}–{w.end_time.strftime('%H:%M')}" for w in windows)
+            print(f"   Work windows: {window_strs}")
         print(f"   Timezone: {config.scheduling.timezone}")
         print(f"   Default task duration: {config.scheduling.default_task_duration_minutes} minutes")
         print()
@@ -162,7 +167,12 @@ def config_validate_command(args: list[str]) -> int:
         print("✓ Configuration is valid")
         print()
         print("Summary:")
-        print(f"  • Work hours: {config.scheduling.work_start_time} - {config.scheduling.work_end_time}")
+        windows = config.scheduling.effective_work_windows()
+        if len(windows) == 1:
+            print(f"  • Work hours: {windows[0].start_time} - {windows[0].end_time}")
+        else:
+            window_strs = ", ".join(f"{w.start_time}–{w.end_time}" for w in windows)
+            print(f"  • Work windows: {window_strs}")
         print(f"  • Sleep windows: {len(config.scheduling.sleep_windows)}")
         print(f"  • Breaks: {len(config.scheduling.breaks)}")
         print(f"  • Meetings: {len(config.scheduling.meetings)}")

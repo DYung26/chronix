@@ -189,7 +189,7 @@ class SchedulingEngine:
         
         for task in tasks:
             if not task.completed:
-                remaining_work[task.id] = task.estimated_duration
+                remaining_work[id(task)] = task.estimated_duration
                 incomplete_tasks.append(task)
         
         current_time = start_time
@@ -218,17 +218,17 @@ class SchedulingEngine:
             
             earliest_allowed_start = current_time
             ref_to_task = {t.ref: t for t in incomplete_tasks if t.ref}
-            
+
             for dep_ref in task_to_schedule.depends_on:
                 dep_task = ref_to_task.get(dep_ref)
-                if dep_task and dep_task.id in completion_times:
-                    dep_completion = completion_times[dep_task.id]
+                if dep_task and id(dep_task) in completion_times:
+                    dep_completion = completion_times[id(dep_task)]
                     earliest_allowed_start = max(earliest_allowed_start, dep_completion)
             
             # Determine chunk size based on execution mode
             desired_chunk = self._determine_desired_chunk(
                 task_to_schedule,
-                remaining_work[task_to_schedule.id],
+                remaining_work[id(task_to_schedule)],
                 current_time,
                 earliest_allowed_start,
                 blocked_time,
@@ -241,21 +241,21 @@ class SchedulingEngine:
                 earliest_start=earliest_allowed_start,
                 blocked_time=blocked_time,
                 desired_chunk_duration=desired_chunk,
-                remaining_duration=remaining_work[task_to_schedule.id]
+                remaining_duration=remaining_work[id(task_to_schedule)]
             )
             
             if segment:
                 start, end = segment
-                segments_by_task[task_to_schedule.id].append((task_to_schedule, start, end))
+                segments_by_task[id(task_to_schedule)].append((task_to_schedule, start, end))
                 segment_duration = end - start
-                remaining_work[task_to_schedule.id] -= segment_duration
-                
+                remaining_work[id(task_to_schedule)] -= segment_duration
+
                 # Track chunk completion
                 day_date = start.date()
-                chunks_scheduled_today[task_to_schedule.id][day_date] += 1
-                
-                if remaining_work[task_to_schedule.id] <= timedelta(0):
-                    completion_times[task_to_schedule.id] = end
+                chunks_scheduled_today[id(task_to_schedule)][day_date] += 1
+
+                if remaining_work[id(task_to_schedule)] <= timedelta(0):
+                    completion_times[id(task_to_schedule)] = end
                 
                 current_time = next_time
             else:
@@ -296,7 +296,7 @@ class SchedulingEngine:
         if chunks_scheduled_today is None:
             chunks_scheduled_today = defaultdict(lambda: defaultdict(int))
         
-        candidates = [t for t in tasks if remaining_work.get(t.id, timedelta(0)) > timedelta(0)]
+        candidates = [t for t in tasks if remaining_work.get(id(t), timedelta(0)) > timedelta(0)]
         
         if not candidates:
             return None
@@ -309,14 +309,14 @@ class SchedulingEngine:
                 dep_task = ref_to_task.get(dep_ref)
                 if not dep_task:
                     return True
-                if dep_task.id not in completion_times:
+                if id(dep_task) not in completion_times:
                     return False
             return True
         
         def can_place_chunk(task: Task) -> bool:
             chunk = self._determine_desired_chunk(
                 task,
-                remaining_work.get(task.id, timedelta(0)),
+                remaining_work.get(id(task), timedelta(0)),
                 current_time,
                 current_time,
                 blocked_time,
@@ -334,7 +334,7 @@ class SchedulingEngine:
         
         urgency_scores = []
         for task in available:
-            score = self._calculate_urgency(task, current_time, remaining_work.get(task.id, timedelta(0)), blocked_time)
+            score = self._calculate_urgency(task, current_time, remaining_work.get(id(task), timedelta(0)), blocked_time)
             urgency_scores.append((score, task))
         
         urgency_scores.sort(key=lambda x: x[0])
@@ -409,21 +409,21 @@ class SchedulingEngine:
         Returns True if safe to schedule, False if it would endanger critical deadlines.
         """
         # Estimate when a typical chunk of this task would finish if scheduled now
-        task_remaining = remaining_work.get(task.id, timedelta(0))
+        task_remaining = remaining_work.get(id(task), timedelta(0))
         typical_chunk = self._determine_desired_chunk(
             task, task_remaining, current_time, current_time, blocked_time, {}
         )
         estimated_end = self._estimate_completion_time(current_time, typical_chunk, blocked_time)
-        
+
         # Check each other task with a deadline
         for other_task in all_tasks:
-            if other_task.id == task.id:
+            if other_task is task:
                 continue
-            
+
             if not other_task.effective_deadline:
                 continue
-            
-            other_remaining = remaining_work.get(other_task.id, timedelta(0))
+
+            other_remaining = remaining_work.get(id(other_task), timedelta(0))
             if other_remaining <= timedelta(0):
                 continue
             
@@ -523,7 +523,7 @@ class SchedulingEngine:
             return timedelta(0)
         
         day_date = earliest_start.date()
-        chunks_today = chunks_scheduled_today.get(task.id, {}).get(day_date, 0)
+        chunks_today = chunks_scheduled_today.get(id(task), {}).get(day_date, 0)
         
         if task.execution_mode == "atomic":
             # Atomic: try to schedule entire remaining work as one chunk

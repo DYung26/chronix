@@ -1,55 +1,63 @@
 """Task parsing and TODO list derivation from structured document content."""
 
 import re
-import json
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from chronix.core.models import Task, AdHocMeeting
+from chronix.core.metadata import (
+    KEY_ACTIVE_SINCE,
+    KEY_ACTUAL_DURATION,
+    KEY_CREATED,
+    KEY_DEPENDS,
+    KEY_DURATION,
+    KEY_ESTIMATE,
+    KEY_EXTERNAL_DEADLINE,
+    KEY_ID,
+    KEY_MODE,
+    KEY_REF,
+    KEY_SESSIONS,
+    KEY_USER_DEADLINE,
+    parse_active_since,
+    parse_created,
+    parse_deadline,
+    parse_duration,
+    parse_metadata,
+    parse_sessions,
+)
+from chronix.core.models import AdHocMeeting, Task, WorkSession
+
+
+EXCLUDED_TAB_TITLES: frozenset[str] = frozenset(["todo"])
 
 
 class TaskParseError(Exception):
-    """Raised when task metadata cannot be parsed.
-    
-    Attributes:
-        message: Human-readable error description
-        raw_text: The original text being parsed (if available)
-        field: The specific field that failed to parse (if applicable)
-        value: The value that caused the error (if applicable)
-    """
-    
+    """Raised when task metadata cannot be parsed."""
+
     def __init__(
         self,
         message: str,
         raw_text: Optional[str] = None,
         field: Optional[str] = None,
-        value: Optional[str] = None
+        value: Optional[str] = None,
     ):
         self.message = message
         self.raw_text = raw_text
         self.field = field
         self.value = value
         super().__init__(message)
-    
+
     def __str__(self) -> str:
-        """Format error with context for debugging."""
         parts = [self.message]
-        
         if self.field:
             parts.append(f"Field: {self.field}")
-        
         if self.value is not None:
             parts.append(f"Value: {repr(self.value)}")
-        
         if self.raw_text:
-            # Truncate if too long
             text = self.raw_text if len(self.raw_text) <= 100 else self.raw_text[:97] + "..."
             parts.append(f"Raw text: {repr(text)}")
-        
         return " | ".join(parts)
-    
+
     def __repr__(self) -> str:
-        """Representation for debugging."""
         return (
             f"TaskParseError(message={self.message!r}, "
             f"raw_text={self.raw_text!r}, "
@@ -60,46 +68,30 @@ class TaskParseError(Exception):
 
 class TaskParser:
     """Parses task lines with metadata into Task domain objects."""
-    
+
     METADATA_PATTERN = re.compile(r'^(.*?)\s*:::\s*(.+)$')
-    DURATION_PATTERN = re.compile(r'^(\d+)(hours?|minutes?)$', re.IGNORECASE)
-    TASK_IDENTIFIER = "TASKS ::: duration; external_deadline; user_deadline; ref; deps; mode"
-    OLD_TASK_IDENTIFIER = "TASKS ::: duration; external_deadline; user_deadline; ref; depends; mode"
-    LEGACY_TASK_IDENTIFIER = "TASKS ::: duration; external_deadline; user_deadline; ref; depends"
+    TASK_IDENTIFIER = "TASKS ::: id; estimate; actual_duration; sessions; active_since; external_deadline; user_deadline; ref; deps; mode; created"
     VALID_MODES = {"atomic", "flex", "contiguous_preferred"}
 
     def parse_task_line(
-        self, 
-        paragraph: dict, 
+        self,
+        paragraph: dict,
         checkbox_list_id: str | None,
-        source: str = "google_docs"
+        source: str = "google_docs",
     ) -> Optional[Task]:
         """Parse a paragraph into a Task if it contains valid task metadata.
-        
+
         A paragraph is considered a task only if:
         1. It has a bullet field
         2. The bullet.list_id matches the document's checkbox_list_id
         3. It is NOT the identifier line itself
-        4. It matches the task metadata pattern (title ::: duration ; deadline ; deadline [; key=value ...])
-        
-        Args:
-            paragraph: The paragraph dictionary to parse
-            checkbox_list_id: The discovered checkbox list ID for this document
-            source: The source system (default: "google_docs")
-        
-        Returns:
-            Task object if valid, None otherwise
+        4. It matches the task metadata pattern
         """
-        # Check if it's a checkbox bullet (only checkbox bullets are tasks)
         bullet = paragraph.get('bullet')
         if bullet is None:
             return None
-
-        # Require a valid checkbox list ID to be discovered
         if checkbox_list_id is None:
             return None
-
-        # Only checkbox list items are tasks (match discovered list ID)
         if bullet.get('list_id') != checkbox_list_id:
             return None
 
@@ -107,8 +99,7 @@ class TaskParser:
         if not text:
             return None
 
-        # Exclude all known identifier line variants (they're not real tasks)
-        if text in (self.TASK_IDENTIFIER, self.OLD_TASK_IDENTIFIER, self.LEGACY_TASK_IDENTIFIER):
+        if text == self.TASK_IDENTIFIER:
             return None
 
         match = self.METADATA_PATTERN.match(text)
@@ -117,264 +108,167 @@ class TaskParser:
 
         title = match.group(1).strip()
         metadata_str = match.group(2).strip()
-
-        parts = [p.strip() for p in metadata_str.split(';')]
-        if len(parts) < 3:
-            raise TaskParseError(
-                message=f"Invalid metadata format: expected at least 3 fields, got {len(parts)}. "
-                        f"Format: duration ; external_deadline ; user_deadline [; key=value ...]",
-                raw_text=text,
-                field="metadata",
-                value=metadata_str
-            )
-
-        duration_str, external_deadline_str, user_deadline_str = parts[:3]
-        extra_fields = parts[3:]
-
-        try:
-            duration = self._parse_duration(duration_str, raw_text=text)
-        except TaskParseError:
-            raise
-        
-        try:
-            external_deadline = self._parse_deadline(external_deadline_str, field="external_deadline", raw_text=text)
-        except TaskParseError:
-            raise
-
-        try:
-            user_deadline = self._parse_deadline(user_deadline_str, field="user_deadline", raw_text=text)
-        except TaskParseError:
-            raise
-
-        ref = None
-        depends_on = []
-        execution_mode = None
-
-        for field_str in extra_fields:
-            if '=' not in field_str:
-                continue
-            
-            key, value = field_str.split('=', 1)
-            key = key.strip()
-            value = value.strip()
-            
-            if key == 'ref':
-                ref = value if value else None
-            elif key in ('deps', 'depends'):
-                if value:
-                    depends_on = [d.strip() for d in value.split(',') if d.strip()]
-            elif key == 'mode':
-                if value:
-                    if value not in self.VALID_MODES:
-                        raise TaskParseError(
-                            message=f"Invalid execution mode: '{value}'. "
-                                    f"Valid modes: atomic, flex, contiguous_preferred",
-                            raw_text=text,
-                            field="mode",
-                            value=value
-                        )
-                    execution_mode = value
+        kv = parse_metadata(metadata_str)
+        task_kwargs = self._parse_kv_metadata(kv, text)
 
         completed = bullet.get('has_strikethrough', False)
-
-        task_kwargs = {
-            'title': title,
-            'estimated_duration': duration,
-            'deadline_external': external_deadline,
-            'deadline_user': user_deadline,
-            'completed': completed,
-            'source': source,
-            'ref': ref,
-            'depends_on': depends_on
-        }
-        
-        if execution_mode is not None:
-            task_kwargs['execution_mode'] = execution_mode
-
+        task_kwargs.update({'title': title, 'completed': completed, 'source': source})
         return Task(**task_kwargs)
 
-    def _parse_duration(self, duration_str: str, raw_text: Optional[str] = None) -> timedelta:
-        """Parse duration string into timedelta."""
-        if duration_str == '-':
+    def _parse_kv_metadata(self, kv: dict[str, str], raw_text: str) -> dict:
+        """Build task kwargs from a key=value metadata dict."""
+        estimate_str = kv.get(KEY_ESTIMATE) or kv.get(KEY_DURATION, "")
+        duration = parse_duration(estimate_str)
+        if duration is None:
             raise TaskParseError(
-                message="Duration cannot be unspecified (use a value, not '-')",
+                message=f"Invalid estimate: '{estimate_str}'",
                 raw_text=raw_text,
-                field="duration",
-                value=duration_str
+                field=KEY_ESTIMATE,
+                value=estimate_str,
             )
-
-        match = self.DURATION_PATTERN.match(duration_str)
-        if not match:
-            raise TaskParseError(
-                message=f"Invalid duration format: '{duration_str}'. "
-                        f"Expected format: <number>hours or <number>minutes",
-                raw_text=raw_text,
-                field="duration",
-                value=duration_str
-            )
-
-        value = int(match.group(1))
-        unit = match.group(2).lower()
-
-        if value <= 0:
-            raise TaskParseError(
-                message=f"Duration must be positive, got {value}",
-                raw_text=raw_text,
-                field="duration",
-                value=duration_str
-            )
-
-        if unit.startswith('hour'):
-            return timedelta(hours=value)
-        elif unit.startswith('minute'):
-            return timedelta(minutes=value)
-        else:
-            raise TaskParseError(
-                message=f"Unknown duration unit: {unit}",
-                raw_text=raw_text,
-                field="duration",
-                value=duration_str
-            )
-
-    def _parse_deadline(
-        self, 
-        deadline_str: str, 
-        field: Optional[str] = None,
-        raw_text: Optional[str] = None
-    ) -> Optional[datetime]:
-        """Parse deadline string into timezone-aware datetime."""
-        if deadline_str == '-':
-            return None
 
         try:
-            dt = datetime.fromisoformat(deadline_str)
-        except ValueError as e:
+            external_deadline = parse_deadline(kv.get(KEY_EXTERNAL_DEADLINE, "-"))
+        except ValueError as exc:
             raise TaskParseError(
-                message=f"Invalid deadline format: '{deadline_str}'. "
-                        f"Expected ISO-8601 format (e.g., 2026-01-09T12:00 or 2026-01-09T12:00+00:00)",
+                message=str(exc), raw_text=raw_text, field=KEY_EXTERNAL_DEADLINE
+            ) from exc
+
+        try:
+            user_deadline = parse_deadline(kv.get(KEY_USER_DEADLINE, "-"))
+        except ValueError as exc:
+            raise TaskParseError(
+                message=str(exc), raw_text=raw_text, field=KEY_USER_DEADLINE
+            ) from exc
+
+        mode = kv.get(KEY_MODE)
+        if mode and mode not in self.VALID_MODES:
+            raise TaskParseError(
+                message=f"Invalid execution mode: '{mode}'. "
+                        f"Valid modes: atomic, flex, contiguous_preferred",
                 raw_text=raw_text,
-                field=field or "deadline",
-                value=deadline_str
-            ) from e
+                field=KEY_MODE,
+                value=mode,
+            )
 
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+        ref = kv.get(KEY_REF) or None
+        depends_raw = kv.get(KEY_DEPENDS) or kv.get("depends", "")
+        depends_on = [d.strip() for d in depends_raw.split(",") if d.strip()] if depends_raw else []
 
-        return dt
+        created_raw = kv.get(KEY_CREATED, "")
+        created = parse_created(created_raw) if created_raw else None
+
+        sessions: list[WorkSession] = []
+        sessions_raw = kv.get(KEY_SESSIONS, "")
+        if sessions_raw:
+            for start, end in parse_sessions(sessions_raw):
+                try:
+                    sessions.append(WorkSession(start=start, end=end))
+                except ValueError:
+                    continue
+
+        actual_duration: Optional[timedelta] = None
+        actual_duration_raw = kv.get(KEY_ACTUAL_DURATION, "")
+        if actual_duration_raw:
+            actual_duration = parse_duration(actual_duration_raw)
+
+        active_since: Optional[datetime] = None
+        active_since_raw = kv.get(KEY_ACTIVE_SINCE, "")
+        if active_since_raw:
+            active_since = parse_active_since(active_since_raw)
+
+        kwargs: dict = {
+            "id": kv.get(KEY_ID) or None,
+            "estimated_duration": duration,
+            "deadline_external": external_deadline,
+            "deadline_user": user_deadline,
+            "ref": ref,
+            "depends_on": depends_on,
+            "created": created,
+            "sessions": sessions,
+            "actual_duration": actual_duration,
+            "active_since": active_since,
+        }
+        if mode:
+            kwargs["execution_mode"] = mode
+        return kwargs
 
 
 class MeetingParser:
-     """Parses ad-hoc meeting lines from Google Docs into AdHocMeeting objects."""
+    """Parses ad-hoc meeting lines from Google Docs into AdHocMeeting objects."""
 
-     METADATA_PATTERN = re.compile(r'^MEETING\s*:::\s*(.+)$', re.IGNORECASE)
-     MEETING_IDENTIFIER = "MEETING ::: start_time ; end_time ; optional_label"
+    METADATA_PATTERN = re.compile(r'^MEETING\s*:::\s*(.+)$', re.IGNORECASE)
+    MEETING_IDENTIFIER = "MEETING ::: start_time ; end_time ; optional_label"
 
-     def parse_meeting_line(
-         self,
-         paragraph: dict,
-         checkbox_list_id: str | None,
-         source: str = "google_docs"
-     ) -> Optional[AdHocMeeting]:
-         """Parse a paragraph into an AdHocMeeting if it contains valid meeting metadata.
+    def parse_meeting_line(
+        self,
+        paragraph: dict,
+        checkbox_list_id: str | None,
+        source: str = "google_docs",
+    ) -> Optional[AdHocMeeting]:
+        """Parse a paragraph into an AdHocMeeting if it matches the meeting format."""
+        bullet = paragraph.get('bullet')
+        if bullet is None:
+            return None
+        if checkbox_list_id is None:
+            return None
+        if bullet.get('list_id') != checkbox_list_id:
+            return None
 
-         A paragraph is considered a meeting only if:
-         1. It has a bullet field
-         2. The bullet.list_id matches the document's checkbox_list_id
-         3. It matches the meeting metadata pattern (MEETING ::: start ; end ; label)
+        text = paragraph['text'].strip()
+        if not text:
+            return None
 
-         Args:
-             paragraph: The paragraph dictionary to parse
-             checkbox_list_id: The discovered checkbox list ID for this document
-             source: The source system (default: "google_docs")
+        match = self.METADATA_PATTERN.match(text)
+        if not match:
+            return None
 
-         Returns:
-             AdHocMeeting object if valid, None otherwise
-         """
-         # Check if it's a checkbox bullet
-         bullet = paragraph.get('bullet')
-         if bullet is None:
-             return None
+        metadata_str = match.group(1).strip()
+        parts = [p.strip() for p in metadata_str.split(';')]
+        if len(parts) < 2 or len(parts) > 3:
+            raise TaskParseError(
+                message=f"Invalid meeting format: expected 2-3 fields, got {len(parts)}. "
+                        f"Format: start_time ; end_time ; optional_label",
+                raw_text=text,
+                field="metadata",
+                value=metadata_str,
+            )
 
-         # Require a valid checkbox list ID
-         if checkbox_list_id is None:
-             return None
+        start_str, end_str = parts[0], parts[1]
+        label = parts[2] if len(parts) == 3 else None
 
-         # Only checkbox list items are meetings (match discovered list ID)
-         if bullet.get('list_id') != checkbox_list_id:
-             return None
+        start = self._parse_datetime(start_str, field="start_time", raw_text=text)
+        end = self._parse_datetime(end_str, field="end_time", raw_text=text)
 
-         text = paragraph['text'].strip()
-         if not text:
-             return None
+        if start >= end:
+            raise TaskParseError(
+                message="Meeting start time must be before end time",
+                raw_text=text,
+                field="time_order",
+                value=f"{start} >= {end}",
+            )
 
-         match = self.METADATA_PATTERN.match(text)
-         if not match:
-             return None
+        return AdHocMeeting(start=start, end=end, label=label, source=source)
 
-         metadata_str = match.group(1).strip()
-
-         parts = [p.strip() for p in metadata_str.split(';')]
-         if len(parts) < 2 or len(parts) > 3:
-             raise TaskParseError(
-                 message=f"Invalid meeting format: expected 2-3 fields, got {len(parts)}. "
-                         f"Format: start_time ; end_time ; optional_label",
-                 raw_text=text,
-                 field="metadata",
-                 value=metadata_str
-             )
-
-         start_str = parts[0]
-         end_str = parts[1]
-         label = parts[2] if len(parts) == 3 else None
-
-         try:
-             start = self._parse_datetime(start_str, field="start_time", raw_text=text)
-         except TaskParseError:
-             raise
-
-         try:
-             end = self._parse_datetime(end_str, field="end_time", raw_text=text)
-         except TaskParseError:
-             raise
-
-         # Validate start < end
-         if start >= end:
-             raise TaskParseError(
-                 message=f"Meeting start time must be before end time",
-                 raw_text=text,
-                 field="time_order",
-                 value=f"{start} >= {end}"
-             )
-
-         return AdHocMeeting(
-             start=start,
-             end=end,
-             label=label,
-             source=source
-         )
-
-     def _parse_datetime(
-         self,
-         datetime_str: str,
-         field: Optional[str] = None,
-         raw_text: Optional[str] = None
-     ) -> datetime:
-         """Parse datetime string into timezone-aware datetime."""
-         try:
-             dt = datetime.fromisoformat(datetime_str)
-         except ValueError as e:
-             raise TaskParseError(
-                 message=f"Invalid datetime format: '{datetime_str}'. "
-                         f"Expected ISO-8601 format (e.g., 2026-01-25T14:00 or 2026-01-25T14:00+00:00)",
-                 raw_text=raw_text,
-                 field=field or "datetime",
-                 value=datetime_str
-             ) from e
-
-         if dt.tzinfo is None:
-             dt = dt.replace(tzinfo=timezone.utc)
-
-         return dt
+    def _parse_datetime(
+        self,
+        datetime_str: str,
+        field: Optional[str] = None,
+        raw_text: Optional[str] = None,
+    ) -> datetime:
+        try:
+            dt = datetime.fromisoformat(datetime_str)
+        except ValueError as exc:
+            raise TaskParseError(
+                message=f"Invalid datetime format: '{datetime_str}'. "
+                        f"Expected ISO-8601 format",
+                raw_text=raw_text,
+                field=field or "datetime",
+                value=datetime_str,
+            ) from exc
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
 
 
 class TodoDeriver:
@@ -386,136 +280,81 @@ class TodoDeriver:
     def derive_todo_list(
         self,
         document_structure: dict,
-        exclude_tab_titles: Optional[list[str]] = None
+        exclude_tab_titles: Optional[list[str]] = None,
     ) -> list[Task]:
-        """Derive TODO list from tabs, excluding specified tab titles.
-
-        Args:
-            document_structure: Parsed document with tabs
-            exclude_tab_titles: Tab titles to exclude (e.g., ["todo"]). 
-                                Case-insensitive comparison.
-
-        Returns:
-            Sorted list of tasks from non-excluded tabs
-        """
+        """Derive TODO list from tabs, excluding specified tab titles."""
         if exclude_tab_titles is None:
-            exclude_tab_titles = ['todo']
+            exclude_tab_titles = EXCLUDED_TAB_TITLES
 
-        # Normalize exclusion list for case-insensitive comparison
-        exclude_normalized = [t.lower() for t in exclude_tab_titles]
-
+        exclude_normalized = {t.lower() for t in exclude_tab_titles}
         tasks = []
         document_title = document_structure.get('title', '').strip()
 
-        # Process each tab
-        tabs = document_structure.get('tabs', [])
-        for tab in tabs:
+        for tab in document_structure.get('tabs', []):
             try:
                 tab_title = tab.get('title', '').strip()
-
-                # Skip excluded tabs
                 if tab_title.lower() in exclude_normalized:
                     continue
 
-                # Get the checkbox list ID for this tab
                 checkbox_list_id = tab.get('checkbox_list_id')
-
-                # If no checkbox list ID found for this tab, raise error
                 if checkbox_list_id is None:
                     raise TaskParseError(
                         message=f"No checkbox list ID found in tab '{tab_title}'. "
                                 f"Tab must contain a checkbox line with text: "
-                                f"'TASKS ::: duration; external_deadline; user_deadline; ref; deps; mode'",
+                                f"'{TaskParser.TASK_IDENTIFIER}'",
                         raw_text=None,
                         field="checkbox_list_id",
-                        value=None
+                        value=None,
                     )
 
-                # Process paragraphs in this tab
-                paragraphs = tab.get('paragraphs', [])
-                for paragraph in paragraphs:
-                    # Track section context using heading styles
+                for paragraph in tab.get('paragraphs', []):
                     style = paragraph.get('style', 'NORMAL_TEXT')
-
-                    # Update section context if this is a heading
                     if style in ['HEADING_1', 'HEADING_2', 'HEADING_3']:
-                        current_section = paragraph.get('text', '').strip()
                         continue
-
-                    # Try to parse as task
                     try:
                         task = self.parser.parse_task_line(paragraph, checkbox_list_id)
                         if task:
-                            # Add document and tab context
                             if document_title:
                                 task.document_title = document_title
                             if tab_title:
                                 task.section = tab_title
                             tasks.append(task)
                     except TaskParseError:
-                        # Ignore lines that can't be parsed as tasks
                         continue
             except TaskParseError:
                 continue
 
-        # Do NOT sort here - tasks will be sorted globally after aggregation
         return tasks
-
-    def _extract_section_name(self, text: str) -> str:
-        """Extract section name from heading text."""
-        return text.strip()
 
     def derive_meetings_list(
         self,
         document_structure: dict,
-        exclude_tab_titles: Optional[list[str]] = None
+        exclude_tab_titles: Optional[list[str]] = None,
     ) -> list[AdHocMeeting]:
-        """Derive list of ad-hoc meetings from document structure.
-
-        Args:
-            document_structure: Parsed document with tabs
-            exclude_tab_titles: Tab titles to exclude (e.g., ["todo"]).
-                                Case-insensitive comparison.
-
-        Returns:
-            List of AdHocMeeting objects
-        """
+        """Derive list of ad-hoc meetings from document structure."""
         if exclude_tab_titles is None:
-            exclude_tab_titles = ['todo']
+            exclude_tab_titles = EXCLUDED_TAB_TITLES
 
-        # Normalize exclusion list for case-insensitive comparison
-        exclude_normalized = [t.lower() for t in exclude_tab_titles]
-
+        exclude_normalized = {t.lower() for t in exclude_tab_titles}
         meetings = []
         meeting_parser = MeetingParser()
 
-        # Process each tab
-        tabs = document_structure.get('tabs', [])
-        for tab in tabs:
+        for tab in document_structure.get('tabs', []):
             try:
                 tab_title = tab.get('title', '').strip()
-
-                # Skip excluded tabs
                 if tab_title.lower() in exclude_normalized:
                     continue
 
-                # Get the checkbox list ID for this tab
                 checkbox_list_id = tab.get('checkbox_list_id')
-
-                # If no checkbox list ID found for this tab, skip
                 if checkbox_list_id is None:
                     continue
 
-                # Process paragraphs in this tab
-                paragraphs = tab.get('paragraphs', [])
-                for paragraph in paragraphs:
-                    # Try to parse as meeting
+                for paragraph in tab.get('paragraphs', []):
                     try:
                         meeting = meeting_parser.parse_meeting_line(paragraph, checkbox_list_id)
                         if meeting:
                             meetings.append(meeting)
                     except TaskParseError:
-                        # Ignore lines that can't be parsed as meetings
                         continue
             except TaskParseError:
                 continue
@@ -525,26 +364,19 @@ class TodoDeriver:
 
 def parse_document_tasks(
     document_structure: dict,
-    source: str = "google_docs"
+    source: str = "google_docs",
 ) -> list[Task]:
     """Parse all tasks from a document structure with tabs."""
     parser = TaskParser()
     tasks = []
     document_title = document_structure.get('title', '').strip()
-    
-    tabs = document_structure.get('tabs', [])
-    for tab in tabs:
+
+    for tab in document_structure.get('tabs', []):
         tab_title = tab.get('title', '').strip()
-        
-        # Get the checkbox list ID for this tab
         checkbox_list_id = tab.get('checkbox_list_id')
-        
-        # If no checkbox list ID found for this tab, skip it
         if checkbox_list_id is None:
             continue
-        
-        paragraphs = tab.get('paragraphs', [])
-        for paragraph in paragraphs:
+        for paragraph in tab.get('paragraphs', []):
             try:
                 task = parser.parse_task_line(paragraph, checkbox_list_id, source=source)
                 if task:
@@ -555,23 +387,21 @@ def parse_document_tasks(
                     tasks.append(task)
             except TaskParseError:
                 continue
-    
+
     return tasks
 
 
 def derive_todo_list(
     document_structure: dict,
-    exclude_tab_titles: Optional[list[str]] = None
+    exclude_tab_titles: Optional[list[str]] = None,
 ) -> list[Task]:
     """Derive and sort the canonical TODO list from a document with tabs."""
-    deriver = TodoDeriver()
-    return deriver.derive_todo_list(document_structure, exclude_tab_titles)
+    return TodoDeriver().derive_todo_list(document_structure, exclude_tab_titles)
 
 
 def parse_document_meetings(
     document_structure: dict,
-    exclude_tab_titles: Optional[list[str]] = None
+    exclude_tab_titles: Optional[list[str]] = None,
 ) -> list[AdHocMeeting]:
     """Parse all ad-hoc meetings from a document structure with tabs."""
-    deriver = TodoDeriver()
-    return deriver.derive_meetings_list(document_structure, exclude_tab_titles)
+    return TodoDeriver().derive_meetings_list(document_structure, exclude_tab_titles)

@@ -11,13 +11,25 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.document import Document
 
 from chronix.cli.commands import (
+    add_command,
     sync_command,
     today_command,
     calendar_command,
     documents_command,
     schedule_command,
     explain_command,
-    help_command
+    help_command,
+    update_command,
+    rename_command,
+    duration_command,
+    deadline_command,
+    mode_command,
+    done_command,
+    undone_command,
+    pause_command,
+    resume_command,
+    meta_command,
+    delete_command,
 )
 from chronix.cli.config_commands import config_command
 from chronix.cli.formatting import console
@@ -29,6 +41,7 @@ class ChronixShell:
     def __init__(self):
         self.running = False
         self.commands = {
+            'add': add_command,
             'sync': sync_command,
             'today': today_command,
             'calendar': calendar_command,
@@ -36,6 +49,17 @@ class ChronixShell:
             'schedule': schedule_command,
             'explain': explain_command,
             'config': config_command,
+            'update': update_command,
+            'rename': rename_command,
+            'duration': duration_command,
+            'deadline': deadline_command,
+            'mode': mode_command,
+            'done': done_command,
+            'undone': undone_command,
+            'pause': pause_command,
+            'resume': resume_command,
+            'meta': meta_command,
+            'delete': delete_command,
             'help': help_command,
             'exit': self._exit_command,
             'quit': self._exit_command,

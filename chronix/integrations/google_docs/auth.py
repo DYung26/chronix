@@ -14,7 +14,7 @@ from googleapiclient.discovery import build
 
 
 SCOPES = [
-    "https://www.googleapis.com/auth/documents.readonly",
+    "https://www.googleapis.com/auth/documents",
     "https://www.googleapis.com/auth/calendar.readonly",
     "https://www.googleapis.com/auth/calendar.events",
 ]

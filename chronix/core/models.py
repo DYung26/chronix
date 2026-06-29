@@ -9,6 +9,35 @@ import secrets
 ExecutionMode = Literal["atomic", "flex", "contiguous_preferred"]
 
 
+def generate_task_id() -> str:
+    """Generate a random, URL-safe persistent task identifier."""
+    return secrets.token_urlsafe(6)
+
+
+class WorkSession(BaseModel):
+    """A completed interval of work on a task."""
+
+    start: datetime
+    end: datetime
+
+    @field_validator("start", "end")
+    @classmethod
+    def validate_timezone_aware(cls, v: datetime) -> datetime:
+        if v.tzinfo is None:
+            raise ValueError("start and end must be timezone-aware")
+        return v
+
+    @model_validator(mode="after")
+    def validate_start_before_end(self):
+        if self.start >= self.end:
+            raise ValueError("start must be before end")
+        return self
+
+    @property
+    def duration(self) -> timedelta:
+        return self.end - self.start
+
+
 class Task(BaseModel):
     """Represents a unit of work, independent of its source or scheduling."""
 
@@ -25,14 +54,10 @@ class Task(BaseModel):
     ref: Optional[str] = None
     depends_on: list[str] = []
     execution_mode: ExecutionMode = "atomic"
-
-    @model_validator(mode="before")
-    @classmethod
-    def generate_id_if_empty(cls, values):
-        if isinstance(values, dict):
-            if not values.get("id"):
-                values["id"] = secrets.token_urlsafe(6)
-        return values
+    created: Optional[datetime] = None
+    sessions: list[WorkSession] = []
+    actual_duration: Optional[timedelta] = None
+    active_since: Optional[datetime] = None
 
     @model_validator(mode="before")
     @classmethod
@@ -46,7 +71,7 @@ class Task(BaseModel):
                     total_minutes = duration / 60 if duration > 60 else duration
                 else:
                     total_minutes = 0
-                
+
                 if total_minutes <= 90:
                     values["execution_mode"] = "atomic"
                 else:
@@ -67,6 +92,13 @@ class Task(BaseModel):
             raise ValueError("deadline must be timezone-aware")
         return v
 
+    @field_validator("created", "active_since")
+    @classmethod
+    def validate_datetime_timezone_aware(cls, v: Optional[datetime]) -> Optional[datetime]:
+        if v is not None and v.tzinfo is None:
+            raise ValueError("datetime must be timezone-aware")
+        return v
+
     @model_validator(mode="after")
     def validate_id_or_title_nonempty(self):
         if not self.id and not self.title:
@@ -77,6 +109,20 @@ class Task(BaseModel):
     def effective_deadline(self) -> Optional[datetime]:
         """Returns deadline_external if set, otherwise deadline_user."""
         return self.deadline_external if self.deadline_external is not None else self.deadline_user
+
+    @property
+    def is_active(self) -> bool:
+        """True if the task has an open work session (either implicit or explicit)."""
+        return self.active_since is not None
+
+    @property
+    def is_paused(self) -> bool:
+        """True if the task has completed sessions but no current active session."""
+        return bool(self.sessions) and self.active_since is None
+
+    def compute_actual_duration(self) -> timedelta:
+        """Sum of all completed work session durations."""
+        return sum((s.duration for s in self.sessions), timedelta())
 
 
 class TimeBlock(BaseModel):
@@ -163,7 +209,7 @@ class ScheduledTask(BaseModel):
         if not self.is_segment and actual_duration != self.task.estimated_duration:
             raise ValueError("duration must equal task.estimated_duration")
         return self
-    
+
     @model_validator(mode="after")
     def validate_segment_fields(self):
         if self.is_segment:

@@ -150,6 +150,30 @@ class CalendarSyncService:
                 success=False,
                 error_message=f"Sync failed: {str(e)}"
             )
+
+    def find_task_scheduled_start(
+        self,
+        task_id: str,
+        search_start: datetime,
+        search_end: datetime,
+    ) -> Optional[datetime]:
+        """Return the calendar start time of the most recent scheduled event for task_id.
+
+        Searches Chronix-managed events in [search_start, search_end] and returns
+        the start of the first matching event, or None if none is found.
+        """
+        try:
+            calendar_id = self.client.get_primary_calendar()
+            events = self.client.list_events(calendar_id, search_start, search_end)
+            for event in events:
+                if (
+                    self.classifier.is_chronix_managed(event)
+                    and self.classifier.get_chronix_task_id(event) == task_id
+                ):
+                    return _parse_datetime(event.get('start'))
+        except Exception:
+            pass
+        return None
     
     def _find_conflicts(self, event: dict, scheduled_tasks: list[ScheduledTask], sync_start: datetime, sync_end: datetime) -> list[ConflictInfo]:
         """Find conflicts between a calendar event and scheduled tasks."""

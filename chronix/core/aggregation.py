@@ -8,6 +8,34 @@ from chronix.core.models import Task
 from chronix.core.dependencies import resolve_task_dependencies, DependencyError
 
 
+# ---------------------------------------------------------------------------
+# Backlog ageing
+# ---------------------------------------------------------------------------
+
+_AGEING_HALF_LIFE_DAYS = 30.0
+
+
+def _ageing_bonus_seconds(task: Task, now: datetime) -> float:
+    """Return a scheduling bonus in seconds derived from how long a task has existed.
+
+    Applies only to tasks without any deadline.  The bonus grows as the task
+    ages and is bounded so it can never exceed the urgency of a legitimate
+    deadline task.  The half-life controls how quickly the bonus accumulates:
+    a task at half-life age earns half the maximum bonus.
+
+    A larger bonus means the task should be scheduled earlier (lower sort key).
+    """
+    if task.effective_deadline is not None:
+        return 0.0
+    if task.created is None:
+        return 0.0
+    age_days = max(0.0, (now - task.created).total_seconds() / 86400)
+    # Bounded growth: bonus saturates asymptotically toward _MAX_AGEING_BONUS_SECONDS
+    _MAX_AGEING_BONUS_SECONDS = 3600 * 24 * 14  # 14 days worth of seconds
+    bonus = _MAX_AGEING_BONUS_SECONDS * (1.0 - 2.0 ** (-age_days / _AGEING_HALF_LIFE_DAYS))
+    return bonus
+
+
 @dataclass
 class ProjectContext:
     """Project identity and metadata."""
@@ -182,11 +210,13 @@ class TaskAggregator:
             )
         )
 
+        now = datetime.now(timezone.utc)
         none_sorted = sorted(
             incomplete_none,
             key=lambda t: (
+                -_ageing_bonus_seconds(t, now),
                 t.estimated_duration,
-                t.title
+                t.title,
             )
         )
 
