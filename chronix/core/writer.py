@@ -19,6 +19,10 @@ class NewTask:
     preserved verbatim in the serialized line after the well-known keys.
 
     ``created`` is set automatically by the writer when not supplied.
+
+    ``tab`` selects which document tab (by title or tab ID) to insert the
+    task into, for sources that support tabs. If unset, the writer falls
+    back to its default (e.g. the first tab with a valid task section).
     """
 
     title: str
@@ -30,6 +34,7 @@ class NewTask:
     ref: Optional[str] = None
     depends: Optional[str] = None
     created: Optional[datetime] = None
+    tab: Optional[str] = None
     extra: dict[str, str] = field(default_factory=dict)
 
 

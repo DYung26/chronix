@@ -55,7 +55,7 @@ class GoogleDocsTaskWriter(TaskWriter):
             includeTabsContent=True,
         ).execute()
 
-        placeholder_index, placeholder_existed, tab_id = self._find_insertion_point(doc)
+        placeholder_index, placeholder_existed, tab_id = self._find_insertion_point(doc, task.tab)
 
         location: dict[str, Any] = {"index": placeholder_index}
         if tab_id is not None:
@@ -142,9 +142,22 @@ class GoogleDocsTaskWriter(TaskWriter):
             body={"requests": [{"deleteContentRange": {"range": range_}}]},
         ).execute()
 
-    def _find_insertion_point(self, doc: dict[str, Any]) -> tuple[int, bool, str | None]:
+    def _find_insertion_point(
+        self, doc: dict[str, Any], tab_token: str | None = None
+    ) -> tuple[int, bool, str | None]:
         tabs = doc.get("tabs", [])
         if tabs:
+            if tab_token is not None:
+                tab_data = _find_tab_by_token(tabs, tab_token)
+                if tab_data is None:
+                    raise ValueError(
+                        f"Tab '{tab_token}' not found in document. "
+                        f"Available tabs: {_format_tab_titles(tabs)}"
+                    )
+                result = self._find_insertion_in_tab(tab_data, allow_excluded=True)
+                if result is None:
+                    raise ValueError(f"No TASKS section found in tab '{tab_token}'")
+                return result
             for tab_data in tabs:
                 result = self._find_insertion_in_tab(tab_data)
                 if result is not None:
@@ -158,10 +171,12 @@ class GoogleDocsTaskWriter(TaskWriter):
 
         raise ValueError("No TASKS section found in document")
 
-    def _find_insertion_in_tab(self, tab_data: dict[str, Any]) -> tuple[int, bool, str] | None:
+    def _find_insertion_in_tab(
+        self, tab_data: dict[str, Any], allow_excluded: bool = False
+    ) -> tuple[int, bool, str] | None:
         tab_id = tab_data.get("tabProperties", {}).get("tabId", "")
         title = tab_data.get("tabProperties", {}).get("title", "")
-        if title.lower() in EXCLUDED_TAB_TITLES:
+        if not allow_excluded and title.lower() in EXCLUDED_TAB_TITLES:
             return None
         content = tab_data.get("documentTab", {}).get("body", {}).get("content", [])
         result = _find_placeholder_index(content)
@@ -399,6 +414,24 @@ def _paragraph_text(paragraph: dict[str, Any]) -> str:
             continue
         parts.append(tr.get("content", ""))
     return "".join(parts).strip()
+
+
+def _find_tab_by_token(tabs: list[dict[str, Any]], token: str) -> dict[str, Any] | None:
+    """Resolve a tab token (tabId, exact match, or title, case-insensitive) to its tab data."""
+    for tab_data in tabs:
+        if tab_data.get("tabProperties", {}).get("tabId") == token:
+            return tab_data
+    token_lower = token.strip().lower()
+    for tab_data in tabs:
+        title = tab_data.get("tabProperties", {}).get("title", "")
+        if title.strip().lower() == token_lower:
+            return tab_data
+    return None
+
+
+def _format_tab_titles(tabs: list[dict[str, Any]]) -> str:
+    titles = [tab_data.get("tabProperties", {}).get("title") or "(untitled)" for tab_data in tabs]
+    return ", ".join(titles) if titles else "(none)"
 
 
 def _find_checkbox_list_id(content: list[dict[str, Any]]) -> str | None:

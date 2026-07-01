@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 
 from chronix.integrations.google_docs.client import GoogleDocsClient
 from chronix.integrations.google_docs.parser import GoogleDocsParser
-from chronix.core.todo import TodoDeriver, parse_document_meetings
+from chronix.core.todo import TodoDeriver, parse_document_meetings, EXCLUDED_TAB_TITLES
 from chronix.core.aggregation import ProjectTodoList, TaskAggregator
 from chronix.core.scheduler import SchedulingEngine, create_time_block
 from chronix.core.models import Task, DaySchedule
@@ -745,6 +745,67 @@ def documents_command(args: list[str]) -> int:
         return 1
 
 
+def tabs_command(args: list[str]) -> int:
+    """
+    Tabs command: List the tabs in a document, for use with add's --tab flag.
+
+    Usage: tabs <id|alias>
+    """
+    if len(args) != 1:
+        print_error("Usage: tabs <id|alias>")
+        return 1
+
+    doc_token = args[0]
+
+    try:
+        from chronix.config import ChronixConfig
+        config = _context.config or ChronixConfig.load_or_default()
+    except Exception as e:
+        print_error(f"Failed to load configuration: {e}")
+        return 1
+
+    doc_id = _resolve_document_token(doc_token, config)
+    if doc_id is None:
+        print_error(f"Unknown document: '{doc_token}'")
+        return 1
+
+    try:
+        client = _context._ensure_google_client()
+        console.print("[dim]Authenticating with Google Docs...[/dim]")
+        if not client.authenticate():
+            print_error("Authentication failed. Please check your credentials.")
+            return 1
+        doc = client.fetch_document(doc_id)
+    except Exception as e:
+        print_error(f"Failed to fetch document: {e}")
+        return 1
+
+    structure = GoogleDocsParser().parse_document(doc)
+
+    if not structure.tabs:
+        print_warning("No tabs found in this document.")
+        return 0
+
+    console.print()
+    console.print(f"[bold]Tabs in {config.google_docs.format_document_label(doc_id)}:[/bold]")
+    console.print()
+
+    for tab in structure.tabs:
+        title = tab.title or "(untitled)"
+        notes = []
+        if tab.checkbox_list_id is None:
+            notes.append("no TASKS section")
+        if title.strip().lower() in EXCLUDED_TAB_TITLES:
+            notes.append("excluded from auto-select")
+        suffix = f" [dim]({', '.join(notes)})[/dim]" if notes else ""
+        console.print(f"  [cyan]{title}[/cyan] [dim]({tab.tab_id})[/dim]{suffix}")
+
+    console.print()
+    console.print("Use a tab's title (or ID) with [cyan]add ... --tab <title|id>[/cyan]")
+    console.print()
+    return 0
+
+
 def help_command(args: list[str]) -> int:
     """
     Help command: Show available commands.
@@ -756,34 +817,41 @@ def help_command(args: list[str]) -> int:
     console.print()
     
     commands_table = [
-        ("add <duration> <title> [--doc <id|alias>]", "Create a new task in a Google Docs document"),
+        ("add <duration> <title> [--doc <id|alias>] [--tab <title|id>]", "Create a new task in a Google Docs document"),
         ("calendar [HH:MM] [--force]", "Sync today's schedule to Google Calendar"),
         ("config <cmd>", "Manage configuration (init, show, path, validate)"),
-        ("deadline <task_id> <ISO|-> [--user]", "Set external deadline; --user sets user deadline instead"),
-        ("delete <task_id>", "Delete a task from its document"),
+        ("deadline <task_id> <ISO|-> [--user] [--doc <id|alias>]", "Set external deadline; --user sets user deadline instead"),
+        ("delete <task_id> [--doc <id|alias>]", "Delete a task from its document"),
         ("documents", "List all configured documents with aliases"),
+        ("tabs <id|alias>", "List the tabs in a document (for add's --tab flag)"),
         ("done <task_id> [--doc <id|alias>]", "Complete a task, recording actual duration from sessions"),
         ("pause <task_id> [--doc <id|alias>]", "Close the current work session"),
         ("resume <task_id> [--doc <id|alias>]", "Open a new work session starting now"),
-        ("duration <task_id> <dur>", "Change a task's estimated duration (e.g. 2h, 30m)"),
+        ("duration <task_id> <dur> [--doc <id|alias>]", "Change a task's estimated duration (e.g. 2h, 30m)"),
         ("explain <task_id>", "Show details and scheduling info for a task"),
-        ("meta <task_id> [k=v ...] [--remove k]", "Set or remove arbitrary metadata fields"),
-        ("mode <task_id> <mode>", "Set execution mode (atomic|flex|contiguous_preferred)"),
-        ("rename <task_id> <title>", "Rename a task"),
+        ("meta <task_id> [k=v ...] [--remove k] [--doc <id|alias>]", "Set or remove arbitrary metadata fields"),
+        ("mode <task_id> <mode> [--doc <id|alias>]", "Set execution mode (atomic|flex|contiguous_preferred)"),
+        ("rename <task_id> <title> [--doc <id|alias>]", "Rename a task"),
         ("schedule [days]", "Display multi-day schedule (default: unlimited days)"),
         ("sync", "Fetch and parse all configured documents"),
         ("sync <id|alias> [...]", "Sync one or more specific documents by ID or alias"),
         ("today [HH:MM]", "Display today's scheduled tasks from optional start time"),
-        ("undone <task_id>", "Mark a task as incomplete"),
-        ("update <task_id> [flags]", "Update fields: --title --duration --external-deadline --user-deadline --mode --meta --remove-meta"),
+        ("undone <task_id> [--doc <id|alias>]", "Mark a task as incomplete"),
+        ("update <task_id> [flags] [--doc <id|alias>]", "Update fields: --title --duration --external-deadline --user-deadline --mode --meta --remove-meta"),
         ("clear / cls", "Clear the terminal screen"),
         ("help", "Show this help message"),
         ("exit / quit", "Exit the interactive shell"),
     ]
     
     for cmd, desc in commands_table:
-        console.print(f"  [cyan]{cmd:42}[/cyan] [dim]{desc}[/dim]")
+        console.print(f"  [cyan]{cmd:52}[/cyan] [dim]{desc}[/dim]")
     
+    console.print()
+    console.print("[bold]--doc resolution:[/bold]")
+    console.print("  In this interactive shell, --doc is optional for task commands once a")
+    console.print("  document has been synced; chronix resolves it from the task's ID automatically.")
+    console.print("  In one-shot mode (chronix <cmd> ...), done/pause/resume require --doc")
+    console.print("  explicitly, since there's no prior sync to resolve it from.")
     console.print()
     console.print("[bold]Configuration:[/bold]")
     console.print(f"  [dim]Config file:[/dim] ~/.config/chronix/config.toml")
@@ -824,16 +892,23 @@ def add_command(args: list[str]) -> int:
     """
     Add command: Create a new task in a Google Docs document.
 
-    Usage: add <duration> <title> [--doc <id|alias>]
+    Usage: add <duration> <title> [--doc <id|alias>] [--tab <title|id>]
 
     Duration examples: 2h, 30m, 2hours, 30minutes
+
+    Without --tab, the task is inserted into the first tab that has a
+    TASKS section (matching prior behavior).
     """
     doc_token: Optional[str] = None
+    tab_token: Optional[str] = None
     remaining: list[str] = []
     i = 0
     while i < len(args):
         if args[i] == "--doc" and i + 1 < len(args):
             doc_token = args[i + 1]
+            i += 2
+        elif args[i] == "--tab" and i + 1 < len(args):
+            tab_token = args[i + 1]
             i += 2
         elif args[i].startswith("--"):
             print_error(f"Unknown flag: {args[i]}")
@@ -843,7 +918,7 @@ def add_command(args: list[str]) -> int:
             i += 1
 
     if len(remaining) < 2:
-        print_error("Usage: add <duration> <title> [--doc <id|alias>]")
+        print_error("Usage: add <duration> <title> [--doc <id|alias>] [--tab <title|id>]")
         return 1
 
     duration_str = remaining[0]
@@ -889,7 +964,7 @@ def add_command(args: list[str]) -> int:
         client = _context._ensure_google_client()
         writer = GoogleDocsTaskWriter(auth_strategy=client.auth_strategy)
         task_id = generate_task_id()
-        writer.create_task(doc_id, NewTask(title=title, duration=duration, id=task_id))
+        writer.create_task(doc_id, NewTask(title=title, duration=duration, id=task_id, tab=tab_token))
         _resync_document(doc_id, config)
         print_success(f"Task added: {title} ({duration_str}) [id={task_id}]")
         return 0
@@ -1026,12 +1101,29 @@ def _resync_document(doc_id: str, config) -> None:
     _context.config = config
 
 
-def _resolve_edit_doc(doc_token: Optional[str], config) -> Optional[str]:
+def _find_document_for_task(task_id: str) -> Optional[str]:
+    """Return the document_id of the currently-synced project containing task_id.
+
+    Only looks at in-memory `_context.projects`, so this is only useful after
+    a sync has populated it (e.g. the REPL's startup sync, or a preceding
+    `sync` in the same session). Returns None if not found there.
+    """
+    for project in _context.projects:
+        for task in project.tasks:
+            if task.id == task_id:
+                return project.project_context.document_id
+    return None
+
+
+def _resolve_edit_doc(task_id: str, doc_token: Optional[str], config) -> Optional[str]:
     all_doc_ids = config.google_docs.document_ids
     if not all_doc_ids:
         return None
     if doc_token is not None:
         return _resolve_document_token(doc_token, config)
+    found = _find_document_for_task(task_id)
+    if found is not None:
+        return found
     if len(all_doc_ids) == 1:
         return all_doc_ids[0]
     return None
@@ -1061,7 +1153,7 @@ def _run_task_update(task_id: str, update, doc_token: Optional[str] = None) -> i
         print_error(f"Failed to load configuration: {e}")
         return 1
 
-    doc_id = _resolve_edit_doc(doc_token, config)
+    doc_id = _resolve_edit_doc(task_id, doc_token, config)
     if doc_id is None:
         if not config.google_docs.document_ids:
             print_error("No documents configured.")
@@ -1587,7 +1679,7 @@ def delete_command(args: list[str]) -> int:
         print_error(f"Failed to load configuration: {e}")
         return 1
 
-    doc_id = _resolve_edit_doc(doc_token, config)
+    doc_id = _resolve_edit_doc(task_id, doc_token, config)
     if doc_id is None:
         if not config.google_docs.document_ids:
             print_error("No documents configured.")

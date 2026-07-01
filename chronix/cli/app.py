@@ -16,6 +16,7 @@ from chronix.cli.commands import (
     today_command,
     calendar_command,
     documents_command,
+    tabs_command,
     schedule_command,
     explain_command,
     help_command,
@@ -30,9 +31,16 @@ from chronix.cli.commands import (
     resume_command,
     meta_command,
     delete_command,
+    _parse_edit_flags,
 )
 from chronix.cli.config_commands import config_command
 from chronix.cli.formatting import console
+
+# Commands that read from `_context` and need it populated before running.
+# The REPL syncs once at startup and keeps `_context` warm for the session;
+# one-shot invocations start cold every time and must sync on demand.
+_FULL_CONTEXT_COMMANDS = frozenset({"today", "schedule", "calendar", "explain"})
+_TASK_LOOKUP_COMMANDS = frozenset({"done", "pause", "resume"})
 
 
 class ChronixShell:
@@ -46,6 +54,7 @@ class ChronixShell:
             'today': today_command,
             'calendar': calendar_command,
             'documents': documents_command,
+            'tabs': tabs_command,
             'schedule': schedule_command,
             'explain': explain_command,
             'config': config_command,
@@ -256,12 +265,22 @@ class ChronixShell:
                 break
     
     def execute_one_shot(self, command_name: str, args: list[str]) -> int:
-        """Execute a single command and exit."""
+        """Execute a single command and exit.
+
+        One-shot invocations have no warm `_context` the way the REPL does,
+        so commands that read from it need an on-demand sync first.
+        """
         if command_name not in self.commands:
             console.print(f"[yellow]Unknown command:[/yellow] {command_name}")
             console.print("[dim]Type 'chronix help' for available commands.[/dim]")
             return 1
-        
+
+        try:
+            self._ensure_context_for_one_shot(command_name, args)
+        except Exception as e:
+            console.print(f"[red]Error:[/red] {e}")
+            return 1
+
         command = self.commands[command_name]
         try:
             return command(args)
@@ -269,14 +288,33 @@ class ChronixShell:
             console.print(f"[red]Error:[/red] {e}")
             return 1
 
+    def _ensure_context_for_one_shot(self, command_name: str, args: list[str]) -> None:
+        """Sync the documents a command needs before running it.
+
+        Full-context commands (today/schedule/calendar/explain) require the
+        complete aggregated task view and always sync everything configured.
+
+        Task-lookup commands (done/pause/resume) only need the one document a
+        task lives in. One-shot invocations have no prior sync to resolve that
+        from, so `--doc` is required here rather than falling back to a full
+        sync of every configured document just to locate one task.
+        """
+        if command_name in _FULL_CONTEXT_COMMANDS:
+            sync_command([])
+        elif command_name in _TASK_LOOKUP_COMMANDS:
+            doc_token, _ = _parse_edit_flags(args)
+            if doc_token is None:
+                raise ValueError(
+                    f"'{command_name}' requires --doc <id|alias> when run as a one-shot "
+                    f"command, since there's no prior sync to resolve the task's document from."
+                )
+            sync_command([doc_token])
+
 
 def main():
     """Main CLI entry point."""
-    # Clear terminal on startup
-    os.system('cls' if os.name == 'nt' else 'clear')
-    
     shell = ChronixShell()
-    
+
     if len(sys.argv) > 1:
         # One-shot command mode
         command_name = sys.argv[1]
