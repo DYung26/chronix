@@ -35,6 +35,7 @@ from chronix.cli.commands import (
 )
 from chronix.cli.config_commands import config_command
 from chronix.cli.formatting import console
+from chronix.cli.highlighting import ChronixCommandLexer, chronix_style
 
 # Commands that read from `_context` and need it populated before running.
 # The REPL syncs once at startup and keeps `_context` warm for the session;
@@ -89,7 +90,9 @@ class ChronixShell:
         self.prompt_session = PromptSession(
             history=self.history,
             enable_history_search=True,
-            key_bindings=kb
+            key_bindings=kb,
+            lexer=ChronixCommandLexer(known_commands=frozenset(self.commands)),
+            style=chronix_style,
         )
     
     def _create_key_bindings(self) -> KeyBindings:
