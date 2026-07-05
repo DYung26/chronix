@@ -8,6 +8,7 @@ from chronix.core.metadata import (
     KEY_ACTIVE_SINCE,
     KEY_ACTUAL_DURATION,
     KEY_CREATED,
+    KEY_DEADLINE_COMPUTED,
     KEY_DEPENDS,
     KEY_DURATION,
     KEY_ESTIMATE,
@@ -70,7 +71,7 @@ class TaskParser:
     """Parses task lines with metadata into Task domain objects."""
 
     METADATA_PATTERN = re.compile(r'^(.*?)\s*:::\s*(.+)$')
-    TASK_IDENTIFIER = "TASKS ::: id; estimate; actual_duration; sessions; active_since; external_deadline; user_deadline; ref; deps; mode; created"
+    TASK_IDENTIFIER = "TASKS ::: id; estimate; actual_duration; sessions; active_since; external_deadline; user_deadline; deadline_computed; ref; deps; mode; created"
     VALID_MODES = {"atomic", "flex", "contiguous_preferred"}
 
     def parse_task_line(
@@ -141,6 +142,13 @@ class TaskParser:
                 message=str(exc), raw_text=raw_text, field=KEY_USER_DEADLINE
             ) from exc
 
+        try:
+            deadline_computed = parse_deadline(kv.get(KEY_DEADLINE_COMPUTED, "-"))
+        except ValueError as exc:
+            raise TaskParseError(
+                message=str(exc), raw_text=raw_text, field=KEY_DEADLINE_COMPUTED
+            ) from exc
+
         mode = kv.get(KEY_MODE)
         if mode and mode not in self.VALID_MODES:
             raise TaskParseError(
@@ -182,6 +190,7 @@ class TaskParser:
             "estimated_duration": duration,
             "deadline_external": external_deadline,
             "deadline_user": user_deadline,
+            "deadline_computed": deadline_computed,
             "ref": ref,
             "depends_on": depends_on,
             "created": created,

@@ -227,6 +227,7 @@ KEY_SESSIONS = "sessions"
 KEY_ACTIVE_SINCE = "active_since"
 KEY_EXTERNAL_DEADLINE = "external_deadline"
 KEY_USER_DEADLINE = "user_deadline"
+KEY_DEADLINE_COMPUTED = "deadline_computed"
 KEY_MODE = "mode"
 KEY_REF = "ref"
 KEY_DEPENDS = "deps"
@@ -240,6 +241,7 @@ WELL_KNOWN_KEYS = (
     KEY_ACTIVE_SINCE,
     KEY_EXTERNAL_DEADLINE,
     KEY_USER_DEADLINE,
+    KEY_DEADLINE_COMPUTED,
     KEY_MODE,
     KEY_REF,
     KEY_DEPENDS,

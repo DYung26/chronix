@@ -24,6 +24,7 @@ from chronix.cli.commands import (
     rename_command,
     duration_command,
     deadline_command,
+    deadlines_command,
     mode_command,
     done_command,
     undone_command,
@@ -40,7 +41,7 @@ from chronix.cli.highlighting import ChronixCommandLexer, chronix_style
 # Commands that read from `_context` and need it populated before running.
 # The REPL syncs once at startup and keeps `_context` warm for the session;
 # one-shot invocations start cold every time and must sync on demand.
-_FULL_CONTEXT_COMMANDS = frozenset({"today", "schedule", "calendar", "explain"})
+_FULL_CONTEXT_COMMANDS = frozenset({"today", "schedule", "calendar", "explain", "deadlines"})
 _TASK_LOOKUP_COMMANDS = frozenset({"done", "pause", "resume"})
 
 
@@ -63,6 +64,7 @@ class ChronixShell:
             'rename': rename_command,
             'duration': duration_command,
             'deadline': deadline_command,
+            'deadlines': deadlines_command,
             'mode': mode_command,
             'done': done_command,
             'undone': undone_command,

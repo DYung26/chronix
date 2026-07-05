@@ -161,7 +161,8 @@ class TaskAggregator:
         Incomplete tasks are categorized by deadline type:
         1. Hard-deadline tasks (external_deadline present)
         2. Soft-deadline tasks (user_deadline present, no external_deadline)
-        3. No-deadline tasks (neither deadline present)
+        3. Computed-deadline tasks (deadline_computed present, no real deadline)
+        4. No-deadline tasks (no deadline of any kind)
 
         Within each category, tasks are sorted by:
         - Primary: deadline (earliest first)
@@ -172,6 +173,7 @@ class TaskAggregator:
         """
         incomplete_hard = []
         incomplete_soft = []
+        incomplete_computed = []
         incomplete_none = []
         completed_with_metadata = []
         completed_without_metadata = []
@@ -187,6 +189,8 @@ class TaskAggregator:
                     incomplete_hard.append(task)
                 elif task.deadline_user is not None:
                     incomplete_soft.append(task)
+                elif task.deadline_computed is not None:
+                    incomplete_computed.append(task)
                 else:
                     incomplete_none.append(task)
 
@@ -205,6 +209,15 @@ class TaskAggregator:
             incomplete_soft,
             key=lambda t: (
                 t.deadline_user or max_datetime,
+                t.estimated_duration,
+                t.title
+            )
+        )
+
+        computed_sorted = sorted(
+            incomplete_computed,
+            key=lambda t: (
+                t.deadline_computed or max_datetime,
                 t.estimated_duration,
                 t.title
             )
@@ -237,6 +250,7 @@ class TaskAggregator:
         return (
             hard_sorted +
             soft_sorted +
+            computed_sorted +
             none_sorted +
             completed_meta_sorted +
             completed_no_meta_sorted

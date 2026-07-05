@@ -821,6 +821,7 @@ def help_command(args: list[str]) -> int:
         ("calendar [HH:MM] [--force]", "Sync today's schedule to Google Calendar"),
         ("config <cmd>", "Manage configuration (init, show, path, validate)"),
         ("deadline <task_id> <ISO|-> [--user] [--doc <id|alias>]", "Set external deadline; --user sets user deadline instead"),
+        ("deadlines <task_id>|--doc <id|alias>|--all [--dry-run]", "Backfill deadline_computed (exactly one scope required)"),
         ("delete <task_id> [--doc <id|alias>]", "Delete a task from its document"),
         ("documents", "List all configured documents with aliases"),
         ("tabs <id|alias>", "List the tabs in a document (for add's --tab flag)"),
@@ -1378,6 +1379,140 @@ def deadline_command(args: list[str]) -> int:
         value = remaining[1]
         print_success(f"Task '{task_id}' {kind} deadline set to '{value}'.")
     return rc
+
+
+def deadlines_command(args: list[str]) -> int:
+    """
+    Deadlines command: Backfill deadline_computed for tasks with no real deadline.
+
+    Usage: deadlines <task_id> [--dry-run]
+           deadlines --doc <id|alias> [--dry-run]
+           deadlines --all [--dry-run]
+
+    Exactly one scope must be given:
+    - <task_id>: backfill only that task.
+    - --doc <id|alias>: backfill every eligible task in that document.
+    - --all: backfill every eligible task across all synced projects.
+
+    There is no bulk default: a task with no deadline may simply not have
+    one, so touching more than a single task always requires an explicit
+    --doc or --all.
+
+    Eligible tasks are incomplete tasks with neither an external nor a user
+    deadline. Projection always considers the full synced task pool so
+    timing stays realistic across projects, even when only writing back to
+    a narrower scope: tasks are ordered oldest-created first and stacked
+    sequentially, each claiming a slice of time equal to its
+    estimated_duration, starting after the later of now or the latest
+    deadline already committed elsewhere in the backlog.
+
+    --dry-run previews the computed deadlines without writing them.
+    Re-running this command recomputes and overwrites deadline_computed for
+    the tasks in scope; it is not a one-time stamp.
+    """
+    from chronix.core.deadline_backfill import compute_backlog_deadlines
+    from chronix.core.metadata import KEY_DEADLINE_COMPUTED, serialize_deadline
+    from chronix.core.writer import TaskUpdate
+
+    usage = "Usage: deadlines <task_id> | --doc <id|alias> | --all [--dry-run]"
+
+    dry_run = "--dry-run" in args
+    args = [a for a in args if a != "--dry-run"]
+    all_scope = "--all" in args
+    args = [a for a in args if a != "--all"]
+    doc_token, remaining = _parse_edit_flags(args)
+
+    if len(remaining) > 1:
+        print_error(usage)
+        return 1
+
+    scopes_given = sum([bool(remaining), doc_token is not None, all_scope])
+    if scopes_given == 0:
+        print_error(usage)
+        console.print("[dim]Specify a single task, a document with --doc, or --all for the whole backlog.[/dim]")
+        return 1
+    if scopes_given > 1:
+        print_error("Specify only one of: <task_id>, --doc <id|alias>, --all")
+        return 1
+
+    task_id = remaining[0] if remaining else None
+
+    if not _context.projects:
+        print_warning("No projects loaded. Run 'sync' first.")
+        return 1
+
+    try:
+        from chronix.config import ChronixConfig
+        config = _context.config or ChronixConfig.load_or_default()
+    except Exception as e:
+        print_error(f"Failed to load configuration: {e}")
+        return 1
+
+    aggregator = TaskAggregator()
+    aggregated_tasks = aggregator.aggregate(_context.projects)
+    all_tasks = [agg.task for agg in aggregated_tasks]
+
+    if task_id is not None and not any(t.id == task_id for t in all_tasks):
+        print_error(f"Task with ID '{task_id}' not found.")
+        return 1
+
+    doc_id = None
+    if doc_token is not None:
+        doc_id = _resolve_document_token(doc_token, config)
+        if doc_id is None:
+            print_error(f"Unknown document: '{doc_token}'")
+            return 1
+
+    now = datetime.now(timezone.utc)
+    results = compute_backlog_deadlines(all_tasks, now)
+
+    if task_id is not None:
+        results = [r for r in results if r.task.id == task_id]
+    elif doc_id is not None:
+        doc_task_ids = {
+            t.id for p in _context.projects
+            if p.project_context.document_id == doc_id
+            for t in p.tasks
+        }
+        results = [r for r in results if r.task.id in doc_task_ids]
+    # --all: no further filtering
+
+    if not results:
+        print_info(
+            "No eligible tasks to backfill (all tasks in scope already have a "
+            "real deadline, or none matched the given scope)."
+        )
+        return 0
+
+    console.print()
+    for r in results:
+        label = f"[{r.task.document_title}] " if r.task.document_title else ""
+        console.print(
+            f"  {label}{r.task.title} ({r.task.id}) -> "
+            f"{r.deadline.strftime('%Y-%m-%d %H:%M')} UTC"
+        )
+    console.print()
+
+    if dry_run:
+        print_info(f"Dry run: {len(results)} task(s) would be updated. No changes written.")
+        return 0
+
+    failures = 0
+    for r in results:
+        if r.task.id is None:
+            print_warning(f"Skipping '{r.task.title}': task has no id yet. Run 'sync' first.")
+            failures += 1
+            continue
+        update = TaskUpdate(metadata={KEY_DEADLINE_COMPUTED: serialize_deadline(r.deadline)})
+        rc = _run_task_update(r.task.id, update)
+        if rc != 0:
+            failures += 1
+
+    updated = len(results) - failures
+    print_success(f"Backfilled deadline_computed for {updated} task(s).")
+    if failures:
+        print_warning(f"{failures} task(s) failed to update.")
+    return 1 if failures else 0
 
 
 def mode_command(args: list[str]) -> int:

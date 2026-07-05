@@ -49,6 +49,7 @@ class Task(BaseModel):
     estimated_duration: timedelta
     deadline_user: Optional[datetime] = None
     deadline_external: Optional[datetime] = None
+    deadline_computed: Optional[datetime] = None
     completed: bool = False
     source: str
     ref: Optional[str] = None
@@ -85,7 +86,7 @@ class Task(BaseModel):
             raise ValueError("estimated_duration must be positive")
         return v
 
-    @field_validator("deadline_user", "deadline_external")
+    @field_validator("deadline_user", "deadline_external", "deadline_computed")
     @classmethod
     def validate_deadline_timezone_aware(cls, v: Optional[datetime]) -> Optional[datetime]:
         if v is not None and v.tzinfo is None:
@@ -107,8 +108,12 @@ class Task(BaseModel):
 
     @property
     def effective_deadline(self) -> Optional[datetime]:
-        """Returns deadline_external if set, otherwise deadline_user."""
-        return self.deadline_external if self.deadline_external is not None else self.deadline_user
+        """Returns deadline_external if set, else deadline_user, else deadline_computed."""
+        if self.deadline_external is not None:
+            return self.deadline_external
+        if self.deadline_user is not None:
+            return self.deadline_user
+        return self.deadline_computed
 
     @property
     def is_active(self) -> bool:
