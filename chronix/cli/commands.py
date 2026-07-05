@@ -838,7 +838,7 @@ def help_command(args: list[str]) -> int:
         ("sync <id|alias> [...]", "Sync one or more specific documents by ID or alias"),
         ("today [HH:MM]", "Display today's scheduled tasks from optional start time"),
         ("undone <task_id> [--doc <id|alias>]", "Mark a task as incomplete"),
-        ("update <task_id> [flags] [--doc <id|alias>]", "Update fields: --title --duration --external-deadline --user-deadline --mode --meta --remove-meta"),
+        ("update <task_id> [flags] [--doc <id|alias>]", "Update fields: --title --duration --external-deadline --user-deadline --mode --ref --deps --meta --remove-meta"),
         ("clear / cls", "Clear the terminal screen"),
         ("help", "Show this help message"),
         ("exit / quit", "Exit the interactive shell"),
@@ -1145,6 +1145,21 @@ def _parse_edit_flags(args: list[str]) -> tuple[Optional[str], list[str]]:
     return doc_token, remaining
 
 
+def _reject_flag_as_task_id(task_id: str, usage: str) -> bool:
+    """Print an error and return True if task_id looks like a flag, not an id.
+
+    Guards against a missing positional task_id causing the next flag token
+    to be silently swallowed as the id (e.g. `update --remove-meta foo ...`
+    treating '--remove-meta' as the task_id and shifting every argument
+    after it out of place).
+    """
+    if task_id.startswith("--"):
+        print_error(f"Expected <task_id> as the first argument, got flag '{task_id}'.")
+        console.print(f"[dim]{usage}[/dim]")
+        return True
+    return False
+
+
 def _run_task_update(task_id: str, update, doc_token: Optional[str] = None) -> int:
     from chronix.core.writer import TaskNotFoundError
     try:
@@ -1178,28 +1193,59 @@ def _run_task_update(task_id: str, update, doc_token: Optional[str] = None) -> i
         return 1
 
 
+def _find_duplicate_ref_task(ref_value: str, task_id: str) -> Optional[Task]:
+    """Return another task already using ref_value, if any (excluding task_id itself).
+
+    Only checks tasks visible in the current in-memory context, so this is a
+    best-effort, fail-fast check ahead of the authoritative validation that
+    DependencyValidator performs across the full backlog at scheduling time.
+    """
+    if not _context.projects:
+        return None
+    aggregator = TaskAggregator()
+    for agg_task in aggregator.aggregate(_context.projects):
+        t = agg_task.task
+        if t.ref == ref_value and t.id != task_id:
+            return t
+    return None
+
+
 def update_command(args: list[str]) -> int:
     """
     Update command: Modify one or more fields of a task by its ID.
 
     Usage: update <task_id> [--title <title>] [--duration <duration>]
                             [--external-deadline <ISO|->] [--user-deadline <ISO|->]
-                            [--mode <mode>] [--meta <key=value> ...]
+                            [--mode <mode>] [--ref <ref>|-] [--deps <ref1,ref2,...>|-]
+                            [--meta <key=value> ...]
                             [--remove-meta <key> ...]
                             [--doc <id|alias>]
 
     At least one field flag must be supplied.
     """
-    from chronix.core.metadata import parse_deadline, parse_duration
+    from chronix.core.metadata import KEY_DEPENDS, KEY_REF, parse_deadline, parse_duration
+    from chronix.core.todo import TaskParser
     from chronix.core.writer import TaskUpdate
 
+    VALID_FLAGS = (
+        "--title", "--duration", "--external-deadline", "--user-deadline",
+        "--mode", "--ref", "--deps", "--meta", "--remove-meta", "--doc",
+    )
+
+    usage = (
+        "Usage: update <task_id> [--title <title>] [--duration <duration>] "
+        "[--external-deadline <ISO|->] [--user-deadline <ISO|->] [--mode <mode>] "
+        "[--ref <ref>|-] [--deps <ref1,ref2,...>|-] [--meta key=value ...] "
+        "[--remove-meta key ...] [--doc <id|alias>]"
+    )
+
     if not args:
-        print_error("Usage: update <task_id> [--title ...] [--duration ...] [--external-deadline ...] "
-                    "[--user-deadline ...] [--mode ...] [--meta key=value ...] [--remove-meta key ...] "
-                    "[--doc <id|alias>]")
+        print_error(usage)
         return 1
 
     task_id = args[0]
+    if _reject_flag_as_task_id(task_id, usage):
+        return 1
     doc_token, flags = _parse_edit_flags(args[1:])
 
     update = TaskUpdate()
@@ -1214,17 +1260,20 @@ def update_command(args: list[str]) -> int:
             i += 2
         elif flag == "--duration":
             if i + 1 >= len(flags):
-                print_error("--duration requires a value")
+                print_error("--duration requires a value (e.g. 2h, 30m, 2hours, 30minutes)")
                 return 1
             dur = parse_duration(flags[i + 1])
             if dur is None:
-                print_error(f"Invalid duration: '{flags[i + 1]}'")
+                print_error(f"Invalid duration: '{flags[i + 1]}'. Use: 2h, 30m, 2hours, 30minutes")
                 return 1
             update.duration = dur
             i += 2
         elif flag == "--external-deadline":
             if i + 1 >= len(flags):
-                print_error("--external-deadline requires a value")
+                print_error(
+                    "--external-deadline requires a value "
+                    "(ISO-8601, e.g. 2026-07-15T09:00:00, or '-' to clear)"
+                )
                 return 1
             try:
                 update.external_deadline = parse_deadline(flags[i + 1])
@@ -1234,7 +1283,10 @@ def update_command(args: list[str]) -> int:
             i += 2
         elif flag == "--user-deadline":
             if i + 1 >= len(flags):
-                print_error("--user-deadline requires a value")
+                print_error(
+                    "--user-deadline requires a value "
+                    "(ISO-8601, e.g. 2026-07-15T09:00:00, or '-' to clear)"
+                )
                 return 1
             try:
                 update.user_deadline = parse_deadline(flags[i + 1])
@@ -1244,13 +1296,31 @@ def update_command(args: list[str]) -> int:
             i += 2
         elif flag == "--mode":
             if i + 1 >= len(flags):
-                print_error("--mode requires a value")
+                print_error("--mode requires a value (atomic, flex, contiguous_preferred)")
                 return 1
-            update.mode = flags[i + 1]
+            new_mode = flags[i + 1]
+            if new_mode not in TaskParser.VALID_MODES:
+                print_error(f"Invalid mode '{new_mode}'. Valid: atomic, flex, contiguous_preferred")
+                return 1
+            update.mode = new_mode
+            i += 2
+        elif flag == "--ref":
+            if i + 1 >= len(flags):
+                print_error("--ref requires a value (e.g. task-a, or '-' to clear)")
+                return 1
+            ref_value = flags[i + 1]
+            update.metadata[KEY_REF] = "" if ref_value == "-" else ref_value
+            i += 2
+        elif flag == "--deps":
+            if i + 1 >= len(flags):
+                print_error("--deps requires a value (comma-separated refs, e.g. task-a,task-b, or '-' to clear)")
+                return 1
+            deps_value = flags[i + 1]
+            update.metadata[KEY_DEPENDS] = "" if deps_value == "-" else deps_value
             i += 2
         elif flag == "--meta":
             if i + 1 >= len(flags):
-                print_error("--meta requires key=value")
+                print_error("--meta requires key=value (e.g. priority=high)")
                 return 1
             pair = flags[i + 1]
             if "=" not in pair:
@@ -1266,7 +1336,7 @@ def update_command(args: list[str]) -> int:
             update.metadata_remove.append(flags[i + 1])
             i += 2
         else:
-            print_error(f"Unknown flag: {flag}")
+            print_error(f"Unknown flag: {flag}. Valid flags: {', '.join(VALID_FLAGS)}")
             return 1
 
     if not any([
@@ -1280,7 +1350,18 @@ def update_command(args: list[str]) -> int:
         update.completed is not None,
     ]):
         print_error("No fields to update. Provide at least one flag.")
+        console.print(f"[dim]{usage}[/dim]")
         return 1
+
+    new_ref = update.metadata.get(KEY_REF)
+    if new_ref:
+        conflict = _find_duplicate_ref_task(new_ref, task_id)
+        if conflict is not None:
+            print_error(
+                f"Duplicate ref '{new_ref}': already used by task "
+                f"'{conflict.title}' (id={conflict.id})."
+            )
+            return 1
 
     rc = _run_task_update(task_id, update, doc_token)
     if rc == 0:
@@ -1296,12 +1377,15 @@ def rename_command(args: list[str]) -> int:
     """
     from chronix.core.writer import TaskUpdate
 
+    usage = "Usage: rename <task_id> <new title> [--doc <id|alias>]"
     doc_token, remaining = _parse_edit_flags(args)
     if len(remaining) < 2:
-        print_error("Usage: rename <task_id> <new title> [--doc <id|alias>]")
+        print_error(usage)
         return 1
 
     task_id = remaining[0]
+    if _reject_flag_as_task_id(task_id, usage):
+        return 1
     new_title = " ".join(remaining[1:])
     update = TaskUpdate(title=new_title)
     rc = _run_task_update(task_id, update, doc_token)
@@ -1321,15 +1405,18 @@ def duration_command(args: list[str]) -> int:
     from chronix.core.metadata import parse_duration
     from chronix.core.writer import TaskUpdate
 
+    usage = "Usage: duration <task_id> <duration> [--doc <id|alias>]"
     doc_token, remaining = _parse_edit_flags(args)
     if len(remaining) < 2:
-        print_error("Usage: duration <task_id> <duration> [--doc <id|alias>]")
+        print_error(usage)
         return 1
 
     task_id = remaining[0]
+    if _reject_flag_as_task_id(task_id, usage):
+        return 1
     dur = parse_duration(remaining[1])
     if dur is None:
-        print_error(f"Invalid duration: '{remaining[1]}'")
+        print_error(f"Invalid duration: '{remaining[1]}'. Use: 2h, 30m, 2hours, 30minutes")
         return 1
 
     update = TaskUpdate(duration=dur)
@@ -1356,11 +1443,14 @@ def deadline_command(args: list[str]) -> int:
     args = [a for a in args if a != "--user"]
     doc_token, remaining = _parse_edit_flags(args)
 
+    usage = "Usage: deadline <task_id> <ISO-date|-> [--user] [--doc <id|alias>]"
     if len(remaining) < 2:
-        print_error("Usage: deadline <task_id> <ISO-date|-> [--user] [--doc <id|alias>]")
+        print_error(usage)
         return 1
 
     task_id = remaining[0]
+    if _reject_flag_as_task_id(task_id, usage):
+        return 1
     try:
         dt = parse_deadline(remaining[1])
     except ValueError as e:
@@ -1424,6 +1514,11 @@ def deadlines_command(args: list[str]) -> int:
 
     if len(remaining) > 1:
         print_error(usage)
+        return 1
+
+    if remaining and remaining[0].startswith("--"):
+        print_error(f"Unknown flag: '{remaining[0]}'")
+        console.print(f"[dim]{usage}[/dim]")
         return 1
 
     scopes_given = sum([bool(remaining), doc_token is not None, all_scope])
@@ -1526,11 +1621,14 @@ def mode_command(args: list[str]) -> int:
     VALID_MODES = {"atomic", "flex", "contiguous_preferred"}
     doc_token, remaining = _parse_edit_flags(args)
 
+    usage = "Usage: mode <task_id> <atomic|flex|contiguous_preferred> [--doc <id|alias>]"
     if len(remaining) < 2:
-        print_error("Usage: mode <task_id> <atomic|flex|contiguous_preferred> [--doc <id|alias>]")
+        print_error(usage)
         return 1
 
     task_id = remaining[0]
+    if _reject_flag_as_task_id(task_id, usage):
+        return 1
     new_mode = remaining[1]
     if new_mode not in VALID_MODES:
         print_error(f"Invalid mode '{new_mode}'. Valid: atomic, flex, contiguous_preferred")
@@ -1587,12 +1685,15 @@ def done_command(args: list[str]) -> int:
         serialize_sessions,
     )
 
+    usage = "Usage: done <task_id> [--doc <id|alias>]"
     doc_token, remaining = _parse_edit_flags(args)
     if not remaining:
-        print_error("Usage: done <task_id> [--doc <id|alias>]")
+        print_error(usage)
         return 1
 
     task_id = remaining[0]
+    if _reject_flag_as_task_id(task_id, usage):
+        return 1
     now = datetime.now(timezone.utc)
 
     update = TaskUpdate(completed=True)
@@ -1644,12 +1745,15 @@ def pause_command(args: list[str]) -> int:
         serialize_sessions,
     )
 
+    usage = "Usage: pause <task_id> [--doc <id|alias>]"
     doc_token, remaining = _parse_edit_flags(args)
     if not remaining:
-        print_error("Usage: pause <task_id> [--doc <id|alias>]")
+        print_error(usage)
         return 1
 
     task_id = remaining[0]
+    if _reject_flag_as_task_id(task_id, usage):
+        return 1
 
     task = _find_task_in_context(task_id)
     if task is None:
@@ -1698,12 +1802,15 @@ def resume_command(args: list[str]) -> int:
     from chronix.core.writer import TaskUpdate
     from chronix.core.metadata import KEY_ACTIVE_SINCE, serialize_active_since
 
+    usage = "Usage: resume <task_id> [--doc <id|alias>]"
     doc_token, remaining = _parse_edit_flags(args)
     if not remaining:
-        print_error("Usage: resume <task_id> [--doc <id|alias>]")
+        print_error(usage)
         return 1
 
     task_id = remaining[0]
+    if _reject_flag_as_task_id(task_id, usage):
+        return 1
 
     task = _find_task_in_context(task_id)
     if task is None:
@@ -1730,12 +1837,15 @@ def undone_command(args: list[str]) -> int:
     """
     from chronix.core.writer import TaskUpdate
 
+    usage = "Usage: undone <task_id> [--doc <id|alias>]"
     doc_token, remaining = _parse_edit_flags(args)
     if not remaining:
-        print_error("Usage: undone <task_id> [--doc <id|alias>]")
+        print_error(usage)
         return 1
 
     task_id = remaining[0]
+    if _reject_flag_as_task_id(task_id, usage):
+        return 1
     update = TaskUpdate(completed=False)
     rc = _run_task_update(task_id, update, doc_token)
     if rc == 0:
@@ -1755,12 +1865,16 @@ def meta_command(args: list[str]) -> int:
     """
     from chronix.core.writer import TaskUpdate
 
+    usage = "Usage: meta <task_id> [key=value ...] [--remove key ...] [--doc <id|alias>]"
+
     doc_token, remaining = _parse_edit_flags(args)
     if not remaining:
-        print_error("Usage: meta <task_id> [key=value ...] [--remove key ...] [--doc <id|alias>]")
+        print_error(usage)
         return 1
 
     task_id = remaining[0]
+    if _reject_flag_as_task_id(task_id, usage):
+        return 1
     rest = remaining[1:]
 
     metadata: dict[str, str] = {}
@@ -1783,6 +1897,7 @@ def meta_command(args: list[str]) -> int:
 
     if not metadata and not metadata_remove:
         print_error("No metadata changes specified.")
+        console.print(f"[dim]{usage}[/dim]")
         return 1
 
     update = TaskUpdate(metadata=metadata, metadata_remove=metadata_remove)
@@ -1800,12 +1915,15 @@ def delete_command(args: list[str]) -> int:
     """
     from chronix.core.writer import TaskNotFoundError
 
+    usage = "Usage: delete <task_id> [--doc <id|alias>]"
     doc_token, remaining = _parse_edit_flags(args)
     if not remaining:
-        print_error("Usage: delete <task_id> [--doc <id|alias>]")
+        print_error(usage)
         return 1
 
     task_id = remaining[0]
+    if _reject_flag_as_task_id(task_id, usage):
+        return 1
 
     try:
         from chronix.config import ChronixConfig

@@ -37,12 +37,17 @@ class DependencyValidator:
 
     def _validate_duplicate_refs(self, tasks: list[Task]) -> None:
         """Check for duplicate ref values across tasks."""
-        seen_refs = set()
+        ref_to_task: dict[str, Task] = {}
         for task in tasks:
             if task.ref:
-                if task.ref in seen_refs:
-                    raise DependencyError(f"Duplicate ref '{task.ref}' found in multiple tasks")
-                seen_refs.add(task.ref)
+                existing = ref_to_task.get(task.ref)
+                if existing is not None:
+                    raise DependencyError(
+                        f"Duplicate ref '{task.ref}' found in multiple tasks: "
+                        f"'{existing.title}' (id={existing.id}) and "
+                        f"'{task.title}' (id={task.id})"
+                    )
+                ref_to_task[task.ref] = task
 
     def _validate_self_dependencies(self, tasks: list[Task]) -> None:
         """Check for tasks that depend on themselves."""

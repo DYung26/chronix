@@ -308,7 +308,7 @@ class SchedulingEngine:
             for dep_ref in task.depends_on:
                 dep_task = ref_to_task.get(dep_ref)
                 if not dep_task:
-                    return True
+                    continue
                 if id(dep_task) not in completion_times:
                     return False
             return True

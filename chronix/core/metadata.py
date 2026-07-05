@@ -113,7 +113,13 @@ def parse_deadline(value: str) -> Optional[datetime]:
     v = value.strip()
     if not v or v == "-":
         return None
-    dt = datetime.fromisoformat(v)
+    try:
+        dt = datetime.fromisoformat(v)
+    except ValueError:
+        raise ValueError(
+            f"Invalid deadline '{value}'. Expected ISO-8601, e.g. "
+            f"2026-07-15T09:00:00 or 2026-07-15, or '-' to clear."
+        )
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt
