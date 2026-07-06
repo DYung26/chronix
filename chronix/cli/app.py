@@ -2,6 +2,7 @@
 
 import sys
 import os
+import shlex
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -16,7 +17,9 @@ from chronix.cli.commands import (
     today_command,
     calendar_command,
     documents_command,
+    document_command,
     tabs_command,
+    blocks_command,
     schedule_command,
     explain_command,
     help_command,
@@ -43,6 +46,7 @@ from chronix.cli.highlighting import ChronixCommandLexer, chronix_style
 # one-shot invocations start cold every time and must sync on demand.
 _FULL_CONTEXT_COMMANDS = frozenset({"today", "schedule", "calendar", "explain", "deadlines"})
 _TASK_LOOKUP_COMMANDS = frozenset({"done", "pause", "resume"})
+_SINGLE_DOC_COMMANDS = frozenset({"document"})
 
 
 class ChronixShell:
@@ -56,7 +60,9 @@ class ChronixShell:
             'today': today_command,
             'calendar': calendar_command,
             'documents': documents_command,
+            'document': document_command,
             'tabs': tabs_command,
+            'blocks': blocks_command,
             'schedule': schedule_command,
             'explain': explain_command,
             'config': config_command,
@@ -198,7 +204,16 @@ class ChronixShell:
                 if not command_str:
                     continue
                 
-                parts = command_str.split()
+                try:
+                    parts = shlex.split(command_str)
+                except ValueError as e:
+                    console.print(f"[red]Error parsing command:[/red] {e}")
+                    segment_success = False
+                    break
+
+                if not parts:
+                    continue
+
                 command_name = parts[0]
                 args = parts[1:]
                 
@@ -314,6 +329,9 @@ class ChronixShell:
                     f"command, since there's no prior sync to resolve the task's document from."
                 )
             sync_command([doc_token])
+        elif command_name in _SINGLE_DOC_COMMANDS:
+            if args and not args[0].startswith("--"):
+                sync_command([args[0]])
 
 
 def main():

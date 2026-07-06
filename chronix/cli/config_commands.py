@@ -147,6 +147,37 @@ def config_path_command(args: list[str]) -> int:
     return 0
 
 
+def config_reload_command(args: list[str]) -> int:
+    """
+    Reload configuration from disk into the current session.
+
+    Usage: config reload
+
+    Chronix loads config.toml once (at REPL startup, or on-demand in
+    one-shot mode) and keeps using that in-memory copy for the rest of the
+    session. Edits made to config.toml on disk have no effect until this is
+    run, or the session is restarted.
+    """
+    from chronix.cli.commands import _context
+
+    config_path = ChronixConfig.get_default_path()
+
+    if not config_path.exists():
+        print(f"No configuration found at: {config_path}")
+        return 1
+
+    try:
+        config = ChronixConfig.from_toml(config_path)
+    except Exception as e:
+        print(f"Failed to reload configuration: {e}")
+        print("Your existing in-memory configuration is unchanged.")
+        return 1
+
+    _context.config = config
+    print(f"✓ Configuration reloaded from: {config_path}")
+    return 0
+
+
 def config_validate_command(args: list[str]) -> int:
     """
     Validate the current configuration file.
@@ -196,6 +227,7 @@ def config_command(args: list[str]) -> int:
       show      Display current configuration
       path      Show configuration file path
       validate  Validate configuration file
+      reload    Reload config.toml into the current session
     """
     if not args:
         print("Usage: config <subcommand>")
@@ -205,6 +237,7 @@ def config_command(args: list[str]) -> int:
         print("  show      Display current configuration")
         print("  path      Show configuration file path")
         print("  validate  Validate configuration file")
+        print("  reload    Reload config.toml into the current session")
         return 1
     
     subcommand = args[0]
@@ -215,6 +248,7 @@ def config_command(args: list[str]) -> int:
         "show": config_show_command,
         "path": config_path_command,
         "validate": config_validate_command,
+        "reload": config_reload_command,
     }
     
     if subcommand not in subcommands:

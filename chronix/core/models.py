@@ -194,6 +194,11 @@ class ScheduledTask(BaseModel):
     is_segment: bool = False
     segment_index: Optional[int] = None
     total_segments: Optional[int] = None
+    # True when the task's full estimated_duration wasn't placed within the
+    # scheduling window (e.g. it ran out of room for today and will need
+    # further chunks on a later day). Distinct from is_segment, which marks
+    # a task split into multiple displayed parts within the same window.
+    is_partial: bool = False
 
     @field_validator("start", "end")
     @classmethod
@@ -211,7 +216,11 @@ class ScheduledTask(BaseModel):
     @model_validator(mode="after")
     def validate_duration_matches(self):
         actual_duration = self.end - self.start
-        if not self.is_segment and actual_duration != self.task.estimated_duration:
+        if (
+            not self.is_segment
+            and not self.is_partial
+            and actual_duration != self.task.estimated_duration
+        ):
             raise ValueError("duration must equal task.estimated_duration")
         return self
 

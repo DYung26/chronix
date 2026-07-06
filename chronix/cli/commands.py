@@ -22,6 +22,9 @@ from chronix.cli.formatting import (
     print_conflicts,
     print_task_details,
     print_task_position,
+    print_document_overview,
+    print_task_table,
+    print_page_footer,
     print_error,
     print_warning,
     print_success,
@@ -95,13 +98,18 @@ def resolve_today_start_datetime(
     return datetime.combine(today_date, parsed_time, tzinfo=tz)
 
 
-def _generate_today_schedule(time_override: Optional[str] = None) -> tuple[DaySchedule, datetime, datetime]:
+def _generate_today_schedule(time_override: Optional[str] = None) -> tuple[DaySchedule, datetime, datetime, list]:
     """
     Generate today's schedule (shared logic for `today` and `calendar` commands).
-    
+
     Returns:
-        Tuple of (day_schedule, work_start, work_end)
-        
+        Tuple of (day_schedule, work_start, work_end, paused_blocks). paused_blocks
+        are the recurring config blocks (sleep/break/meeting) that fall today but
+        are paused for this session via `blocks pause` -- they no longer occupy
+        any time (tasks may be scheduled through them), but are returned so the
+        caller can still show them, greyed out, at their original time in the
+        timeline for visibility.
+
     Raises:
         RuntimeError: If no projects loaded
         ValueError: If time override format is invalid
@@ -153,8 +161,13 @@ def _generate_today_schedule(time_override: Optional[str] = None) -> tuple[DaySc
     if work_end > end_of_today:
         work_end = end_of_today
 
-    # Get blocked time from config
-    blocked_time = config_to_time_blocks(config, today)
+    # Get blocked time from config, honoring any session-level pauses. Blocks
+    # that are paused this session are split off separately: they no longer
+    # occupy any time, but are still returned so the caller can display them
+    # (greyed out) at their original slot.
+    all_today_config_blocks = config_to_time_blocks(config, today)
+    blocked_time = [b for b in all_today_config_blocks if _is_block_active(b)]
+    paused_blocks = [b for b in all_today_config_blocks if not _is_block_active(b)]
 
     # Add gap blocks between work windows so the scheduler skips non-work periods
     for i in range(len(all_windows) - 1):
@@ -194,8 +207,15 @@ def _generate_today_schedule(time_override: Optional[str] = None) -> tuple[DaySc
         blocked_time=day_schedule.blocked_time,
         conflicts=day_schedule.conflicts
     )
-    
-    return day_schedule, work_start, work_end
+
+    # Only surface paused blocks that actually overlap the displayed window,
+    # same as the filtering already applied to real blocked time above.
+    paused_blocks = [
+        b for b in paused_blocks
+        if b.start < work_end and b.end > work_start
+    ]
+
+    return day_schedule, work_start, work_end, paused_blocks
 
 
 class ChronixContext:
@@ -207,6 +227,10 @@ class ChronixContext:
         self.last_sync: Optional[datetime] = None
         self.google_client: Optional[GoogleDocsClient] = None
         self.config: Optional['ChronixConfig'] = None
+        # Recurring config blocks (sleep/break/meeting) the user has paused
+        # for this session only, keyed by their lowercased label (or kind if
+        # unlabeled). Never written back to config.toml.
+        self.disabled_blocks: set[str] = set()
 
     def _ensure_google_client(self) -> GoogleDocsClient:
         """Lazy initialize Google Docs client."""
@@ -217,6 +241,17 @@ class ChronixContext:
 
 # Global context instance
 _context = ChronixContext()
+
+
+def _block_config_key(block_config) -> str:
+    """Canonical session-pause key for a configured recurring time block."""
+    return (block_config.label or block_config.kind).strip().lower()
+
+
+def _is_block_active(time_block) -> bool:
+    """Whether a domain TimeBlock built from config should still apply this session."""
+    key = (time_block.label or time_block.kind).strip().lower()
+    return key not in _context.disabled_blocks
 
 
 def _resolve_document_token(token: str, config: 'ChronixConfig') -> Optional[str]:
@@ -385,12 +420,12 @@ def today_command(args: list[str]) -> int:
         
         console.print("[dim]Generating today's schedule...[/dim]")
         
-        day_schedule, work_start, work_end = _generate_today_schedule(time_override)
+        day_schedule, work_start, work_end, paused_blocks = _generate_today_schedule(time_override)
         
         # Display schedule
         print_schedule_header(day_schedule.date, work_start, work_end, "UTC")
         
-        _display_continuous_timeline(day_schedule, work_start, work_end)
+        _display_continuous_timeline(day_schedule, work_start, work_end, paused_blocks=paused_blocks)
         
         # Show conflicts
         if day_schedule.conflicts:
@@ -446,7 +481,7 @@ def calendar_command(args: list[str]) -> int:
         
         console.print("[dim]Generating and syncing today's schedule to Google Calendar...[/dim]")
         
-        day_schedule, work_start, work_end = _generate_today_schedule(time_override)
+        day_schedule, work_start, work_end, paused_blocks = _generate_today_schedule(time_override)
         
         # Sync to Google Calendar
         from chronix.integrations.google_calendar import CalendarSyncService
@@ -481,7 +516,7 @@ def calendar_command(args: list[str]) -> int:
         # Display schedule (same as today command)
         print_schedule_header(day_schedule.date, work_start, work_end, "UTC")
         
-        _display_continuous_timeline(day_schedule, work_start, work_end)
+        _display_continuous_timeline(day_schedule, work_start, work_end, paused_blocks=paused_blocks)
         
         # Show conflicts
         if day_schedule.conflicts:
@@ -511,36 +546,111 @@ def calendar_command(args: list[str]) -> int:
         return 1
 
 
+def _parse_day_range(token: str) -> Optional[tuple[int, int]]:
+    """Parse a '<start>-<end>' token into 1-indexed, inclusive day offsets.
+
+    Returns None if the token has no hyphen (i.e. isn't a range at all).
+    Raises ValueError if it has a hyphen but is otherwise malformed.
+    """
+    if "-" not in token:
+        return None
+    parts = token.split("-")
+    if len(parts) != 2:
+        raise ValueError(f"Invalid day range '{token}'. Use format: <start>-<end>, e.g. 3-5")
+    try:
+        start_day, end_day = int(parts[0]), int(parts[1])
+    except ValueError:
+        raise ValueError(f"Invalid day range '{token}'. Use format: <start>-<end>, e.g. 3-5")
+    if start_day < 1 or end_day < 1:
+        raise ValueError("Day range values must be positive")
+    if start_day > end_day:
+        raise ValueError(f"Invalid day range '{token}': start day must not exceed end day")
+    return start_day, end_day
+
+
 def schedule_command(args: list[str]) -> int:
     """
     Schedule command: Display schedule for multiple days.
 
     Usage: schedule [days]
-    
-    If days is not specified, schedules all tasks until completion (no day limit).
-    If days is specified, limits scheduling to that number of days.
+           schedule <start>-<end>
+           schedule from <day> [to <count>]
+
+    schedule [days]: schedules all tasks from today; days limits how many
+    days are shown (unlimited if omitted).
+
+    schedule <start>-<end>: runs the same continuous simulation as
+    `schedule <end>`, since later days depend on what real depletion
+    happened on earlier days, but only displays days <start>..<end>
+    (1-indexed, today is day 1), renumbering the task list for that range.
+
+    schedule from <day> [to <count>]: forecasts what the schedule would
+    look like if day <day> were the starting point, using the full current
+    backlog as-is rather than simulating depletion of the days before it.
+    <count>, if given, limits how many forecasted days are shown.
     """
+    usage = "Usage: schedule [days] | schedule <start>-<end> | schedule from <day> [to <count>]"
+
     try:
         if not _context.projects:
             print_warning("No projects loaded. Run 'sync' first.")
             return 1
 
-        # Parse number of days
-        num_days: int | None = None  # None means unlimited
-        if args:
-            if len(args) > 1:
-                print_error("Usage: schedule [days] - too many arguments")
+        num_days: int | None = None
+        range_start: Optional[int] = None
+        range_end: Optional[int] = None
+        forecast_day: Optional[int] = None
+        forecast_count: Optional[int] = None
+
+        if args and args[0] == "from":
+            if len(args) not in (2, 4):
+                print_error(usage)
                 return 1
             try:
-                num_days = int(args[0])
+                forecast_day = int(args[1])
+            except ValueError:
+                print_error(f"Invalid day: '{args[1]}'")
+                return 1
+            if forecast_day < 1:
+                print_error("Day must be positive")
+                return 1
+            if len(args) == 4:
+                if args[2] != "to":
+                    print_error(usage)
+                    return 1
+                try:
+                    forecast_count = int(args[3])
+                except ValueError:
+                    print_error(f"Invalid day count: '{args[3]}'")
+                    return 1
+                if forecast_count < 1:
+                    print_error("Day count must be positive")
+                    return 1
+        elif args:
+            if len(args) > 1:
+                print_error(usage)
+                return 1
+            try:
+                day_range = _parse_day_range(args[0])
+            except ValueError as e:
+                print_error(str(e))
+                return 1
+            if day_range is not None:
+                range_start, range_end = day_range
+                num_days = range_end
+            else:
+                try:
+                    num_days = int(args[0])
+                except ValueError:
+                    print_error(f"Invalid number of days: {args[0]}")
+                    return 1
                 if num_days < 1:
                     print_error("Number of days must be positive")
                     return 1
-            except ValueError:
-                print_error(f"Invalid number of days: {args[0]}")
-                return 1
 
-        if num_days is None:
+        if forecast_day is not None:
+            console.print(f"[dim]Generating forecast from day {forecast_day}...[/dim]")
+        elif num_days is None:
             console.print(f"[dim]Generating unlimited schedule...[/dim]")
         else:
             console.print(f"[dim]Generating {num_days}-day schedule...[/dim]")
@@ -562,17 +672,33 @@ def schedule_command(args: list[str]) -> int:
 
         # Get current time
         now = datetime.now(tz)
-        
-        # Adjust start time if we're past work start today
-        first_day_start, _ = get_work_window(config, now.date())
-        start_time = max(now, first_day_start)
-        
+
+        if forecast_day is not None:
+            # Forecast mode ignores depletion on days before forecast_day:
+            # start the simulation directly at that day's work window using
+            # the full current backlog, rather than running days 1..N-1 first.
+            forecast_date = now.date() + timedelta(days=forecast_day - 1)
+            forecast_work_start, _ = get_work_window(config, forecast_date)
+            if forecast_day == 1 and now > forecast_work_start:
+                start_time = now
+            else:
+                start_time = forecast_work_start
+            continuous_num_days = forecast_count
+        else:
+            # Adjust start time if we're past work start today
+            first_day_start, _ = get_work_window(config, now.date())
+            start_time = max(now, first_day_start)
+            continuous_num_days = num_days
+
         # Schedule continuously across all days
         scheduler = SchedulingEngine()
         
         def get_daily_blocked_time(day_date: date) -> list:
             """Get blocked time for a specific day."""
-            blocked = config_to_time_blocks(config, day_date)
+            blocked = [
+                b for b in config_to_time_blocks(config, day_date)
+                if _is_block_active(b)
+            ]
             # Add gap blocks between work windows
             day_windows = get_work_windows(config, day_date)
             for i in range(len(day_windows) - 1):
@@ -586,21 +712,36 @@ def schedule_command(args: list[str]) -> int:
                 if meeting.start.date() == day_date:
                     blocked.append(meeting.to_time_block())
             return blocked
+
+        def get_daily_paused_blocks(day_date: date) -> list:
+            """Get this session's paused recurring blocks for a specific day, for display only."""
+            return [
+                b for b in config_to_time_blocks(config, day_date)
+                if not _is_block_active(b)
+            ]
         
         schedules_by_day = scheduler.schedule_continuous(
             tasks=incomplete_tasks,
             start_time=start_time,
-            num_days=num_days,
+            num_days=continuous_num_days,
             daily_blocked_time_fn=get_daily_blocked_time
         )
         
         # Display each day's schedule with continuous task numbering
         all_conflicts = []
-        task_counter = 1  # Global task counter across all days (starts at 1)
+        task_counter = 1  # Global task counter across displayed days (starts at 1)
+        first_displayed = True
         for day_offset, day_date in enumerate(sorted(schedules_by_day.keys())):
-            # Break after num_days if specified
-            if num_days is not None and day_offset >= num_days:
-                break
+            day_number = day_offset + 1  # 1-indexed offset from the simulation's start
+
+            if forecast_day is not None:
+                if forecast_count is not None and day_offset >= forecast_count:
+                    break
+            else:
+                if num_days is not None and day_offset >= num_days:
+                    break
+                if range_start is not None and day_number < range_start:
+                    continue
             
             if day_date not in schedules_by_day:
                 continue
@@ -613,11 +754,20 @@ def schedule_command(args: list[str]) -> int:
                 work_start = now
             
             # Display separator between days
-            if day_offset > 0:
+            if not first_displayed:
                 console.print("\n" + "─" * 60 + "\n")
+            first_displayed = False
             
+            day_paused_blocks = [
+                b for b in get_daily_paused_blocks(day_date)
+                if b.start < work_end and b.end > work_start
+            ]
+
             print_schedule_header(day_schedule.date, work_start, work_end, config.scheduling.timezone)
-            task_counter = _display_continuous_timeline(day_schedule, work_start, work_end, start_index=task_counter)
+            task_counter = _display_continuous_timeline(
+                day_schedule, work_start, work_end,
+                start_index=task_counter, paused_blocks=day_paused_blocks
+            )
             
             # Collect conflicts
             if day_schedule.conflicts:
@@ -745,6 +895,118 @@ def documents_command(args: list[str]) -> int:
         return 1
 
 
+def document_command(args: list[str]) -> int:
+    """
+    Document command: Show a document's task list, paginated.
+
+    Usage: document <id|alias> [--page N] [--per-page N] [--status incomplete|complete|all]
+
+    Defaults to incomplete tasks, 20 per page. Requires the document to
+    already be synced (the REPL syncs at startup; one-shot mode syncs it
+    automatically before running this command).
+    """
+    DEFAULT_PER_PAGE = 20
+    VALID_STATUS = ("incomplete", "complete", "all")
+
+    usage = "Usage: document <id|alias> [--page N] [--per-page N] [--status incomplete|complete|all]"
+
+    page = 1
+    per_page = DEFAULT_PER_PAGE
+    status = "incomplete"
+    remaining: list[str] = []
+
+    i = 0
+    while i < len(args):
+        if args[i] == "--page" and i + 1 < len(args):
+            try:
+                page = int(args[i + 1])
+            except ValueError:
+                print_error(f"Invalid page number: '{args[i + 1]}'")
+                return 1
+            if page < 1:
+                print_error("Page number must be positive")
+                return 1
+            i += 2
+        elif args[i] == "--per-page" and i + 1 < len(args):
+            try:
+                per_page = int(args[i + 1])
+            except ValueError:
+                print_error(f"Invalid --per-page value: '{args[i + 1]}'")
+                return 1
+            if per_page < 1:
+                print_error("--per-page must be positive")
+                return 1
+            i += 2
+        elif args[i] == "--status" and i + 1 < len(args):
+            status = args[i + 1]
+            if status not in VALID_STATUS:
+                print_error(f"Invalid status '{status}'. Valid: incomplete, complete, all")
+                return 1
+            i += 2
+        elif args[i].startswith("--"):
+            print_error(f"Unknown flag: {args[i]}")
+            return 1
+        else:
+            remaining.append(args[i])
+            i += 1
+
+    if len(remaining) != 1:
+        print_error(usage)
+        return 1
+
+    doc_token = remaining[0]
+
+    try:
+        from chronix.config import ChronixConfig
+        config = _context.config or ChronixConfig.load_or_default()
+    except Exception as e:
+        print_error(f"Failed to load configuration: {e}")
+        return 1
+
+    doc_id = _resolve_document_token(doc_token, config)
+    if doc_id is None:
+        print_error(f"Unknown document: '{doc_token}'")
+        return 1
+
+    project = next(
+        (p for p in _context.projects if p.project_context.document_id == doc_id),
+        None
+    )
+    if project is None:
+        print_warning(f"Document not synced yet. Run 'sync {doc_token}' first.")
+        return 1
+
+    all_tasks = project.tasks
+    incomplete_count = sum(1 for t in all_tasks if not t.completed)
+    completed_count = len(all_tasks) - incomplete_count
+
+    print_document_overview(
+        document_label=project.project_context.document_label(),
+        total_tasks=len(all_tasks),
+        incomplete_count=incomplete_count,
+        completed_count=completed_count,
+    )
+
+    if status == "incomplete":
+        filtered = [t for t in all_tasks if not t.completed]
+    elif status == "complete":
+        filtered = [t for t in all_tasks if t.completed]
+    else:
+        filtered = all_tasks
+
+    start = (page - 1) * per_page
+    page_tasks = filtered[start:start + per_page]
+
+    if not page_tasks and filtered:
+        print_error(f"Page {page} is out of range ({len(filtered)} {status} task(s) total).")
+        return 1
+
+    print_task_table(page_tasks)
+    print_page_footer(page=page, per_page=per_page, total=len(filtered), status_label=status)
+
+    return 0
+
+
 def tabs_command(args: list[str]) -> int:
     """
     Tabs command: List the tabs in a document, for use with add's --tab flag.
@@ -806,6 +1068,88 @@ def tabs_command(args: list[str]) -> int:
     return 0
 
 
+def blocks_command(args: list[str]) -> int:
+    """
+    Blocks command: list or pause/resume recurring config time blocks for this session.
+
+    Usage: blocks
+           blocks pause <label|kind>
+           blocks resume <label|kind>|all
+
+    Lists (or toggles) the sleep windows, breaks, and recurring meetings
+    defined in config.toml. Pausing a block stops it from being treated as
+    blocked time in `today`, `schedule`, and `calendar` for the rest of this
+    session only — config.toml itself is never modified, and the block
+    reactivates on the next session (or via 'blocks resume').
+
+    A block is identified by its label if it has one (e.g. "Netflix"),
+    otherwise by its kind (e.g. "sleep"). Pausing by kind pauses every
+    block of that kind that has no label of its own.
+    """
+    try:
+        from chronix.config import ChronixConfig
+        config = _context.config or ChronixConfig.load_or_default()
+    except Exception as e:
+        print_error(f"Failed to load configuration: {e}")
+        return 1
+
+    all_block_configs = (
+        config.scheduling.sleep_windows
+        + config.scheduling.breaks
+        + config.scheduling.meetings
+    )
+
+    if not args:
+        if not all_block_configs:
+            print_info("No recurring blocks configured (sleep windows, breaks, or meetings).")
+            return 0
+
+        console.print()
+        console.print("[bold]Recurring time blocks:[/bold]")
+        console.print()
+        for block in all_block_configs:
+            name = block.label or block.kind.capitalize()
+            paused = _block_config_key(block) in _context.disabled_blocks
+            status = "[yellow]paused[/yellow]" if paused else "[green]active[/green]"
+            time_range = f"{block.start_time.strftime('%H:%M')}-{block.end_time.strftime('%H:%M')}"
+            console.print(f"  [cyan]{name}[/cyan] [dim]({block.kind}, {time_range})[/dim] — {status}")
+        console.print()
+        console.print("[dim]Pausing only affects this session; config.toml is untouched.[/dim]")
+        console.print()
+        return 0
+
+    usage = "Usage: blocks | blocks pause <label|kind> | blocks resume <label|kind>|all"
+    action = args[0]
+    if action not in ("pause", "resume") or len(args) < 2:
+        print_error(usage)
+        return 1
+
+    # Labels can contain spaces (e.g. "Weekly Planning"), so join the rest of
+    # the args rather than taking args[1] alone. No quoting needed.
+    raw_target = " ".join(args[1:]).strip()
+    target = raw_target.lower()
+
+    if action == "resume" and target == "all":
+        count = len(_context.disabled_blocks)
+        _context.disabled_blocks.clear()
+        print_success(f"Resumed {count} paused block(s).")
+        return 0
+
+    if not any(_block_config_key(b) == target for b in all_block_configs):
+        print_error(f"No configured block matches '{raw_target}'.")
+        console.print("[dim]Run 'blocks' to see configured block names.[/dim]")
+        return 1
+
+    if action == "pause":
+        _context.disabled_blocks.add(target)
+        print_success(f"Paused '{raw_target}' for this session.")
+    else:
+        _context.disabled_blocks.discard(target)
+        print_success(f"Resumed '{raw_target}'.")
+
+    return 0
+
+
 def help_command(args: list[str]) -> int:
     """
     Help command: Show available commands.
@@ -818,12 +1162,14 @@ def help_command(args: list[str]) -> int:
     
     commands_table = [
         ("add <duration> <title> [--doc <id|alias>] [--tab <title|id>]", "Create a new task in a Google Docs document"),
+        ("blocks | blocks pause <label|kind> | blocks resume <label|kind>|all", "List or pause/resume recurring config time blocks for this session"),
         ("calendar [HH:MM] [--force]", "Sync today's schedule to Google Calendar"),
-        ("config <cmd>", "Manage configuration (init, show, path, validate)"),
+        ("config <cmd>", "Manage configuration (init, show, path, validate, reload)"),
         ("deadline <task_id> <ISO|-> [--user] [--doc <id|alias>]", "Set external deadline; --user sets user deadline instead"),
         ("deadlines <task_id>|--doc <id|alias>|--all [--dry-run]", "Backfill deadline_computed (exactly one scope required)"),
         ("delete <task_id> [--doc <id|alias>]", "Delete a task from its document"),
         ("documents", "List all configured documents with aliases"),
+        ("document <id|alias> [--page N] [--per-page N] [--status s]", "Show a document's task list, paginated"),
         ("tabs <id|alias>", "List the tabs in a document (for add's --tab flag)"),
         ("done <task_id> [--doc <id|alias>]", "Complete a task, recording actual duration from sessions"),
         ("pause <task_id> [--doc <id|alias>]", "Close the current work session"),
@@ -833,7 +1179,7 @@ def help_command(args: list[str]) -> int:
         ("meta <task_id> [k=v ...] [--remove k] [--doc <id|alias>]", "Set or remove arbitrary metadata fields"),
         ("mode <task_id> <mode> [--doc <id|alias>]", "Set execution mode (atomic|flex|contiguous_preferred)"),
         ("rename <task_id> <title> [--doc <id|alias>]", "Rename a task"),
-        ("schedule [days]", "Display multi-day schedule (default: unlimited days)"),
+        ("schedule [days] | <start>-<end> | from <day> [to <count>]", "Display multi-day schedule, a day range, or a forecast from a future day"),
         ("sync", "Fetch and parse all configured documents"),
         ("sync <id|alias> [...]", "Sync one or more specific documents by ID or alias"),
         ("today [HH:MM]", "Display today's scheduled tasks from optional start time"),
@@ -974,7 +1320,7 @@ def add_command(args: list[str]) -> int:
         return 1
 
 
-def _display_continuous_timeline(day_schedule, work_start: datetime, work_end: datetime, start_index: int = 1) -> int:
+def _display_continuous_timeline(day_schedule, work_start: datetime, work_end: datetime, start_index: int = 1, paused_blocks: Optional[list] = None) -> int:
     """
     Display a continuous timeline including tasks, blocked time, and empty slots.
     
@@ -983,6 +1329,12 @@ def _display_continuous_timeline(day_schedule, work_start: datetime, work_end: d
         work_start: Start of work day
         work_end: End of work day
         start_index: Starting index for task numbering (for continuous numbering across days)
+        paused_blocks: Recurring config blocks paused for this session that fall
+            within work_start/work_end. These are display-only: they never occupy
+            time (tasks may be scheduled straight through them) but are still shown,
+            greyed out, at their original slot so it's visible that a block used to
+            be there. They're layered onto the timeline after it's built, so they
+            never affect gap-filling or task scheduling.
     
     Returns:
         The next index to use for the next day (last_index + 1)
@@ -1018,7 +1370,10 @@ def _display_continuous_timeline(day_schedule, work_start: datetime, work_end: d
     current_time = work_start
     
     for segment in segments:
-        # If there's a gap before this segment, add an empty slot
+        # If there's a gap before this segment, add an empty slot. Segments
+        # can overlap (e.g. a short meeting nested inside a longer transit
+        # block), so track the furthest point covered so far rather than
+        # the end of the most recently processed segment.
         if current_time < segment['start']:
             timeline.append({
                 'start': current_time,
@@ -1029,7 +1384,7 @@ def _display_continuous_timeline(day_schedule, work_start: datetime, work_end: d
         
         # Add the segment
         timeline.append(segment)
-        current_time = segment['end']
+        current_time = max(current_time, segment['end'])
     
     # If there's time remaining until work_end, add final empty slot
     if current_time < work_end:
@@ -1039,6 +1394,20 @@ def _display_continuous_timeline(day_schedule, work_start: datetime, work_end: d
             'type': 'empty',
             'data': None
         })
+
+    # Layer paused blocks on top of the already-built timeline, purely for
+    # display: they're inserted at their original chronological position but
+    # never touched current_time above, so they don't displace or shrink
+    # whatever real segment (task/blocked/empty) already covers that slot.
+    if paused_blocks:
+        for block in paused_blocks:
+            timeline.append({
+                'start': block.start,
+                'end': block.end,
+                'type': 'paused',
+                'data': block,
+            })
+        timeline.sort(key=lambda seg: seg['start'])
     
     # Display the timeline
     console.print("[bold]⏰ Today's Timeline[/bold]")

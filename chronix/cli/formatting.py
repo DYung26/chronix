@@ -141,6 +141,8 @@ def print_timeline_segment(
         _print_task_segment(index, time_range, data)
     elif segment_type == 'blocked':
         _print_blocked_segment(index, time_range, data)
+    elif segment_type == 'paused':
+        _print_paused_segment(index, time_range, data)
     elif segment_type == 'empty':
         _print_empty_segment(index, time_range)
 
@@ -164,10 +166,12 @@ def _print_task_segment(index: int, time_range: str, scheduled_task):
     task_line.append("📋 ", style="")
     task_line.append(task.title, style="bold white")
     
-    # Add segment indicator if task is split
+    # Add segment indicator if task is split, and/or a partial-completion note
     if scheduled_task.is_segment:
         segment_label = f" (part {scheduled_task.segment_index}/{scheduled_task.total_segments})"
         task_line.append(segment_label, style="dim italic")
+    if scheduled_task.is_partial:
+        task_line.append(" (continues later)", style="dim italic")
     
     if violation_str:
         task_line.append(f" {violation_str}", style="")
@@ -243,6 +247,32 @@ def _print_blocked_segment(index: int, time_range: str, block: TimeBlock):
     blocked_line.append(label, style=style)
     
     console.print(blocked_line)
+
+
+def _print_paused_segment(index: int, time_range: str, block: TimeBlock):
+    """Print a recurring block that's paused for this session.
+
+    Greyed out and struck through: it no longer occupies any time (tasks may
+    be scheduled straight through it), this is purely a visual reminder that
+    it would normally have been here.
+    """
+    label = block.label or block.kind
+
+    emoji = "🚫"
+    if block.kind == "break":
+        emoji = "☕"
+    elif block.kind == "sleep":
+        emoji = "😴"
+    elif block.kind == "meeting":
+        emoji = "📅"
+
+    paused_line = Text()
+    paused_line.append(f"{index:2}. ", style="dim")
+    paused_line.append(f"{time_range}  ", style="dim strike")
+    paused_line.append(f"{emoji} ", style="dim")
+    paused_line.append(f"{label} (paused)", style="dim italic strike")
+
+    console.print(paused_line)
 
 
 def _print_empty_segment(index: int, time_range: str):
@@ -335,15 +365,101 @@ def print_task_details(task: Task, project_context):
     else:
         console.print(f"   [dim]External deadline:[/dim] [dim italic]Not set[/dim italic]")
     
+    if task.deadline_computed:
+        deadline_str = task.deadline_computed.strftime('%Y-%m-%d %H:%M %Z')
+        console.print(f"   [dim]Computed deadline:[/dim] {deadline_str}")
+    
     if task.effective_deadline:
         deadline_str = task.effective_deadline.strftime('%Y-%m-%d %H:%M %Z')
         console.print(f"   [dim]Effective deadline:[/dim] [bold]{deadline_str}[/bold]")
+    console.print()
+    
+    # Execution section
+    console.print("[bold]⚙️  Execution[/bold]")
+    console.print(f"   [dim]Mode:[/dim] {task.execution_mode}")
+    console.print(f"   [dim]Ref:[/dim] {task.ref if task.ref else '[dim italic]Not set[/dim italic]'}")
+    if task.depends_on:
+        console.print(f"   [dim]Depends on:[/dim] {', '.join(task.depends_on)}")
+    else:
+        console.print(f"   [dim]Depends on:[/dim] [dim italic]None[/dim italic]")
     console.print()
     
     # Status section
     console.print("[bold]📊 Status[/bold]")
     status_str = "[green]✓ Yes[/green]" if task.completed else "[dim]No[/dim]"
     console.print(f"   [dim]Completed:[/dim] {status_str}")
+    if task.is_active:
+        console.print(f"   [dim]Work session:[/dim] [green]active[/green] [dim](since {task.active_since.strftime('%Y-%m-%d %H:%M %Z')})[/dim]")
+    elif task.is_paused:
+        console.print(f"   [dim]Work session:[/dim] [yellow]paused[/yellow]")
+    else:
+        console.print(f"   [dim]Work session:[/dim] [dim italic]None[/dim italic]")
+    if task.sessions:
+        actual = task.actual_duration if task.actual_duration is not None else task.compute_actual_duration()
+        console.print(f"   [dim]Sessions logged:[/dim] {len(task.sessions)} [dim]|[/dim] [dim]Actual duration:[/dim] {format_duration(actual)}")
+    console.print()
+
+
+def print_document_overview(
+    document_label: str,
+    total_tasks: int,
+    incomplete_count: int,
+    completed_count: int
+):
+    """Print the header and task-count summary for a document's task listing."""
+    console.print()
+    console.print(f"[bold]📄 {document_label}[/bold]")
+    console.print()
+
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_column("Label", style="dim")
+    table.add_column("Value", style="bold cyan")
+    table.add_row("Total tasks", str(total_tasks))
+    table.add_row("Incomplete", str(incomplete_count))
+    table.add_row("Completed", str(completed_count))
+    console.print(table)
+    console.print()
+
+
+def print_task_table(tasks: list[Task]):
+    """Print a compact table of tasks for a single page of a document's task listing."""
+    table = Table(box=box.SIMPLE_HEAVY)
+    table.add_column("ID", style="yellow")
+    table.add_column("Title", style="white")
+    table.add_column("Duration", style="cyan")
+    table.add_column("Deadline", style="dim")
+    table.add_column("Mode", style="dim")
+
+    for task in tasks:
+        deadline_str = (
+            task.effective_deadline.strftime('%Y-%m-%d %H:%M')
+            if task.effective_deadline else "-"
+        )
+        title = task.title if len(task.title) <= 60 else task.title[:57] + "..."
+        table.add_row(
+            task.id or "-",
+            title,
+            format_duration(task.estimated_duration),
+            deadline_str,
+            task.execution_mode,
+        )
+
+    console.print(table)
+
+
+def print_page_footer(page: int, per_page: int, total: int, status_label: str):
+    """Print the pagination summary line below a task table."""
+    console.print()
+    if total == 0:
+        console.print(f"[dim]No {status_label} tasks.[/dim]")
+        console.print()
+        return
+
+    start = (page - 1) * per_page + 1
+    end = min(page * per_page, total)
+    console.print(f"[dim]Showing {start}-{end} of {total} {status_label} tasks.[/dim]")
+    if end < total:
+        console.print(f"[dim]Use --page {page + 1} to see more.[/dim]")
     console.print()
 
 

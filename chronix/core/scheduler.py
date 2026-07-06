@@ -4,6 +4,8 @@ from datetime import datetime, timedelta, date
 from typing import Optional
 from collections import defaultdict
 
+from pydantic import ValidationError
+
 from chronix.core.models import Task, TimeBlock, ScheduledTask, DaySchedule
 
 
@@ -199,6 +201,13 @@ class SchedulingEngine:
         
         # Track chunks scheduled per task per calendar day
         chunks_scheduled_today = defaultdict(lambda: defaultdict(int))
+
+        # Tasks that failed to actually place a chunk at current_time despite
+        # passing _select_next_task's pre-check (e.g. a dependency pushed
+        # earliest_allowed_start into a new day, changing the chunk-cap math
+        # after selection). Excluding them lets other tasks keep progressing
+        # instead of aborting the whole schedule; cleared once time advances.
+        unschedulable_now: set[int] = set()
         
         # Keep scheduling until all work is done
         while any(duration > timedelta(0) for duration in remaining_work.values()):
@@ -209,21 +218,18 @@ class SchedulingEngine:
                 current_time,
                 blocked_time,
                 completion_times,
-                chunks_scheduled_today
+                chunks_scheduled_today,
+                unschedulable_now
             )
             
             if task_to_schedule is None:
                 # No tasks left to schedule
                 break
             
-            earliest_allowed_start = current_time
             ref_to_task = {t.ref: t for t in incomplete_tasks if t.ref}
-
-            for dep_ref in task_to_schedule.depends_on:
-                dep_task = ref_to_task.get(dep_ref)
-                if dep_task and id(dep_task) in completion_times:
-                    dep_completion = completion_times[id(dep_task)]
-                    earliest_allowed_start = max(earliest_allowed_start, dep_completion)
+            earliest_allowed_start = self._compute_earliest_allowed_start(
+                task_to_schedule, current_time, completion_times, ref_to_task
+            )
             
             # Determine chunk size based on execution mode
             desired_chunk = self._determine_desired_chunk(
@@ -258,9 +264,9 @@ class SchedulingEngine:
                     completion_times[id(task_to_schedule)] = end
                 
                 current_time = next_time
+                unschedulable_now.clear()
             else:
-                # Could not schedule - should not happen, but safety break
-                break
+                unschedulable_now.add(id(task_to_schedule))
         
         # Convert segments to ScheduledTask objects with proper metadata
         scheduled, conflicts = self._build_scheduled_tasks(segments_by_task)
@@ -274,7 +280,8 @@ class SchedulingEngine:
         current_time: datetime,
         blocked_time: list[TimeBlock],
         completion_times: Optional[dict[str, datetime]] = None,
-        chunks_scheduled_today: Optional[dict[str, dict]] = None
+        chunks_scheduled_today: Optional[dict[str, dict]] = None,
+        excluded_task_ids: Optional[set[int]] = None
     ) -> Optional[Task]:
         """
         Select the next task to schedule using urgency-aware logic.
@@ -295,8 +302,17 @@ class SchedulingEngine:
         
         if chunks_scheduled_today is None:
             chunks_scheduled_today = defaultdict(lambda: defaultdict(int))
+
+        if excluded_task_ids is None:
+            excluded_task_ids = set()
+
+        ref_to_task = {t.ref: t for t in tasks if t.ref}
         
-        candidates = [t for t in tasks if remaining_work.get(id(t), timedelta(0)) > timedelta(0)]
+        candidates = [
+            t for t in tasks
+            if remaining_work.get(id(t), timedelta(0)) > timedelta(0)
+            and id(t) not in excluded_task_ids
+        ]
         
         if not candidates:
             return None
@@ -304,7 +320,6 @@ class SchedulingEngine:
         def deps_satisfied(task: Task) -> bool:
             if not task.depends_on:
                 return True
-            ref_to_task = {t.ref: t for t in tasks if t.ref}
             for dep_ref in task.depends_on:
                 dep_task = ref_to_task.get(dep_ref)
                 if not dep_task:
@@ -314,11 +329,14 @@ class SchedulingEngine:
             return True
         
         def can_place_chunk(task: Task) -> bool:
+            earliest_start = self._compute_earliest_allowed_start(
+                task, current_time, completion_times, ref_to_task
+            )
             chunk = self._determine_desired_chunk(
                 task,
                 remaining_work.get(id(task), timedelta(0)),
                 current_time,
-                current_time,
+                earliest_start,
                 blocked_time,
                 chunks_scheduled_today
             )
@@ -389,6 +407,21 @@ class SchedulingEngine:
             base_score *= 0.5  # External deadlines are twice as urgent
         
         return base_score
+
+    def _compute_earliest_allowed_start(
+        self,
+        task: Task,
+        current_time: datetime,
+        completion_times: dict[str, datetime],
+        ref_to_task: dict[str, Task]
+    ) -> datetime:
+        """Resolve the earliest a task may start given its dependencies' completion times."""
+        earliest_allowed_start = current_time
+        for dep_ref in task.depends_on:
+            dep_task = ref_to_task.get(dep_ref)
+            if dep_task and id(dep_task) in completion_times:
+                earliest_allowed_start = max(earliest_allowed_start, completion_times[id(dep_task)])
+        return earliest_allowed_start
 
     def _is_safe_to_schedule(
         self,
@@ -677,11 +710,27 @@ class SchedulingEngine:
         for task_id, segments in segments_by_task.items():
             # Sort segments by start time
             segments.sort(key=lambda s: s[1])
-            
+
+            # Merge segments that immediately follow one another with no
+            # actual gap in between. The chunking policy for flex/
+            # contiguous_preferred modes can pick the same task again on
+            # the very next iteration with no interruption in between; that's
+            # not a real split and shouldn't be shown as separate "parts".
+            merged_segments = [segments[0]]
+            for seg_task, seg_start, seg_end in segments[1:]:
+                prev_task, prev_start, prev_end = merged_segments[-1]
+                if seg_start <= prev_end:
+                    merged_segments[-1] = (prev_task, prev_start, max(prev_end, seg_end))
+                else:
+                    merged_segments.append((seg_task, seg_start, seg_end))
+            segments = merged_segments
+
             task = segments[0][0]
             final_end = segments[-1][2]
             is_multi_segment = len(segments) > 1
-            
+            total_scheduled = sum((end - start for _, start, end in segments), timedelta())
+            is_partial = total_scheduled < task.estimated_duration
+
             # Check violations based on final end time
             violates_user = self._violates_deadline(final_end, task.deadline_user)
             violates_external = self._violates_deadline(final_end, task.deadline_external)
@@ -715,16 +764,22 @@ class SchedulingEngine:
             
             # Create ScheduledTask for each segment
             for idx, (_, start, end) in enumerate(segments, start=1):
-                scheduled_task = ScheduledTask(
-                    task=task,
-                    start=start,
-                    end=end,
-                    violates_deadline_user=violates_user,
-                    violates_deadline_external=violates_external,
-                    is_segment=is_multi_segment,
-                    segment_index=idx if is_multi_segment else None,
-                    total_segments=len(segments) if is_multi_segment else None
-                )
+                try:
+                    scheduled_task = ScheduledTask(
+                        task=task,
+                        start=start,
+                        end=end,
+                        violates_deadline_user=violates_user,
+                        violates_deadline_external=violates_external,
+                        is_segment=is_multi_segment,
+                        segment_index=idx if is_multi_segment else None,
+                        total_segments=len(segments) if is_multi_segment else None,
+                        is_partial=is_partial,
+                    )
+                except ValidationError as e:
+                    raise ValueError(
+                        f"Failed to schedule task '{task.title}' (id={task.id}): {e}"
+                    ) from e
                 scheduled.append(scheduled_task)
         
         # Return in chronological order
