@@ -2037,13 +2037,24 @@ def _find_task_in_context(task_id: str) -> Optional[Task]:
     return None
 
 
-def _get_calendar_task_start(task_id: str) -> Optional[datetime]:
-    """Look up the scheduled calendar start time for a task, or return None."""
+# Fallback lookback when a task has no recorded `created` timestamp (e.g.
+# synced before that field existed). Matches the old fixed-window behavior.
+_DEFAULT_CALENDAR_SEARCH_LOOKBACK = timedelta(days=14)
+
+
+def _get_calendar_task_start(task_id: str, created: Optional[datetime] = None) -> Optional[datetime]:
+    """Look up the scheduled calendar start time for a task, or return None.
+
+    Searches from the task's creation time through now, so a task's calendar
+    event is still found even if it was scheduled well in the past (e.g. an
+    overdue task only just salvaged) -- searching to the deadline instead of
+    now would miss events created after an already-blown deadline.
+    """
     try:
         from chronix.integrations.google_calendar import CalendarSyncService
         sync_service = CalendarSyncService()
-        search_start = datetime.now(timezone.utc) - timedelta(days=14)
         search_end = datetime.now(timezone.utc)
+        search_start = created if created is not None else search_end - _DEFAULT_CALENDAR_SEARCH_LOOKBACK
         return sync_service.find_task_scheduled_start(task_id, search_start, search_end)
     except Exception:
         return None
@@ -2090,7 +2101,7 @@ def done_command(args: list[str]) -> int:
             sessions.append(WorkSession(start=task.active_since, end=now))
             update.metadata_remove.append(KEY_ACTIVE_SINCE)
         elif not sessions:
-            calendar_start = _get_calendar_task_start(task_id)
+            calendar_start = _get_calendar_task_start(task_id, created=task.created)
             if calendar_start is not None:
                 sessions.append(WorkSession(start=calendar_start, end=now))
             else:
@@ -2153,7 +2164,7 @@ def pause_command(args: list[str]) -> int:
     if task.active_since is not None:
         session_start = task.active_since
     else:
-        session_start = _get_calendar_task_start(task_id)
+        session_start = _get_calendar_task_start(task_id, created=task.created)
         if session_start is None:
             print_error(
                 f"Task '{task_id}' has no scheduled calendar event. "

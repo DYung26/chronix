@@ -160,17 +160,25 @@ class CalendarSyncService:
         """Return the calendar start time of the most recent scheduled event for task_id.
 
         Searches Chronix-managed events in [search_start, search_end] and returns
-        the start of the first matching event, or None if none is found.
+        the start of the latest-starting matching event, or None if none is found.
+        Normal operation keeps at most one live event per task (rescheduling
+        deletes and recreates it), but a widened search window can still surface
+        stale duplicates left over from before a reschedule; picking the latest
+        one reflects the task's current scheduled occurrence.
         """
         try:
             calendar_id = self.client.get_primary_calendar()
             events = self.client.list_events(calendar_id, search_start, search_end)
+            latest_start: Optional[datetime] = None
             for event in events:
                 if (
                     self.classifier.is_chronix_managed(event)
                     and self.classifier.get_chronix_task_id(event) == task_id
                 ):
-                    return _parse_datetime(event.get('start'))
+                    event_start = _parse_datetime(event.get('start'))
+                    if event_start is not None and (latest_start is None or event_start > latest_start):
+                        latest_start = event_start
+            return latest_start
         except Exception:
             pass
         return None
