@@ -377,6 +377,10 @@ def print_task_details(task: Task, project_context):
     # Execution section
     console.print("[bold]⚙️  Execution[/bold]")
     console.print(f"   [dim]Mode:[/dim] {task.execution_mode}")
+    if task.priority is not None:
+        console.print(f"   [dim]Priority:[/dim] P{task.priority} [dim](from source document's config)[/dim]")
+    else:
+        console.print(f"   [dim]Priority:[/dim] [dim italic]Unranked[/dim italic]")
     console.print(f"   [dim]Ref:[/dim] {task.ref if task.ref else '[dim italic]Not set[/dim italic]'}")
     if task.depends_on:
         console.print(f"   [dim]Depends on:[/dim] {', '.join(task.depends_on)}")

@@ -342,7 +342,10 @@ def sync_command(args: list[str]) -> int:
 
         for doc_id in document_ids:
             alias = config.google_docs.get_alias(doc_id)
-            result, project, meetings = _sync_single_document_with_retries(doc_id, client, alias=alias)
+            priority = config.google_docs.get_priority(doc_id)
+            result, project, meetings = _sync_single_document_with_retries(
+                doc_id, client, alias=alias, priority=priority
+            )
             results.append(result)
             
             if result.outcome.value == "success":
@@ -877,16 +880,25 @@ def documents_command(args: list[str]) -> int:
                 if p.project_context.document_id
             }
         
-        for doc_config in documents:
+        # Show explicitly ranked documents first (lowest rank number first,
+        # i.e. highest priority), then unranked ones in their configured order.
+        ranked = sorted(
+            documents,
+            key=lambda d: d.priority if d.priority is not None else float("inf")
+        )
+
+        for doc_config in ranked:
             doc_id = doc_config.document_id
             title = doc_titles.get(doc_id, "(not synced yet)")
+            priority_str = f"[yellow]P{doc_config.priority}[/yellow] " if doc_config.priority is not None else ""
             if doc_config.alias:
-                console.print(f"  [cyan]{doc_config.alias}[/cyan] [dim]({doc_id})[/dim]  {title}")
+                console.print(f"  {priority_str}[cyan]{doc_config.alias}[/cyan] [dim]({doc_id})[/dim]  {title}")
             else:
-                console.print(f"  [cyan]{doc_id}[/cyan]  {title}")
+                console.print(f"  {priority_str}[cyan]{doc_id}[/cyan]  {title}")
         
         console.print()
         console.print(f"Use [cyan]sync <id|alias> [id|alias ...][/cyan] to sync specific documents")
+        console.print("[dim]Priority (lower = higher) is set per document via `priority` in config.toml.[/dim]")
         console.print()
         return 0
     
@@ -1455,7 +1467,10 @@ def _resync_document(doc_id: str, config) -> None:
     try:
         client = _context._ensure_google_client()
         alias = config.google_docs.get_alias(doc_id)
-        result, project, _meetings = _sync_single_document_with_retries(doc_id, client, alias=alias)
+        priority = config.google_docs.get_priority(doc_id)
+        result, project, _meetings = _sync_single_document_with_retries(
+            doc_id, client, alias=alias, priority=priority
+        )
     except Exception:
         print_warning("Could not refresh local state for this document. Run 'sync' to pick up the change.")
         return

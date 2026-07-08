@@ -86,6 +86,16 @@ class DocumentConfig(BaseModel):
 
     document_id: str
     alias: Optional[str] = None
+    priority: Optional[int] = Field(
+        default=None,
+        description=(
+            "Scheduling priority rank for this document's tasks, relative to other "
+            "documents. Lower number = higher priority (1 is highest). Unset means "
+            "unranked, which is treated as lowest priority. This is a soft nudge on "
+            "top of deadline-driven scheduling, not a hard override: a lower-priority "
+            "document's task with a critical deadline is still protected."
+        ),
+    )
 
 
 class GoogleDocsConfig(BaseModel):
@@ -144,6 +154,13 @@ class GoogleDocsConfig(BaseModel):
         for doc in self.documents:
             if doc.document_id == document_id:
                 return doc.alias
+        return None
+
+    def get_priority(self, document_id: str) -> Optional[int]:
+        """Return the priority rank for a document_id, or None if unranked/not configured."""
+        for doc in self.documents:
+            if doc.document_id == document_id:
+                return doc.priority
         return None
 
     def format_document_label(self, document_id: str) -> str:

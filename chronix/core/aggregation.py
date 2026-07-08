@@ -14,6 +14,16 @@ from chronix.core.dependencies import resolve_task_dependencies, DependencyError
 
 _AGEING_HALF_LIFE_DAYS = 30.0
 
+# Sentinel used so unranked documents (Task.priority is None) sort after every
+# explicitly ranked one, consistent with DocumentConfig.priority's semantics
+# (lower number = higher priority; unset = lowest priority tier).
+_UNRANKED_PRIORITY = 2 ** 31
+
+
+def _priority_sort_key(task: Task) -> int:
+    """Sort key for a task's document priority (lower sorts first)."""
+    return task.priority if task.priority is not None else _UNRANKED_PRIORITY
+
 
 def _ageing_bonus_seconds(task: Task, now: datetime) -> float:
     """Return a scheduling bonus in seconds derived from how long a task has existed.
@@ -45,6 +55,10 @@ class ProjectContext:
     source: str = "google_docs"
     document_id: Optional[str] = None
     alias: Optional[str] = None
+    # Scheduling priority rank from this document's config entry (lower =
+    # higher priority; None = unranked). Propagated to each Task at
+    # aggregation time -- see TaskAggregator._enrich_task_with_project.
+    priority: Optional[int] = None
 
     def __hash__(self):
         return hash((self.project_id, self.source))
@@ -88,6 +102,7 @@ class ProjectTodoList:
         source: str = "google_docs",
         document_id: Optional[str] = None,
         alias: Optional[str] = None,
+        priority: Optional[int] = None,
     ):
         self.project_context = ProjectContext(
             project_id=project_id or self._normalize_project_name(project_name),
@@ -95,6 +110,7 @@ class ProjectTodoList:
             source=source,
             document_id=document_id,
             alias=alias,
+            priority=priority,
         )
         self.tasks = tasks
 
@@ -140,6 +156,9 @@ class TaskAggregator:
         if not task.project:
             task.project = project_context.project_name
 
+        if task.priority is None:
+            task.priority = project_context.priority
+
         return task
 
     def get_task_pool(
@@ -166,8 +185,15 @@ class TaskAggregator:
 
         Within each category, tasks are sorted by:
         - Primary: deadline (earliest first)
-        - Secondary: duration (shorter first)
-        - Tertiary: title (alphabetical)
+        - Secondary: document priority rank (lower rank first; unranked last)
+        - Tertiary: duration (shorter first)
+        - Quaternary: title (alphabetical)
+
+        Document priority is a soft bias, same as in the scheduler's urgency
+        scoring: it only distinguishes tasks that already tie on the primary
+        key (or, for no-deadline tasks, ranks above the passive ageing bonus).
+        It never lets an unranked/low-priority document's deadline jump ahead
+        of a higher-priority document's earlier deadline.
 
         Completed tasks appear after all incomplete tasks.
         """
@@ -200,6 +226,7 @@ class TaskAggregator:
             incomplete_hard,
             key=lambda t: (
                 t.deadline_external or max_datetime,
+                _priority_sort_key(t),
                 t.estimated_duration,
                 t.title
             )
@@ -209,6 +236,7 @@ class TaskAggregator:
             incomplete_soft,
             key=lambda t: (
                 t.deadline_user or max_datetime,
+                _priority_sort_key(t),
                 t.estimated_duration,
                 t.title
             )
@@ -218,6 +246,7 @@ class TaskAggregator:
             incomplete_computed,
             key=lambda t: (
                 t.deadline_computed or max_datetime,
+                _priority_sort_key(t),
                 t.estimated_duration,
                 t.title
             )
@@ -227,6 +256,7 @@ class TaskAggregator:
         none_sorted = sorted(
             incomplete_none,
             key=lambda t: (
+                _priority_sort_key(t),
                 -_ageing_bonus_seconds(t, now),
                 t.estimated_duration,
                 t.title,
@@ -306,6 +336,7 @@ def create_project_todo(
     source: str = "google_docs",
     document_id: Optional[str] = None,
     alias: Optional[str] = None,
+    priority: Optional[int] = None,
 ) -> ProjectTodoList:
     """Create a ProjectTodoList with explicit project identity."""
     return ProjectTodoList(
@@ -315,4 +346,5 @@ def create_project_todo(
         source=source,
         document_id=document_id,
         alias=alias,
+        priority=priority,
     )

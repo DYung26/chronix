@@ -120,12 +120,18 @@ def config_show_command(args: list[str]) -> int:
         print(f"   Auth method: {config.google_docs.auth_method}")
         print(f"   Credentials: {config.google_docs.credentials_path}")
         print(f"   Token cache: {config.google_docs.token_path}")
-        if config.google_docs.document_ids:
-            print(f"   Documents: {len(config.google_docs.document_ids)} configured")
-            for doc_id in config.google_docs.document_ids[:3]:
-                print(f"     • {doc_id}")
-            if len(config.google_docs.document_ids) > 3:
-                print(f"     ... and {len(config.google_docs.document_ids) - 3} more")
+        if config.google_docs.documents:
+            print(f"   Documents: {len(config.google_docs.documents)} configured")
+            ranked = sorted(
+                config.google_docs.documents,
+                key=lambda d: d.priority if d.priority is not None else float("inf")
+            )
+            for doc in ranked[:3]:
+                label = f"{doc.alias} ({doc.document_id})" if doc.alias else doc.document_id
+                priority_str = f" [priority {doc.priority}]" if doc.priority is not None else ""
+                print(f"     • {label}{priority_str}")
+            if len(ranked) > 3:
+                print(f"     ... and {len(ranked) - 3} more")
         else:
             print(f"   Documents: None configured")
         

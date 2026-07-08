@@ -55,6 +55,11 @@ class Task(BaseModel):
     ref: Optional[str] = None
     depends_on: list[str] = []
     execution_mode: ExecutionMode = "atomic"
+    # Priority rank inherited from the task's source document's config entry
+    # (DocumentConfig.priority). Lower = higher priority; None = unranked.
+    # Used only as a soft bias in scheduling urgency -- never overrides
+    # deadline safety. Stamped on by TaskAggregator, not set by parsers.
+    priority: Optional[int] = None
     created: Optional[datetime] = None
     sessions: list[WorkSession] = []
     actual_duration: Optional[timedelta] = None

@@ -84,10 +84,15 @@ def _sync_single_document_with_retries(
     doc_id: str,
     client: Any,
     alias: Optional[str] = None,
+    priority: Optional[int] = None,
 ) -> tuple[DocumentSyncResult, Optional[Any], list]:
     """
     Sync a single document with retry logic for transient failures.
-    
+
+    `priority` is the document's configured scheduling priority rank (see
+    DocumentConfig.priority), threaded through so it lands on the resulting
+    ProjectTodoList and, from there, on every task via TaskAggregator.
+
     Returns (result, project, meetings) where project and meetings are None on failure.
     """
     from chronix.integrations.google_docs.parser import GoogleDocsParser
@@ -123,6 +128,7 @@ def _sync_single_document_with_retries(
                 tasks=tasks,
                 document_id=doc_id,
                 alias=alias,
+                priority=priority,
             )
             
             task_word = "task" if len(tasks) == 1 else "tasks"

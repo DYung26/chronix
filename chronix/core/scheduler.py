@@ -15,6 +15,23 @@ DEFAULT_TARGET_CHUNK = timedelta(minutes=90)
 DEFAULT_MIN_CHUNK = timedelta(minutes=60)
 DEFAULT_MAX_CHUNKS_PER_DAY = 2
 
+# Soft per-rank nudge applied to a task's urgency score based on its source
+# document's configured priority (DocumentConfig.priority; rank 1 = highest).
+# Deliberately modest relative to typical deadline slack (hours/days): this
+# lets document priority break ties and nudge ordering among comparably
+# urgent tasks -- or fully determine order among tasks with no deadline at
+# all -- without letting a merely "preferred" document jump ahead of a
+# critical deadline elsewhere. _is_safe_to_schedule's deadline protection is
+# unaffected by this bias.
+PRIORITY_BIAS_STEP_SECONDS = 4 * 3600
+
+# Bias rank used for unranked (Task.priority is None) tasks -- deliberately
+# higher than any realistic explicit rank, so an unranked document's tasks
+# are always nudged less urgent than an explicitly ranked one's, matching
+# DocumentConfig.priority's "unset = lowest priority" semantics. If a config
+# ever ranks 25+ documents this assumption should be revisited.
+UNRANKED_PRIORITY_BIAS_RANK = 25
+
 
 class SchedulingEngine:
     """Places ordered tasks into time slots while respecting blocked time."""
@@ -379,34 +396,53 @@ class SchedulingEngine:
         - Time until deadline (less time = more urgent)
         - Time needed to complete (more time needed = more urgent to start)
         - Deadline type (external > user > none)
+        - Document priority rank (soft nudge -- see PRIORITY_BIAS_STEP_SECONDS)
         """
         if not task.effective_deadline:
             # No deadline - least urgent, use a large number plus duration
-            return 1e10 + remaining_duration.total_seconds()
-        
-        # Time until deadline
-        time_until_deadline = task.effective_deadline - current_time
-        
-        if time_until_deadline <= timedelta(0):
-            # Already past deadline - highly urgent
-            return -1e9 + time_until_deadline.total_seconds()
-        
-        # Estimate completion time accounting for blocks
-        completion_time = self._estimate_completion_time(current_time, remaining_duration, blocked_time)
-        time_with_blocks = completion_time - current_time
-        
-        # Slack time = how much time we have beyond what we need
-        slack = time_until_deadline - time_with_blocks
-        
-        # Base urgency on slack time
-        # Less slack = more urgent (lower score)
-        base_score = slack.total_seconds()
-        
-        # Boost urgency for external deadlines
-        if task.deadline_external:
-            base_score *= 0.5  # External deadlines are twice as urgent
-        
-        return base_score
+            base_score = 1e10 + remaining_duration.total_seconds()
+        else:
+            # Time until deadline
+            time_until_deadline = task.effective_deadline - current_time
+
+            if time_until_deadline <= timedelta(0):
+                # Already past deadline - highly urgent
+                base_score = -1e9 + time_until_deadline.total_seconds()
+            else:
+                # Estimate completion time accounting for blocks
+                completion_time = self._estimate_completion_time(current_time, remaining_duration, blocked_time)
+                time_with_blocks = completion_time - current_time
+
+                # Slack time = how much time we have beyond what we need
+                slack = time_until_deadline - time_with_blocks
+
+                # Base urgency on slack time
+                # Less slack = more urgent (lower score)
+                base_score = slack.total_seconds()
+
+                # Boost urgency for external deadlines
+                if task.deadline_external:
+                    base_score *= 0.5  # External deadlines are twice as urgent
+
+        return base_score + self._priority_bias(task)
+
+    def _priority_bias(self, task: Task) -> float:
+        """Soft urgency-score nudge from the task's source-document priority.
+
+        Since lower urgency scores are picked first, a lower Task.priority
+        number (rank 1 = highest) adds a smaller amount here, making the task
+        look more urgent. Unranked (None) tasks are treated as one tier below
+        any realistic explicit rank (UNRANKED_PRIORITY_BIAS_RANK), so they're
+        always nudged less urgent than a ranked document's tasks, matching
+        DocumentConfig.priority's "unset = lowest priority" semantics. This
+        only ever shifts ordering among tasks that are otherwise comparably
+        urgent (or have no deadline at all) -- it's added after all
+        deadline-driven urgency math, and is small enough relative to real
+        deadline slack that it cannot make a merely higher-priority document's
+        task preempt another task's genuinely critical deadline.
+        """
+        rank = task.priority if task.priority is not None else UNRANKED_PRIORITY_BIAS_RANK
+        return rank * PRIORITY_BIAS_STEP_SECONDS
 
     def _compute_earliest_allowed_start(
         self,
@@ -438,6 +474,11 @@ class SchedulingEngine:
         - It's an external deadline (hard constraint)
         - OR it's a user deadline that's becoming urgent (less than 2x the time needed)
         
+        Other tasks whose deadline is already unreachable as of current_time -- i.e. it
+        would be missed even with zero further delay -- are excluded from this check.
+        They've already lost regardless of what we schedule next, so they shouldn't be
+        able to veto scheduling of a task whose deadline is still reachable.
+        
         This version reasons about a typical chunk, not the entire remaining task.
         Returns True if safe to schedule, False if it would endanger critical deadlines.
         """
@@ -458,6 +499,15 @@ class SchedulingEngine:
 
             other_remaining = remaining_work.get(id(other_task), timedelta(0))
             if other_remaining <= timedelta(0):
+                continue
+
+            # Skip tasks that are already unreachable even with zero further
+            # delay -- they're a lost cause independent of this decision, so
+            # they shouldn't block scheduling of a task that can still make it.
+            time_needed_from_now = self._estimate_duration_with_blocks(
+                current_time, other_remaining, blocked_time
+            )
+            if time_needed_from_now > other_task.effective_deadline - current_time:
                 continue
             
             # Only check if the other task's deadline is "critical"
