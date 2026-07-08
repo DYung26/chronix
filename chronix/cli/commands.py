@@ -263,6 +263,12 @@ def _resolve_document_token(token: str, config: 'ChronixConfig') -> Optional[str
     return config.google_docs.resolve(token)
 
 
+def _configured_tz(config: 'ChronixConfig') -> ZoneInfo:
+    """The app's configured scheduling timezone, used to read/write naive
+    metadata datetimes in Google Docs as-is (see chronix.core.metadata)."""
+    return ZoneInfo(config.scheduling.timezone)
+
+
 def sync_command(args: list[str]) -> int:
     """
     Sync command: Fetch and parse configured project documents.
@@ -336,6 +342,7 @@ def sync_command(args: list[str]) -> int:
         # Sync each document with retry logic
         from chronix.cli.sync_helpers import _sync_single_document_with_retries
         
+        tz = _configured_tz(config)
         projects = []
         all_meetings = []
         results = []
@@ -344,7 +351,7 @@ def sync_command(args: list[str]) -> int:
             alias = config.google_docs.get_alias(doc_id)
             priority = config.google_docs.get_priority(doc_id)
             result, project, meetings = _sync_single_document_with_retries(
-                doc_id, client, alias=alias, priority=priority
+                doc_id, client, alias=alias, priority=priority, tz=tz
             )
             results.append(result)
             
@@ -426,7 +433,7 @@ def today_command(args: list[str]) -> int:
         day_schedule, work_start, work_end, paused_blocks = _generate_today_schedule(time_override)
         
         # Display schedule
-        print_schedule_header(day_schedule.date, work_start, work_end, "UTC")
+        print_schedule_header(day_schedule.date, work_start, work_end, str(work_start.tzinfo))
         
         _display_continuous_timeline(day_schedule, work_start, work_end, paused_blocks=paused_blocks)
         
@@ -517,7 +524,7 @@ def calendar_command(args: list[str]) -> int:
         print()
         
         # Display schedule (same as today command)
-        print_schedule_header(day_schedule.date, work_start, work_end, "UTC")
+        print_schedule_header(day_schedule.date, work_start, work_end, str(work_start.tzinfo))
         
         _display_continuous_timeline(day_schedule, work_start, work_end, paused_blocks=paused_blocks)
         
@@ -1321,7 +1328,7 @@ def add_command(args: list[str]) -> int:
 
     try:
         client = _context._ensure_google_client()
-        writer = GoogleDocsTaskWriter(auth_strategy=client.auth_strategy)
+        writer = GoogleDocsTaskWriter(auth_strategy=client.auth_strategy, tz=_configured_tz(config))
         task_id = generate_task_id()
         writer.create_task(doc_id, NewTask(title=title, duration=duration, id=task_id, tab=tab_token))
         _resync_document(doc_id, config)
@@ -1448,10 +1455,10 @@ def _display_continuous_timeline(day_schedule, work_start: datetime, work_end: d
 # ---------------------------------------------------------------------------
 
 
-def _get_task_writer():
+def _get_task_writer(tz: ZoneInfo):
     from chronix.integrations.google_docs.writer import GoogleDocsTaskWriter
     client = _context._ensure_google_client()
-    return GoogleDocsTaskWriter(auth_strategy=client.auth_strategy)
+    return GoogleDocsTaskWriter(auth_strategy=client.auth_strategy, tz=tz)
 
 
 def _resync_document(doc_id: str, config) -> None:
@@ -1469,7 +1476,7 @@ def _resync_document(doc_id: str, config) -> None:
         alias = config.google_docs.get_alias(doc_id)
         priority = config.google_docs.get_priority(doc_id)
         result, project, _meetings = _sync_single_document_with_retries(
-            doc_id, client, alias=alias, priority=priority
+            doc_id, client, alias=alias, priority=priority, tz=_configured_tz(config)
         )
     except Exception:
         print_warning("Could not refresh local state for this document. Run 'sync' to pick up the change.")
@@ -1565,7 +1572,7 @@ def _run_task_update(task_id: str, update, doc_token: Optional[str] = None) -> i
         return 1
 
     try:
-        writer = _get_task_writer()
+        writer = _get_task_writer(_configured_tz(config))
         writer.update_task(doc_id, task_id, update)
         _resync_document(doc_id, config)
         return 0
@@ -1632,6 +1639,14 @@ def update_command(args: list[str]) -> int:
         return 1
     doc_token, flags = _parse_edit_flags(args[1:])
 
+    try:
+        from chronix.config import ChronixConfig
+        config = _context.config or ChronixConfig.load_or_default()
+    except Exception as e:
+        print_error(f"Failed to load configuration: {e}")
+        return 1
+    tz = _configured_tz(config)
+
     update = TaskUpdate()
     i = 0
     while i < len(flags):
@@ -1660,7 +1675,7 @@ def update_command(args: list[str]) -> int:
                 )
                 return 1
             try:
-                update.external_deadline = parse_deadline(flags[i + 1])
+                update.external_deadline = parse_deadline(flags[i + 1], tz)
             except ValueError as e:
                 print_error(str(e))
                 return 1
@@ -1673,7 +1688,7 @@ def update_command(args: list[str]) -> int:
                 )
                 return 1
             try:
-                update.user_deadline = parse_deadline(flags[i + 1])
+                update.user_deadline = parse_deadline(flags[i + 1], tz)
             except ValueError as e:
                 print_error(str(e))
                 return 1
@@ -1835,8 +1850,16 @@ def deadline_command(args: list[str]) -> int:
     task_id = remaining[0]
     if _reject_flag_as_task_id(task_id, usage):
         return 1
+
     try:
-        dt = parse_deadline(remaining[1])
+        from chronix.config import ChronixConfig
+        config = _context.config or ChronixConfig.load_or_default()
+    except Exception as e:
+        print_error(f"Failed to load configuration: {e}")
+        return 1
+
+    try:
+        dt = parse_deadline(remaining[1], _configured_tz(config))
     except ValueError as e:
         print_error(str(e))
         return 1
@@ -1982,7 +2005,7 @@ def deadlines_command(args: list[str]) -> int:
             print_warning(f"Skipping '{r.task.title}': task has no id yet. Run 'sync' first.")
             failures += 1
             continue
-        update = TaskUpdate(metadata={KEY_DEADLINE_COMPUTED: serialize_deadline(r.deadline)})
+        update = TaskUpdate(metadata={KEY_DEADLINE_COMPUTED: serialize_deadline(r.deadline, _configured_tz(config))})
         rc = _run_task_update(r.task.id, update)
         if rc != 0:
             failures += 1
@@ -2089,6 +2112,14 @@ def done_command(args: list[str]) -> int:
     task_id = remaining[0]
     if _reject_flag_as_task_id(task_id, usage):
         return 1
+
+    try:
+        from chronix.config import ChronixConfig
+        config = _context.config or ChronixConfig.load_or_default()
+    except Exception as e:
+        print_error(f"Failed to load configuration: {e}")
+        return 1
+
     now = datetime.now(timezone.utc)
 
     update = TaskUpdate(completed=True)
@@ -2113,7 +2144,7 @@ def done_command(args: list[str]) -> int:
 
         if sessions:
             actual = sum((s.duration for s in sessions), timedelta())
-            update.metadata[KEY_SESSIONS] = serialize_sessions(sessions)
+            update.metadata[KEY_SESSIONS] = serialize_sessions(sessions, _configured_tz(config))
             update.metadata[KEY_ACTUAL_DURATION] = serialize_duration(actual)
 
     rc = _run_task_update(task_id, update, doc_token)
@@ -2159,6 +2190,13 @@ def pause_command(args: list[str]) -> int:
         print_error(f"Task '{task_id}' is already paused.")
         return 1
 
+    try:
+        from chronix.config import ChronixConfig
+        config = _context.config or ChronixConfig.load_or_default()
+    except Exception as e:
+        print_error(f"Failed to load configuration: {e}")
+        return 1
+
     now = datetime.now(timezone.utc)
 
     if task.active_since is not None:
@@ -2176,7 +2214,7 @@ def pause_command(args: list[str]) -> int:
     sessions = task.sessions + [new_session]
 
     update = TaskUpdate(
-        metadata={KEY_SESSIONS: serialize_sessions(sessions)},
+        metadata={KEY_SESSIONS: serialize_sessions(sessions, _configured_tz(config))},
         metadata_remove=[KEY_ACTIVE_SINCE],
     )
     rc = _run_task_update(task_id, update, doc_token)
@@ -2216,8 +2254,15 @@ def resume_command(args: list[str]) -> int:
         print_error(f"Task '{task_id}' is already active.")
         return 1
 
+    try:
+        from chronix.config import ChronixConfig
+        config = _context.config or ChronixConfig.load_or_default()
+    except Exception as e:
+        print_error(f"Failed to load configuration: {e}")
+        return 1
+
     now = datetime.now(timezone.utc)
-    update = TaskUpdate(metadata={KEY_ACTIVE_SINCE: serialize_active_since(now)})
+    update = TaskUpdate(metadata={KEY_ACTIVE_SINCE: serialize_active_since(now, _configured_tz(config))})
     rc = _run_task_update(task_id, update, doc_token)
     if rc == 0:
         print_success(f"Task '{task_id}' resumed.")
@@ -2339,7 +2384,7 @@ def delete_command(args: list[str]) -> int:
         return 1
 
     try:
-        writer = _get_task_writer()
+        writer = _get_task_writer(_configured_tz(config))
         writer.delete_task(doc_id, task_id)
         _resync_document(doc_id, config)
         print_success(f"Task '{task_id}' deleted.")

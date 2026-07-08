@@ -1,6 +1,7 @@
 """Google Docs implementation of the TaskWriter interface."""
 
 from collections import defaultdict
+from datetime import timezone
 from typing import Any
 
 from chronix.core.metadata import (
@@ -39,9 +40,15 @@ class GoogleDocsTaskWriter(TaskWriter):
     The new paragraph inherits checkbox list membership from the split point.
     """
 
-    def __init__(self, auth_strategy: AuthStrategy | None = None):
+    def __init__(self, auth_strategy: AuthStrategy | None = None, tz: timezone = timezone.utc):
+        """`tz` is the timezone naive metadata datetimes are read/written in.
+
+        Should be the app's configured `scheduling.timezone`, since Google Docs
+        is treated as the source of truth for those naive values as-is.
+        """
         self._auth = auth_strategy or get_default_auth_strategy()
         self._service = None
+        self._tz = tz
 
     @property
     def _docs_service(self) -> Any:
@@ -61,7 +68,7 @@ class GoogleDocsTaskWriter(TaskWriter):
         if tab_id is not None:
             location["tabId"] = tab_id
 
-        task_line = format_task_line(task)
+        task_line = format_task_line(task, self._tz)
         requests: list[dict[str, Any]] = []
 
         if not placeholder_existed:
@@ -112,7 +119,7 @@ class GoogleDocsTaskWriter(TaskWriter):
         if element is None:
             raise TaskNotFoundError(task_id)
 
-        requests = _build_update_requests(element, tab_id, update)
+        requests = _build_update_requests(element, tab_id, update, self._tz)
         if requests:
             self._docs_service.documents().batchUpdate(
                 documentId=document_id,
@@ -249,15 +256,16 @@ class GoogleDocsTaskWriter(TaskWriter):
 # Line serialization
 # ---------------------------------------------------------------------------
 
-def format_task_line(task: NewTask) -> str:
+def format_task_line(task: NewTask, tz: timezone = timezone.utc) -> str:
     """Serialize a NewTask to the canonical key=value task line.
 
     ``id`` is included only when set on the task; callers that want a persistent
     id assigned immediately (rather than later via sync's backfill) must pass one.
     A ``created`` timestamp is always included.  If ``task.created`` is set it
     is used as-is; otherwise the current UTC time is stamped automatically.
+    `tz` is the timezone naive deadline/created values are written in.
     """
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     fields: dict[str, str] = {}
     if task.id is not None:
@@ -265,9 +273,9 @@ def format_task_line(task: NewTask) -> str:
     fields[KEY_ESTIMATE] = serialize_duration(task.duration)
 
     if task.external_deadline is not None:
-        fields[KEY_EXTERNAL_DEADLINE] = serialize_deadline(task.external_deadline)
+        fields[KEY_EXTERNAL_DEADLINE] = serialize_deadline(task.external_deadline, tz)
     if task.user_deadline is not None:
-        fields[KEY_USER_DEADLINE] = serialize_deadline(task.user_deadline)
+        fields[KEY_USER_DEADLINE] = serialize_deadline(task.user_deadline, tz)
     if task.mode is not None:
         fields[KEY_MODE] = task.mode
     if task.ref is not None:
@@ -275,19 +283,20 @@ def format_task_line(task: NewTask) -> str:
     if task.depends is not None:
         fields[KEY_DEPENDS] = task.depends
     created = task.created if task.created is not None else datetime.now(timezone.utc)
-    fields[KEY_CREATED] = serialize_created(created)
+    fields[KEY_CREATED] = serialize_created(created, tz)
     for k, v in task.extra.items():
         fields[k] = v
 
     return f"{task.title} ::: {serialize_metadata(fields)}"
 
 
-def _apply_update_to_task_line(current_line: str, update: TaskUpdate) -> str:
+def _apply_update_to_task_line(current_line: str, update: TaskUpdate, tz: timezone = timezone.utc) -> str:
     """Produce the updated task line string from the current line and an update.
 
     Preserves the existing id= and all unknown metadata keys.
     Only fields explicitly set on ``update`` are changed.
     Migrates legacy ``duration=`` key to ``estimate=`` on any update.
+    `tz` is the timezone naive deadline values are written in.
     """
     sep = " ::: "
     if sep not in current_line:
@@ -310,10 +319,10 @@ def _apply_update_to_task_line(current_line: str, update: TaskUpdate) -> str:
         kv[KEY_ESTIMATE] = serialize_duration(update.duration)
 
     if update.has_external_deadline_change():
-        kv[KEY_EXTERNAL_DEADLINE] = serialize_deadline(update.external_deadline)  # type: ignore[arg-type]
+        kv[KEY_EXTERNAL_DEADLINE] = serialize_deadline(update.external_deadline, tz)  # type: ignore[arg-type]
 
     if update.has_user_deadline_change():
-        kv[KEY_USER_DEADLINE] = serialize_deadline(update.user_deadline)  # type: ignore[arg-type]
+        kv[KEY_USER_DEADLINE] = serialize_deadline(update.user_deadline, tz)  # type: ignore[arg-type]
 
     if update.mode is not None:
         kv[KEY_MODE] = update.mode
@@ -343,6 +352,7 @@ def _build_update_requests(
     element: dict[str, Any],
     tab_id: str | None,
     update: TaskUpdate,
+    tz: timezone = timezone.utc,
 ) -> list[dict[str, Any]]:
     """Build batchUpdate requests to apply ``update`` to the given element."""
     requests: list[dict[str, Any]] = []
@@ -352,7 +362,7 @@ def _build_update_requests(
     text_end = end_index - 1
 
     current_text = _paragraph_text(element.get("paragraph", {}))
-    new_text = _apply_update_to_task_line(current_text, update)
+    new_text = _apply_update_to_task_line(current_text, update, tz)
 
     text_changed = new_text != current_text
 

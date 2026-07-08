@@ -89,23 +89,35 @@ def serialize_duration(duration: timedelta) -> str:
 # Display datetime formatting
 #
 # All datetime-bearing metadata fields are stored internally as
-# timezone-aware UTC datetimes, but are displayed in Google Docs as naive,
-# second-precision UTC strings (no offset, no microseconds) for readability.
-# This is the single source of truth for that display format; every
-# serialize_* helper below routes through it.
+# timezone-aware datetimes, but are displayed in Google Docs as naive,
+# second-precision local-time strings (no offset, no microseconds) for
+# readability. "Local" here means the caller-supplied `tz` -- in practice
+# always the app's configured `scheduling.timezone` -- since Google Docs is
+# treated as the source of truth and is assumed to already contain times in
+# that same timezone; chronix must round-trip them as-is rather than
+# re-interpreting or re-offsetting them. This is the single source of truth
+# for that display format; every serialize_*/parse_* helper below routes
+# through it. `tz` defaults to UTC only for historical/one-off callers (e.g.
+# scripts/migrate_datetime_display_format.py) that predate configurable
+# timezones; real application code must always pass the configured tz
+# explicitly.
 # ---------------------------------------------------------------------------
 
-def _format_display_datetime(dt: datetime) -> str:
-    """Format a datetime for display: naive UTC, second precision."""
-    return dt.astimezone(timezone.utc).replace(tzinfo=None, microsecond=0).isoformat()
+def _format_display_datetime(dt: datetime, tz: timezone = timezone.utc) -> str:
+    """Format a datetime for display: naive local time (per `tz`), second precision."""
+    return dt.astimezone(tz).replace(tzinfo=None, microsecond=0).isoformat()
 
 
 # ---------------------------------------------------------------------------
 # Deadline helpers
 # ---------------------------------------------------------------------------
 
-def parse_deadline(value: str) -> Optional[datetime]:
+def parse_deadline(value: str, tz: timezone = timezone.utc) -> Optional[datetime]:
     """Parse an ISO-8601 datetime string.
+
+    A naive string (no UTC offset) is assumed to already be in `tz` -- the
+    configured local timezone -- matching how Google Docs stores it. A string
+    with an explicit offset is always respected as-is.
 
     Returns None for the sentinel '-' or any blank value.
     Raises ValueError for malformed strings.
@@ -121,23 +133,25 @@ def parse_deadline(value: str) -> Optional[datetime]:
             f"2026-07-15T09:00:00 or 2026-07-15, or '-' to clear."
         )
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.replace(tzinfo=tz)
     return dt
 
 
-def serialize_deadline(dt: Optional[datetime]) -> str:
+def serialize_deadline(dt: Optional[datetime], tz: timezone = timezone.utc) -> str:
     """Serialize a deadline datetime.  Returns '-' for absent values."""
     if dt is None:
         return "-"
-    return _format_display_datetime(dt)
+    return _format_display_datetime(dt, tz)
 
 
 # ---------------------------------------------------------------------------
 # Created-timestamp helpers
 # ---------------------------------------------------------------------------
 
-def parse_created(value: str) -> Optional[datetime]:
-    """Parse an ISO-8601 UTC creation timestamp.
+def parse_created(value: str, tz: timezone = timezone.utc) -> Optional[datetime]:
+    """Parse an ISO-8601 creation timestamp.
+
+    A naive string (no UTC offset) is assumed to already be in `tz`.
 
     Returns None for blank or sentinel '-' values.
     Raises ValueError for malformed strings.
@@ -147,21 +161,23 @@ def parse_created(value: str) -> Optional[datetime]:
         return None
     dt = datetime.fromisoformat(v)
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.replace(tzinfo=tz)
     return dt
 
 
-def serialize_created(dt: datetime) -> str:
-    """Serialize a creation timestamp as a naive UTC datetime, second precision."""
-    return _format_display_datetime(dt)
+def serialize_created(dt: datetime, tz: timezone = timezone.utc) -> str:
+    """Serialize a creation timestamp as a naive local-time datetime (per `tz`), second precision."""
+    return _format_display_datetime(dt, tz)
 
 
 # ---------------------------------------------------------------------------
 # Session helpers
 # ---------------------------------------------------------------------------
 
-def parse_sessions(value: str) -> list[tuple[datetime, datetime]]:
+def parse_sessions(value: str, tz: timezone = timezone.utc) -> list[tuple[datetime, datetime]]:
     """Parse a sessions value like [start/end,start/end,...] into (start, end) tuples.
+
+    A naive start/end (no UTC offset) is assumed to already be in `tz`.
 
     Returns an empty list for blank, '-', or '[]' values.
     """
@@ -184,41 +200,44 @@ def parse_sessions(value: str) -> list[tuple[datetime, datetime]]:
             start = datetime.fromisoformat(start_str)
             end = datetime.fromisoformat(end_str)
             if start.tzinfo is None:
-                start = start.replace(tzinfo=timezone.utc)
+                start = start.replace(tzinfo=tz)
             if end.tzinfo is None:
-                end = end.replace(tzinfo=timezone.utc)
+                end = end.replace(tzinfo=tz)
             sessions.append((start, end))
         except ValueError:
             continue
     return sessions
 
 
-def serialize_sessions(sessions: "list[WorkSession]") -> str:
+def serialize_sessions(sessions: "list[WorkSession]", tz: timezone = timezone.utc) -> str:
     """Serialize a list of WorkSessions to the [start/end,...] metadata format."""
     if not sessions:
         return "[]"
 
     parts = [
-        f"{_format_display_datetime(s.start)}/{_format_display_datetime(s.end)}"
+        f"{_format_display_datetime(s.start, tz)}/{_format_display_datetime(s.end, tz)}"
         for s in sessions
     ]
     return "[" + ",".join(parts) + "]"
 
 
-def parse_active_since(value: str) -> Optional[datetime]:
-    """Parse an ISO-8601 active_since timestamp."""
+def parse_active_since(value: str, tz: timezone = timezone.utc) -> Optional[datetime]:
+    """Parse an ISO-8601 active_since timestamp.
+
+    A naive string (no UTC offset) is assumed to already be in `tz`.
+    """
     v = value.strip()
     if not v or v == "-":
         return None
     dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.replace(tzinfo=tz)
     return dt
 
 
-def serialize_active_since(dt: datetime) -> str:
-    """Serialize an active_since timestamp, second precision UTC."""
-    return _format_display_datetime(dt)
+def serialize_active_since(dt: datetime, tz: timezone = timezone.utc) -> str:
+    """Serialize an active_since timestamp, second precision local time (per `tz`)."""
+    return _format_display_datetime(dt, tz)
 
 
 # ---------------------------------------------------------------------------

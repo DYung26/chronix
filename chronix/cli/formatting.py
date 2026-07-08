@@ -138,7 +138,7 @@ def print_timeline_segment(
     time_range = f"{start.strftime('%H:%M')} – {end.strftime('%H:%M')}"
     
     if segment_type == 'task':
-        _print_task_segment(index, time_range, data)
+        _print_task_segment(index, time_range, data, display_tz=display_tz)
     elif segment_type == 'blocked':
         _print_blocked_segment(index, time_range, data)
     elif segment_type == 'paused':
@@ -147,7 +147,7 @@ def print_timeline_segment(
         _print_empty_segment(index, time_range)
 
 
-def _print_task_segment(index: int, time_range: str, scheduled_task):
+def _print_task_segment(index: int, time_range: str, scheduled_task, display_tz=None):
     """Print a scheduled task segment."""
     task = scheduled_task.task
     
@@ -212,6 +212,8 @@ def _print_task_segment(index: int, time_range: str, scheduled_task):
         deadline_type = "User"
     
     if deadline_to_show:
+        if display_tz and deadline_to_show.tzinfo:
+            deadline_to_show = deadline_to_show.astimezone(display_tz)
         deadline_str = deadline_to_show.strftime('%Y-%m-%d %H:%M')
         style = "red" if violations else ""
         if style:

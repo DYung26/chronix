@@ -74,6 +74,14 @@ class TaskParser:
     TASK_IDENTIFIER = "TASKS ::: id; estimate; actual_duration; sessions; active_since; external_deadline; user_deadline; deadline_computed; ref; deps; mode; created"
     VALID_MODES = {"atomic", "flex", "contiguous_preferred"}
 
+    def __init__(self, tz: timezone = timezone.utc):
+        """`tz` is the timezone naive metadata datetimes are assumed to already be in.
+
+        Should be the app's configured `scheduling.timezone`, since Google Docs
+        is treated as the source of truth for those naive values as-is.
+        """
+        self.tz = tz
+
     def parse_task_line(
         self,
         paragraph: dict,
@@ -129,21 +137,21 @@ class TaskParser:
             )
 
         try:
-            external_deadline = parse_deadline(kv.get(KEY_EXTERNAL_DEADLINE, "-"))
+            external_deadline = parse_deadline(kv.get(KEY_EXTERNAL_DEADLINE, "-"), self.tz)
         except ValueError as exc:
             raise TaskParseError(
                 message=str(exc), raw_text=raw_text, field=KEY_EXTERNAL_DEADLINE
             ) from exc
 
         try:
-            user_deadline = parse_deadline(kv.get(KEY_USER_DEADLINE, "-"))
+            user_deadline = parse_deadline(kv.get(KEY_USER_DEADLINE, "-"), self.tz)
         except ValueError as exc:
             raise TaskParseError(
                 message=str(exc), raw_text=raw_text, field=KEY_USER_DEADLINE
             ) from exc
 
         try:
-            deadline_computed = parse_deadline(kv.get(KEY_DEADLINE_COMPUTED, "-"))
+            deadline_computed = parse_deadline(kv.get(KEY_DEADLINE_COMPUTED, "-"), self.tz)
         except ValueError as exc:
             raise TaskParseError(
                 message=str(exc), raw_text=raw_text, field=KEY_DEADLINE_COMPUTED
@@ -164,12 +172,12 @@ class TaskParser:
         depends_on = [d.strip() for d in depends_raw.split(",") if d.strip()] if depends_raw else []
 
         created_raw = kv.get(KEY_CREATED, "")
-        created = parse_created(created_raw) if created_raw else None
+        created = parse_created(created_raw, self.tz) if created_raw else None
 
         sessions: list[WorkSession] = []
         sessions_raw = kv.get(KEY_SESSIONS, "")
         if sessions_raw:
-            for start, end in parse_sessions(sessions_raw):
+            for start, end in parse_sessions(sessions_raw, self.tz):
                 try:
                     sessions.append(WorkSession(start=start, end=end))
                 except ValueError:
@@ -183,7 +191,7 @@ class TaskParser:
         active_since: Optional[datetime] = None
         active_since_raw = kv.get(KEY_ACTIVE_SINCE, "")
         if active_since_raw:
-            active_since = parse_active_since(active_since_raw)
+            active_since = parse_active_since(active_since_raw, self.tz)
 
         kwargs: dict = {
             "id": kv.get(KEY_ID) or None,
@@ -208,6 +216,10 @@ class MeetingParser:
 
     METADATA_PATTERN = re.compile(r'^MEETING\s*:::\s*(.+)$', re.IGNORECASE)
     MEETING_IDENTIFIER = "MEETING ::: start_time ; end_time ; optional_label"
+
+    def __init__(self, tz: timezone = timezone.utc):
+        """`tz` is the timezone a naive start/end time is assumed to already be in."""
+        self.tz = tz
 
     def parse_meeting_line(
         self,
@@ -276,15 +288,19 @@ class MeetingParser:
                 value=datetime_str,
             ) from exc
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+            dt = dt.replace(tzinfo=self.tz)
         return dt
 
 
 class TodoDeriver:
     """Derives canonical TODO list from document structures."""
 
-    def __init__(self, parser: Optional[TaskParser] = None):
-        self.parser = parser or TaskParser()
+    def __init__(self, parser: Optional[TaskParser] = None, tz: timezone = timezone.utc):
+        """`tz` is used to construct the default TaskParser/MeetingParser when
+        an explicit `parser` isn't supplied, and always for meeting parsing.
+        """
+        self.tz = tz
+        self.parser = parser or TaskParser(tz=tz)
 
     def derive_todo_list(
         self,
@@ -346,7 +362,7 @@ class TodoDeriver:
 
         exclude_normalized = {t.lower() for t in exclude_tab_titles}
         meetings = []
-        meeting_parser = MeetingParser()
+        meeting_parser = MeetingParser(tz=self.tz)
 
         for tab in document_structure.get('tabs', []):
             try:
@@ -374,9 +390,10 @@ class TodoDeriver:
 def parse_document_tasks(
     document_structure: dict,
     source: str = "google_docs",
+    tz: timezone = timezone.utc,
 ) -> list[Task]:
     """Parse all tasks from a document structure with tabs."""
-    parser = TaskParser()
+    parser = TaskParser(tz=tz)
     tasks = []
     document_title = document_structure.get('title', '').strip()
 
@@ -403,14 +420,16 @@ def parse_document_tasks(
 def derive_todo_list(
     document_structure: dict,
     exclude_tab_titles: Optional[list[str]] = None,
+    tz: timezone = timezone.utc,
 ) -> list[Task]:
     """Derive and sort the canonical TODO list from a document with tabs."""
-    return TodoDeriver().derive_todo_list(document_structure, exclude_tab_titles)
+    return TodoDeriver(tz=tz).derive_todo_list(document_structure, exclude_tab_titles)
 
 
 def parse_document_meetings(
     document_structure: dict,
     exclude_tab_titles: Optional[list[str]] = None,
+    tz: timezone = timezone.utc,
 ) -> list[AdHocMeeting]:
     """Parse all ad-hoc meetings from a document structure with tabs."""
-    return TodoDeriver().derive_meetings_list(document_structure, exclude_tab_titles)
+    return TodoDeriver(tz=tz).derive_meetings_list(document_structure, exclude_tab_titles)

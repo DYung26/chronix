@@ -1,5 +1,6 @@
 """Helpers for sync command: error classification, result tracking, retry logic."""
 
+from datetime import timezone
 from enum import Enum
 from dataclasses import dataclass
 from typing import Optional, Any
@@ -85,6 +86,7 @@ def _sync_single_document_with_retries(
     client: Any,
     alias: Optional[str] = None,
     priority: Optional[int] = None,
+    tz: timezone = timezone.utc,
 ) -> tuple[DocumentSyncResult, Optional[Any], list]:
     """
     Sync a single document with retry logic for transient failures.
@@ -92,6 +94,9 @@ def _sync_single_document_with_retries(
     `priority` is the document's configured scheduling priority rank (see
     DocumentConfig.priority), threaded through so it lands on the resulting
     ProjectTodoList and, from there, on every task via TaskAggregator.
+
+    `tz` is the timezone naive metadata datetimes in the document are assumed
+    to already be in; should be the app's configured `scheduling.timezone`.
 
     Returns (result, project, meetings) where project and meetings are None on failure.
     """
@@ -105,7 +110,7 @@ def _sync_single_document_with_retries(
     RETRY_BACKOFF_SECONDS = 1
     
     parser = GoogleDocsParser()
-    deriver = TodoDeriver()
+    deriver = TodoDeriver(tz=tz)
     
     label = f"{alias} ({doc_id})" if alias else doc_id
     console.print(f"[dim]Fetching document {label}...[/dim]")
@@ -118,9 +123,9 @@ def _sync_single_document_with_retries(
 
             project_name = doc_structure.title
             tasks = deriver.derive_todo_list(doc_structure.to_dict())
-            meetings = parse_document_meetings(doc_structure.to_dict())
+            meetings = parse_document_meetings(doc_structure.to_dict(), tz=tz)
 
-            writer = GoogleDocsTaskWriter()
+            writer = GoogleDocsTaskWriter(tz=tz)
             tasks = writer.backfill_missing_ids(doc_id, tasks, source_data=doc)
 
             project_todo = ProjectTodoList(
