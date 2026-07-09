@@ -109,7 +109,7 @@ class SchedulingEngine:
         # Determine lookahead days for collecting blocked time
         # For unlimited scheduling, use a large buffer based on total task work
         if num_days is None:
-            total_work = sum(t.estimated_duration.total_seconds() for t in tasks if not t.completed)
+            total_work = sum(t.remaining_duration.total_seconds() for t in tasks if not t.completed)
             # Estimate: ~8 hours per day = 28800 seconds; add 20% buffer for blocked time
             estimated_days_needed = max(10, int((total_work / 28800) * 1.2) + 5)
             lookahead_days = estimated_days_needed
@@ -208,7 +208,7 @@ class SchedulingEngine:
         
         for task in tasks:
             if not task.completed:
-                remaining_work[id(task)] = task.estimated_duration
+                remaining_work[id(task)] = task.remaining_duration
                 incomplete_tasks.append(task)
         
         current_time = start_time
@@ -779,7 +779,7 @@ class SchedulingEngine:
             final_end = segments[-1][2]
             is_multi_segment = len(segments) > 1
             total_scheduled = sum((end - start for _, start, end in segments), timedelta())
-            is_partial = total_scheduled < task.estimated_duration
+            is_partial = total_scheduled < task.remaining_duration
 
             # Check violations based on final end time
             violates_user = self._violates_deadline(final_end, task.deadline_user)

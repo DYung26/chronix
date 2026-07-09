@@ -134,6 +134,22 @@ class Task(BaseModel):
         """Sum of all completed work session durations."""
         return sum((s.duration for s in self.sessions), timedelta())
 
+    @property
+    def remaining_duration(self) -> timedelta:
+        """Estimated duration still owed, net of completed work sessions.
+
+        Used by the scheduler in place of estimated_duration so tasks with
+        banked sessions (e.g. paused mid-way) are scheduled for what's
+        actually left rather than their full original estimate.
+
+        Floors at zero once logged sessions meet or exceed the estimate.
+        `pause` and `duration` both enforce that an incomplete task's
+        estimated_duration stays ahead of its logged time, so this state
+        should be transient in practice rather than something the scheduler
+        needs to carry indefinitely.
+        """
+        return max(self.estimated_duration - self.compute_actual_duration(), timedelta())
+
 
 class TimeBlock(BaseModel):
     """Represents a reserved interval of time."""
@@ -199,7 +215,7 @@ class ScheduledTask(BaseModel):
     is_segment: bool = False
     segment_index: Optional[int] = None
     total_segments: Optional[int] = None
-    # True when the task's full estimated_duration wasn't placed within the
+    # True when the task's full remaining_duration wasn't placed within the
     # scheduling window (e.g. it ran out of room for today and will need
     # further chunks on a later day). Distinct from is_segment, which marks
     # a task split into multiple displayed parts within the same window.
@@ -224,9 +240,9 @@ class ScheduledTask(BaseModel):
         if (
             not self.is_segment
             and not self.is_partial
-            and actual_duration != self.task.estimated_duration
+            and actual_duration != self.task.remaining_duration
         ):
-            raise ValueError("duration must equal task.estimated_duration")
+            raise ValueError("duration must equal task.remaining_duration")
         return self
 
     @model_validator(mode="after")

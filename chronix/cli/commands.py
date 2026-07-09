@@ -1818,6 +1818,16 @@ def duration_command(args: list[str]) -> int:
         print_error(f"Invalid duration: '{remaining[1]}'. Use: 2h, 30m, 2hours, 30minutes")
         return 1
 
+    task = _find_task_in_context(task_id)
+    if task is not None and not task.completed:
+        actual = task.compute_actual_duration()
+        if dur <= actual:
+            print_error(
+                f"New duration ({remaining[1]}) must exceed already-logged time "
+                f"({format_duration(actual)})."
+            )
+            return 1
+
     update = TaskUpdate(duration=dur)
     rc = _run_task_update(task_id, update, doc_token)
     if rc == 0:
@@ -2212,11 +2222,46 @@ def pause_command(args: list[str]) -> int:
 
     new_session = WorkSession(start=session_start, end=now)
     sessions = task.sessions + [new_session]
+    prospective_actual = sum((s.duration for s in sessions), timedelta())
 
     update = TaskUpdate(
         metadata={KEY_SESSIONS: serialize_sessions(sessions, _configured_tz(config))},
         metadata_remove=[KEY_ACTIVE_SINCE],
     )
+
+    if prospective_actual >= task.estimated_duration:
+        from chronix.core.metadata import parse_duration
+
+        print_warning(
+            f"Pausing '{task_id}' now would bring logged time to "
+            f"{format_duration(prospective_actual)}, at or past its "
+            f"{format_duration(task.estimated_duration)} estimate."
+        )
+        choice = console.input(
+            "Enter a new duration to extend and pause (e.g. 3h), "
+            "'done' to mark it complete instead, or leave blank to cancel: "
+        ).strip()
+
+        if not choice:
+            print_info("Pause cancelled.")
+            return 1
+
+        if choice.lower() == "done":
+            done_args = [task_id] + (["--doc", doc_token] if doc_token else [])
+            return done_command(done_args)
+
+        new_duration = parse_duration(choice)
+        if new_duration is None:
+            print_error(f"Invalid duration: '{choice}'. Use: 2h, 30m, 2hours, 30minutes")
+            return 1
+        if new_duration <= prospective_actual:
+            print_error(
+                f"New duration must exceed {format_duration(prospective_actual)} "
+                f"(the logged time this pause would produce)."
+            )
+            return 1
+        update.duration = new_duration
+
     rc = _run_task_update(task_id, update, doc_token)
     if rc == 0:
         print_success(
