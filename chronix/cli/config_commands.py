@@ -180,7 +180,33 @@ def config_reload_command(args: list[str]) -> int:
         return 1
 
     _context.config = config
+
+    # Document priority (and alias) get baked into each synced project's
+    # ProjectContext at sync time, and from there stamped onto each Task the
+    # first time it's aggregated (TaskAggregator._enrich_task_with_project
+    # only assigns task.priority when it's still None, so it never overwrites
+    # after that first stamp). Neither is re-read from config afterwards, so
+    # without this, editing a document's priority in config.toml and running
+    # `config reload` has no effect on scheduling until a full `sync`
+    # rebuilds the Task objects from scratch. Refresh both here, in place,
+    # and reset task.priority so the next aggregate() call re-stamps it from
+    # the freshly reloaded config.
+    refreshed_projects = 0
+    refreshed_tasks = 0
+    for project in _context.projects:
+        document_id = project.project_context.document_id
+        if document_id is None:
+            continue
+        project.project_context.priority = config.google_docs.get_priority(document_id)
+        project.project_context.alias = config.google_docs.get_alias(document_id)
+        refreshed_projects += 1
+        for task in project.tasks:
+            task.priority = None
+            refreshed_tasks += 1
+
     print(f"✓ Configuration reloaded from: {config_path}")
+    if refreshed_projects:
+        print(f"✓ Refreshed priority/alias for {refreshed_projects} synced document(s) ({refreshed_tasks} task(s)).")
     return 0
 
 
