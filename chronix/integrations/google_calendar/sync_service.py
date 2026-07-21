@@ -9,6 +9,15 @@ from chronix.integrations.google_calendar.models import CalendarSyncResult, Conf
 
 
 UTC = ZoneInfo("UTC")
+
+# Google Calendar's standard event colorId palette (calendar API "colors"
+# endpoint, event colors 1-11). Secondary-track events get a distinct color
+# (Banana/yellow) so they're visually distinguishable at a glance from
+# primary-track events, which are left uncolored (colorId omitted) so they
+# inherit whatever color the calendar itself is set to.
+SECONDARY_TRACK_COLOR_ID = "5"
+
+
 class CalendarEventClassifier:
     """Classifies calendar events for sync purposes."""
     
@@ -35,6 +44,17 @@ class CalendarEventClassifier:
                 return task_id
         
         return None
+
+    @staticmethod
+    def get_chronix_track(event: dict) -> str:
+        """Extract the track ('primary'/'secondary') an event was synced under.
+
+        Events created before track-aware sync (or otherwise missing the
+        property) are treated as 'primary', matching the track every event
+        implicitly belonged to before this field existed.
+        """
+        extended_props = event.get('extendedProperties', {}).get('private', {})
+        return extended_props.get('chronix_track', 'primary')
     
     @staticmethod
     def event_overlaps(event: dict, blocked_window: TimeBlock) -> bool:
@@ -69,7 +89,8 @@ class CalendarSyncService:
         day_schedule: DaySchedule,
         sync_start: datetime,
         sync_end: datetime,
-        force: bool = False
+        force: bool = False,
+        track: str = "primary",
     ) -> CalendarSyncResult:
         """
         Sync a day's schedule to Google Calendar.
@@ -79,6 +100,14 @@ class CalendarSyncService:
             sync_start: Start of sync window (effective start time)
             sync_end: End of sync window (typically end of day)
             force: If True, overwrite conflicting non-Chronix events
+            track: "primary" or "secondary" -- which track this schedule
+                represents. Secondary-track events are created with a
+                distinct colorId (SECONDARY_TRACK_COLOR_ID) so they're
+                visually distinguishable from primary-track events on the
+                calendar. Reconciliation (finding/deleting/shortening
+                existing Chronix-managed events) is unaffected by track --
+                it identifies events purely by chronix_task_id, and a given
+                task only ever belongs to one track at a time.
         
         Returns:
             CalendarSyncResult with success status and sync statistics
@@ -98,6 +127,14 @@ class CalendarSyncService:
             
             for event in existing_events:
                 if self.classifier.is_chronix_managed(event):
+                    # Only reconcile events belonging to the track currently
+                    # being synced -- an other-track Chronix event (e.g. a
+                    # secondary-track event while syncing primary) is left
+                    # alone entirely: not reconciled, and not treated as a
+                    # conflict either, since it's a legitimate Chronix event
+                    # just not one this call owns.
+                    if self.classifier.get_chronix_track(event) != track:
+                        continue
                     task_id = self.classifier.get_chronix_task_id(event)
                     if task_id:
                         chronix_events[event['id']] = (event, task_id)
@@ -139,7 +176,7 @@ class CalendarSyncService:
             # Create new events for scheduled tasks
             for task in day_schedule.scheduled_tasks:
                 if task.start >= sync_start and task.start <= sync_end:
-                    event_data = self._create_event_data(task)
+                    event_data = self._create_event_data(task, track=track)
                     self.client.create_event(calendar_id, event_data)
                     result.created_count += 1
             
@@ -242,9 +279,14 @@ class CalendarSyncService:
         
         return result
     
-    def _create_event_data(self, task: ScheduledTask) -> dict:
-        """Create Google Calendar event data from a scheduled task."""
-        return {
+    def _create_event_data(self, task: ScheduledTask, track: str = "primary") -> dict:
+        """Create Google Calendar event data from a scheduled task.
+
+        `track` controls the event's colorId: secondary-track events get
+        SECONDARY_TRACK_COLOR_ID; primary-track events omit colorId
+        entirely so they inherit the calendar's own default color.
+        """
+        event_data = {
             'summary': task.task.title,
             'description': self._create_event_description(task),
             'start': {
@@ -259,9 +301,13 @@ class CalendarSyncService:
                 'private': {
                     'chronix_managed': 'true',
                     'chronix_task_id': task.task.id,
+                    'chronix_track': track,
                 }
             }
         }
+        if track == "secondary":
+            event_data['colorId'] = SECONDARY_TRACK_COLOR_ID
+        return event_data
     
     def _create_event_description(self, task: ScheduledTask) -> str:
         """Create event description with task metadata."""

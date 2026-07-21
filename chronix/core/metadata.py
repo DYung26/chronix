@@ -254,6 +254,7 @@ KEY_EXTERNAL_DEADLINE = "external_deadline"
 KEY_USER_DEADLINE = "user_deadline"
 KEY_DEADLINE_COMPUTED = "deadline_computed"
 KEY_MODE = "mode"
+KEY_TRACK = "track"
 KEY_REF = "ref"
 KEY_DEPENDS = "deps"
 KEY_CREATED = "created"
@@ -268,6 +269,7 @@ WELL_KNOWN_KEYS = (
     KEY_USER_DEADLINE,
     KEY_DEADLINE_COMPUTED,
     KEY_MODE,
+    KEY_TRACK,
     KEY_REF,
     KEY_DEPENDS,
     KEY_CREATED,

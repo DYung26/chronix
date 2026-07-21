@@ -31,6 +31,7 @@ class NewTask:
     external_deadline: Optional[datetime] = None
     user_deadline: Optional[datetime] = None
     mode: Optional[str] = None
+    track: Optional[str] = None
     ref: Optional[str] = None
     depends: Optional[str] = None
     created: Optional[datetime] = None
@@ -58,6 +59,7 @@ class TaskUpdate:
     external_deadline: Optional[datetime] = field(default=_UNSET)  # type: ignore[assignment]
     user_deadline: Optional[datetime] = field(default=_UNSET)  # type: ignore[assignment]
     mode: Optional[str] = None
+    track: Optional[str] = None
     completed: Optional[bool] = None
     metadata: dict[str, str] = field(default_factory=dict)
     metadata_remove: list[str] = field(default_factory=list)

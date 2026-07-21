@@ -14,6 +14,7 @@ from chronix.core.metadata import (
     KEY_EXTERNAL_DEADLINE,
     KEY_ID,
     KEY_MODE,
+    KEY_TRACK,
     KEY_REF,
     KEY_SESSIONS,
     KEY_USER_DEADLINE,
@@ -278,6 +279,8 @@ def format_task_line(task: NewTask, tz: timezone = timezone.utc) -> str:
         fields[KEY_USER_DEADLINE] = serialize_deadline(task.user_deadline, tz)
     if task.mode is not None:
         fields[KEY_MODE] = task.mode
+    if task.track is not None:
+        fields[KEY_TRACK] = task.track
     if task.ref is not None:
         fields[KEY_REF] = task.ref
     if task.depends is not None:
@@ -326,6 +329,9 @@ def _apply_update_to_task_line(current_line: str, update: TaskUpdate, tz: timezo
 
     if update.mode is not None:
         kv[KEY_MODE] = update.mode
+
+    if update.track is not None:
+        kv[KEY_TRACK] = update.track
 
     for k, v in update.metadata.items():
         kv[k.lower()] = v

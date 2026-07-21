@@ -15,6 +15,7 @@ from chronix.core.metadata import (
     KEY_EXTERNAL_DEADLINE,
     KEY_ID,
     KEY_MODE,
+    KEY_TRACK,
     KEY_REF,
     KEY_SESSIONS,
     KEY_USER_DEADLINE,
@@ -71,8 +72,9 @@ class TaskParser:
     """Parses task lines with metadata into Task domain objects."""
 
     METADATA_PATTERN = re.compile(r'^(.*?)\s*:::\s*(.+)$')
-    TASK_IDENTIFIER = "TASKS ::: id; estimate; actual_duration; sessions; active_since; external_deadline; user_deadline; deadline_computed; ref; deps; mode; created"
+    TASK_IDENTIFIER = "TASKS ::: id; estimate; actual_duration; sessions; active_since; external_deadline; user_deadline; deadline_computed; ref; deps; mode; track; created"
     VALID_MODES = {"atomic", "flex", "contiguous_preferred"}
+    VALID_TRACKS = {"auto", "primary", "secondary"}
 
     def __init__(self, tz: timezone = timezone.utc):
         """`tz` is the timezone naive metadata datetimes are assumed to already be in.
@@ -167,6 +169,16 @@ class TaskParser:
                 value=mode,
             )
 
+        track = kv.get(KEY_TRACK)
+        if track and track not in self.VALID_TRACKS:
+            raise TaskParseError(
+                message=f"Invalid track: '{track}'. "
+                        f"Valid tracks: auto, primary, secondary",
+                raw_text=raw_text,
+                field=KEY_TRACK,
+                value=track,
+            )
+
         ref = kv.get(KEY_REF) or None
         depends_raw = kv.get(KEY_DEPENDS) or kv.get("depends", "")
         depends_on = [d.strip() for d in depends_raw.split(",") if d.strip()] if depends_raw else []
@@ -208,6 +220,8 @@ class TaskParser:
         }
         if mode:
             kwargs["execution_mode"] = mode
+        if track:
+            kwargs["track"] = track
         return kwargs
 
 

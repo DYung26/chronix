@@ -8,6 +8,18 @@ import secrets
 
 ExecutionMode = Literal["atomic", "flex", "contiguous_preferred"]
 
+# Which independently-scheduled timeline a task belongs to. "auto" (the
+# default) means the track is derived from the task's execution_mode/duration
+# at scheduling time rather than stored explicitly -- see
+# chronix.core.tracks.resolve_track. "primary" and "secondary" are explicit,
+# user-set overrides that always win over the auto heuristic.
+ExecutionTrack = Literal["auto", "primary", "secondary"]
+
+# Auto-heuristic threshold: atomic tasks at or under this duration are
+# considered short enough to run alongside a primary-track task without
+# requiring full attention. Used by chronix.core.tracks.resolve_track.
+AUTO_SECONDARY_ATOMIC_THRESHOLD_MINUTES = 30
+
 
 def generate_task_id() -> str:
     """Generate a random, URL-safe persistent task identifier."""
@@ -60,6 +72,11 @@ class Task(BaseModel):
     # Used only as a soft bias in scheduling urgency -- never overrides
     # deadline safety. Stamped on by TaskAggregator, not set by parsers.
     priority: Optional[int] = None
+    # Which independently-scheduled timeline (primary vs. secondary) this task
+    # belongs to. Defaults to "auto", which lets chronix.core.tracks.resolve_track
+    # infer it from execution_mode/duration at scheduling time. An explicit
+    # "primary"/"secondary" here always overrides that inference.
+    track: ExecutionTrack = "auto"
     created: Optional[datetime] = None
     sessions: list[WorkSession] = []
     actual_duration: Optional[timedelta] = None
@@ -81,7 +98,7 @@ class Task(BaseModel):
                 if total_minutes <= 90:
                     values["execution_mode"] = "atomic"
                 else:
-                    values["execution_mode"] = "flex"
+                    values["execution_mode"] = "contiguous_preferred"
         return values
 
     @field_validator("estimated_duration")

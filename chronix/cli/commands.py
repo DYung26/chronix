@@ -19,6 +19,7 @@ from chronix.cli.formatting import (
     print_schedule_header,
     print_timeline_segment,
     print_timeline_footer,
+    print_dual_timeline,
     print_conflicts,
     print_task_details,
     print_task_position,
@@ -114,10 +115,44 @@ def _generate_today_schedule(time_override: Optional[str] = None) -> tuple[DaySc
         RuntimeError: If no projects loaded
         ValueError: If time override format is invalid
     """
+    day_schedule, secondary_schedule, work_start, work_end, paused_blocks = _generate_today_schedules(time_override)
+    return day_schedule, work_start, work_end, paused_blocks
+
+
+def _generate_today_schedules(
+    time_override: Optional[str] = None,
+) -> tuple[DaySchedule, DaySchedule, datetime, datetime, list]:
+    """
+    Generate today's primary and secondary track schedules.
+
+    The two tracks are scheduled independently: tasks are partitioned by
+    resolve_track (see chronix.core.tracks) into a primary pool and a
+    secondary pool, then each pool is run through its own SchedulingEngine
+    pass over the *same* work window and blocked time (sleep, meetings,
+    off-hours). Neither pass is aware of the other's placements -- a
+    secondary-track task can and will be scheduled at a time that overlaps a
+    primary-track task, since the whole point of the secondary track is
+    "things you could plausibly run alongside whatever the primary track has
+    you doing" (e.g. in a second terminal pane), not a second set of hands
+    fighting the primary track for the same minutes.
+
+    Returns:
+        Tuple of (primary_schedule, secondary_schedule, work_start, work_end,
+        paused_blocks). paused_blocks are the recurring config blocks
+        (sleep/break/meeting) that fall today but are paused for this session
+        via `blocks pause` -- they no longer occupy any time in either track,
+        but are returned so the caller can still show them, greyed out, at
+        their original time in the timeline for visibility.
+
+    Raises:
+        RuntimeError: If no projects loaded
+        ValueError: If time override format is invalid
+    """
     if not _context.projects:
         raise RuntimeError("No projects loaded. Run 'sync' first.")
     
     from chronix.config import ChronixConfig, config_to_time_blocks, get_work_window, get_work_windows
+    from chronix.core.tracks import partition_by_track
     
     config = _context.config or ChronixConfig.load_or_default()
     tz = ZoneInfo(config.scheduling.timezone)
@@ -134,6 +169,7 @@ def _generate_today_schedule(time_override: Optional[str] = None) -> tuple[DaySc
     aggregated_tasks = aggregator.aggregate(_context.projects)
     task_pool = aggregator.get_task_pool(aggregated_tasks)
     incomplete_tasks = [t for t in task_pool if not t.completed]
+    primary_tasks, secondary_tasks = partition_by_track(incomplete_tasks)
     
     # Get today's date and time
     now = datetime.now(tz)
@@ -182,31 +218,34 @@ def _generate_today_schedule(time_override: Optional[str] = None) -> tuple[DaySc
         if meeting.start.date() == today:
             blocked_time.append(meeting.to_time_block())
     
-    # Schedule tasks
+    # Schedule tasks -- both tracks share the exact same blocked time and
+    # work window, and are scheduled with two independent engine runs.
     filtered_blocked = [
         block for block in blocked_time
         if block.start < work_end and block.end > work_start
     ]
     
     scheduler = SchedulingEngine()
-    day_schedule = scheduler.schedule_tasks(
-        tasks=incomplete_tasks,
-        start_time=work_start,
-        blocked_time=filtered_blocked
-    )
-    
-    # Filter to today's tasks
-    today_scheduled_tasks = [
-        st for st in day_schedule.scheduled_tasks
-        if st.start.date() == today
-    ]
-    
-    day_schedule = DaySchedule(
-        date=day_schedule.date,
-        scheduled_tasks=today_scheduled_tasks,
-        blocked_time=day_schedule.blocked_time,
-        conflicts=day_schedule.conflicts
-    )
+
+    def _run_and_filter_to_today(tasks: list[Task]) -> DaySchedule:
+        result = scheduler.schedule_tasks(
+            tasks=tasks,
+            start_time=work_start,
+            blocked_time=filtered_blocked
+        )
+        today_scheduled_tasks = [
+            st for st in result.scheduled_tasks
+            if st.start.date() == today
+        ]
+        return DaySchedule(
+            date=result.date,
+            scheduled_tasks=today_scheduled_tasks,
+            blocked_time=result.blocked_time,
+            conflicts=result.conflicts,
+        )
+
+    primary_schedule = _run_and_filter_to_today(primary_tasks)
+    secondary_schedule = _run_and_filter_to_today(secondary_tasks)
 
     # Only surface paused blocks that actually overlap the displayed window,
     # same as the filtering already applied to real blocked time above.
@@ -215,7 +254,7 @@ def _generate_today_schedule(time_override: Optional[str] = None) -> tuple[DaySc
         if b.start < work_end and b.end > work_start
     ]
 
-    return day_schedule, work_start, work_end, paused_blocks
+    return primary_schedule, secondary_schedule, work_start, work_end, paused_blocks
 
 
 class ChronixContext:
@@ -415,12 +454,19 @@ def today_command(args: list[str]) -> int:
     """
     Today command: Display today's scheduled tasks.
 
-    Usage: today [HH:MM]
+    Usage: today [HH:MM] [--split]
     
     Optional HH:MM argument specifies the start time for scheduling today.
     If not provided, uses current time. Times are in 24-hour format.
+
+    --split shows the primary and secondary (parallel) tracks side by side
+    instead of only the primary track. Falls back to a stacked rendering
+    automatically on narrow terminals.
     """
     try:
+        split = "--split" in args
+        args = [a for a in args if a != "--split"]
+
         # Validate arguments
         if len(args) > 1:
             print_error(f"today command takes at most 1 argument, got {len(args)}")
@@ -430,6 +476,27 @@ def today_command(args: list[str]) -> int:
         
         console.print("[dim]Generating today's schedule...[/dim]")
         
+        if split:
+            primary_schedule, secondary_schedule, work_start, work_end, paused_blocks = _generate_today_schedules(time_override)
+
+            print_schedule_header(primary_schedule.date, work_start, work_end, str(work_start.tzinfo))
+            print_dual_timeline(primary_schedule, secondary_schedule, work_start, work_end, paused_blocks=paused_blocks)
+
+            all_conflicts = primary_schedule.conflicts + secondary_schedule.conflicts
+            if all_conflicts:
+                print_conflicts(all_conflicts)
+
+            total_duration = sum(
+                (st.end - st.start for st in primary_schedule.scheduled_tasks + secondary_schedule.scheduled_tasks),
+                timedelta()
+            )
+            print_timeline_footer(
+                total_duration=total_duration,
+                num_scheduled=len(primary_schedule.scheduled_tasks) + len(secondary_schedule.scheduled_tasks),
+                num_conflicts=len(all_conflicts)
+            )
+            return 0
+
         day_schedule, work_start, work_end, paused_blocks = _generate_today_schedule(time_override)
         
         # Display schedule
@@ -467,19 +534,28 @@ def calendar_command(args: list[str]) -> int:
     """
     Calendar command: Sync today's schedule to Google Calendar.
 
-    Usage: calendar [HH:MM] [--force]
+    Usage: calendar [HH:MM] [--force] [--split]
     
     Optional HH:MM argument specifies the start time for scheduling today.
     --force flag allows overwriting conflicting non-Chronix calendar events.
+
+    Without --split, only the primary track is synced and displayed (same
+    as today's plain `today`). With --split, the secondary track is synced
+    too -- as a distinctly colored (yellow/Banana) set of events, since they
+    can legitimately overlap primary-track events in time -- and both
+    tracks are displayed side by side afterward (same as `today --split`).
     """
     try:
         # Parse arguments
         time_override = None
         force = False
+        split = False
         
         for arg in args:
             if arg == '--force':
                 force = True
+            elif arg == '--split':
+                split = True
             elif arg.startswith('--'):
                 print_error(f"Unknown flag: {arg}")
                 return 1
@@ -491,57 +567,111 @@ def calendar_command(args: list[str]) -> int:
         
         console.print("[dim]Generating and syncing today's schedule to Google Calendar...[/dim]")
         
-        day_schedule, work_start, work_end, paused_blocks = _generate_today_schedule(time_override)
+        primary_schedule, secondary_schedule, work_start, work_end, paused_blocks = _generate_today_schedules(time_override)
         
-        # Sync to Google Calendar
+        # Sync to Google Calendar -- primary track only unless --split was
+        # given, in which case the secondary track is synced too (as
+        # distinctly colored events -- see CalendarSyncService.sync's
+        # `track` parameter). Each track is synced independently, so a
+        # secondary-track task placed at the same time as a primary-track
+        # one is not treated as a conflict with itself; reconciliation of
+        # existing Chronix events is also scoped per track, so syncing one
+        # track never touches or deletes the other's already-synced events.
         from chronix.integrations.google_calendar import CalendarSyncService
         sync_service = CalendarSyncService()
         
-        sync_result = sync_service.sync(
-            day_schedule=day_schedule,
+        primary_result = sync_service.sync(
+            day_schedule=primary_schedule,
             sync_start=work_start,
             sync_end=work_end,
-            force=force
+            force=force,
+            track="primary",
         )
-        
-        if not sync_result.success:
-            if sync_result.conflicts:
+
+        if not primary_result.success:
+            if primary_result.conflicts:
                 print_error("Calendar sync failed due to conflicting events:")
-                for conflict in sync_result.conflicts:
+                for conflict in primary_result.conflicts:
                     print_error(f"  - {conflict.calendar_event_title} ({conflict.calendar_event_start} - {conflict.calendar_event_end})")
                     print_error(f"    conflicts with {conflict.chronix_task_title}")
                 print_info("Rerun with --force to overwrite, or resolve conflicts manually.")
             else:
-                print_error(f"Calendar sync failed: {sync_result.error_message}")
+                print_error(f"Calendar sync failed: {primary_result.error_message}")
             return 1
+
+        secondary_result = None
+        if split:
+            secondary_result = sync_service.sync(
+                day_schedule=secondary_schedule,
+                sync_start=work_start,
+                sync_end=work_end,
+                force=force,
+                track="secondary",
+            )
+
+            if not secondary_result.success:
+                if secondary_result.conflicts:
+                    print_error("Calendar sync failed due to conflicting events (secondary track):")
+                    for conflict in secondary_result.conflicts:
+                        print_error(f"  - {conflict.calendar_event_title} ({conflict.calendar_event_start} - {conflict.calendar_event_end})")
+                        print_error(f"    conflicts with {conflict.chronix_task_title}")
+                    print_info("Rerun with --force to overwrite, or resolve conflicts manually.")
+                else:
+                    print_error(f"Calendar sync failed (secondary track): {secondary_result.error_message}")
+                return 1
         
-        # Print sync summary
+        # Print sync summary (combined across both tracks if --split was used)
+        created = primary_result.created_count + (secondary_result.created_count if secondary_result else 0)
+        updated = primary_result.updated_count + (secondary_result.updated_count if secondary_result else 0)
+        deleted = primary_result.deleted_count + (secondary_result.deleted_count if secondary_result else 0)
+        shortened = primary_result.shortened_count + (secondary_result.shortened_count if secondary_result else 0)
+
         print_success(f"Calendar sync completed:")
-        print_info(f"  Created: {sync_result.created_count} events")
-        print_info(f"  Updated: {sync_result.updated_count} events")
-        print_info(f"  Deleted: {sync_result.deleted_count} events")
-        print_info(f"  Shortened: {sync_result.shortened_count} events")
+        print_info(f"  Created: {created} events")
+        print_info(f"  Updated: {updated} events")
+        print_info(f"  Deleted: {deleted} events")
+        print_info(f"  Shortened: {shortened} events")
         print()
         
-        # Display schedule (same as today command)
-        print_schedule_header(day_schedule.date, work_start, work_end, str(work_start.tzinfo))
-        
-        _display_continuous_timeline(day_schedule, work_start, work_end, paused_blocks=paused_blocks)
+        # Display schedule -- mirrors `today`/`today --split` exactly, using
+        # whatever was actually synced above (secondary_schedule only
+        # matters here when --split triggered its sync).
+        print_schedule_header(primary_schedule.date, work_start, work_end, str(work_start.tzinfo))
+
+        if split:
+            all_conflicts = primary_schedule.conflicts + secondary_schedule.conflicts
+            print_dual_timeline(primary_schedule, secondary_schedule, work_start, work_end, paused_blocks=paused_blocks)
+
+            if all_conflicts:
+                print_conflicts(all_conflicts)
+
+            total_duration = sum(
+                (st.end - st.start for st in primary_schedule.scheduled_tasks + secondary_schedule.scheduled_tasks),
+                timedelta()
+            )
+            print_timeline_footer(
+                total_duration=total_duration,
+                num_scheduled=len(primary_schedule.scheduled_tasks) + len(secondary_schedule.scheduled_tasks),
+                num_conflicts=len(all_conflicts)
+            )
+            return 0
+
+        _display_continuous_timeline(primary_schedule, work_start, work_end, paused_blocks=paused_blocks)
         
         # Show conflicts
-        if day_schedule.conflicts:
-            print_conflicts(day_schedule.conflicts)
+        if primary_schedule.conflicts:
+            print_conflicts(primary_schedule.conflicts)
         
         # Summary
         total_duration = sum(
-            (st.end - st.start for st in day_schedule.scheduled_tasks),
+            (st.end - st.start for st in primary_schedule.scheduled_tasks),
             timedelta()
         )
         
         print_timeline_footer(
             total_duration=total_duration,
-            num_scheduled=len(day_schedule.scheduled_tasks),
-            num_conflicts=len(day_schedule.conflicts)
+            num_scheduled=len(primary_schedule.scheduled_tasks),
+            num_conflicts=len(primary_schedule.conflicts)
         )
         
         return 0
@@ -582,7 +712,7 @@ def schedule_command(args: list[str]) -> int:
     """
     Schedule command: Display schedule for multiple days.
 
-    Usage: schedule [days]
+    Usage: schedule [days] [--split]
            schedule <start>-<end>
            schedule from <day> [to <count>]
 
@@ -598,13 +728,21 @@ def schedule_command(args: list[str]) -> int:
     look like if day <day> were the starting point, using the full current
     backlog as-is rather than simulating depletion of the days before it.
     <count>, if given, limits how many forecasted days are shown.
+
+    --split shows the primary and secondary (parallel) tracks side by side
+    for each day instead of only the primary track. Only supported with the
+    plain `schedule [days]` form; combine with a day range or forecast by
+    running `today --split` for a single day instead.
     """
-    usage = "Usage: schedule [days] | schedule <start>-<end> | schedule from <day> [to <count>]"
+    usage = "Usage: schedule [days] [--split] | schedule <start>-<end> | schedule from <day> [to <count>]"
 
     try:
         if not _context.projects:
             print_warning("No projects loaded. Run 'sync' first.")
             return 1
+
+        split = "--split" in args
+        args = [a for a in args if a != "--split"]
 
         num_days: int | None = None
         range_start: Optional[int] = None
@@ -613,6 +751,9 @@ def schedule_command(args: list[str]) -> int:
         forecast_count: Optional[int] = None
 
         if args and args[0] == "from":
+            if split:
+                print_error("--split is not supported with 'schedule from'. Use 'today --split' for a single day.")
+                return 1
             if len(args) not in (2, 4):
                 print_error(usage)
                 return 1
@@ -646,6 +787,9 @@ def schedule_command(args: list[str]) -> int:
                 print_error(str(e))
                 return 1
             if day_range is not None:
+                if split:
+                    print_error("--split is not supported with a day range. Use 'today --split' for a single day.")
+                    return 1
                 range_start, range_end = day_range
                 num_days = range_end
             else:
@@ -679,6 +823,10 @@ def schedule_command(args: list[str]) -> int:
 
         # Filter incomplete tasks only
         incomplete_tasks = [t for t in task_pool if not t.completed]
+
+        if split:
+            from chronix.core.tracks import partition_by_track
+            primary_tasks, secondary_tasks = partition_by_track(incomplete_tasks)
 
         # Get current time
         now = datetime.now(tz)
@@ -729,7 +877,59 @@ def schedule_command(args: list[str]) -> int:
                 b for b in config_to_time_blocks(config, day_date)
                 if not _is_block_active(b)
             ]
-        
+
+        if split:
+            primary_schedules_by_day = scheduler.schedule_continuous(
+                tasks=primary_tasks,
+                start_time=start_time,
+                num_days=continuous_num_days,
+                daily_blocked_time_fn=get_daily_blocked_time
+            )
+            secondary_schedules_by_day = scheduler.schedule_continuous(
+                tasks=secondary_tasks,
+                start_time=start_time,
+                num_days=continuous_num_days,
+                daily_blocked_time_fn=get_daily_blocked_time
+            )
+
+            all_conflicts = []
+            first_displayed = True
+            all_days = sorted(set(primary_schedules_by_day.keys()) | set(secondary_schedules_by_day.keys()))
+            for day_offset, day_date in enumerate(all_days):
+                if num_days is not None and day_offset >= num_days:
+                    break
+
+                work_start, work_end = get_work_window(config, day_date)
+                if day_offset == 0 and now > work_start:
+                    work_start = now
+
+                if not first_displayed:
+                    console.print("\n" + "─" * 60 + "\n")
+                first_displayed = False
+
+                day_paused_blocks = [
+                    b for b in get_daily_paused_blocks(day_date)
+                    if b.start < work_end and b.end > work_start
+                ]
+
+                from chronix.core.models import DaySchedule as _DaySchedule
+                primary_day = primary_schedules_by_day.get(day_date) or _DaySchedule(date=day_date, scheduled_tasks=[], blocked_time=[], conflicts=[])
+                secondary_day = secondary_schedules_by_day.get(day_date) or _DaySchedule(date=day_date, scheduled_tasks=[], blocked_time=[], conflicts=[])
+
+                print_schedule_header(day_date, work_start, work_end, config.scheduling.timezone)
+                print_dual_timeline(primary_day, secondary_day, work_start, work_end, paused_blocks=day_paused_blocks)
+
+                if primary_day.conflicts:
+                    all_conflicts.extend(primary_day.conflicts)
+                if secondary_day.conflicts:
+                    all_conflicts.extend(secondary_day.conflicts)
+
+            if all_conflicts:
+                console.print("\n" + "─" * 60 + "\n")
+                print_conflicts(all_conflicts)
+
+            return 0
+
         schedules_by_day = scheduler.schedule_continuous(
             tasks=incomplete_tasks,
             start_time=start_time,
@@ -1182,7 +1382,7 @@ def help_command(args: list[str]) -> int:
     commands_table = [
         ("add <duration> <title> [--doc <id|alias>] [--tab <title|id>]", "Create a new task in a Google Docs document"),
         ("blocks | blocks pause <label|kind> | blocks resume <label|kind>|all", "List or pause/resume recurring config time blocks for this session"),
-        ("calendar [HH:MM] [--force]", "Sync today's schedule to Google Calendar"),
+        ("calendar [HH:MM] [--force] [--split]", "Sync primary track to Google Calendar; --split also syncs secondary (colored distinctly)"),
         ("config <cmd>", "Manage configuration (init, show, path, validate, reload)"),
         ("deadline <task_id> <ISO|-> [--user] [--doc <id|alias>]", "Set external deadline; --user sets user deadline instead"),
         ("deadlines <task_id>|--doc <id|alias>|--all [--dry-run]", "Backfill deadline_computed (exactly one scope required)"),
@@ -1197,13 +1397,14 @@ def help_command(args: list[str]) -> int:
         ("explain <task_id>", "Show details and scheduling info for a task"),
         ("meta <task_id> [k=v ...] [--remove k] [--doc <id|alias>]", "Set or remove arbitrary metadata fields"),
         ("mode <task_id> <mode> [--doc <id|alias>]", "Set execution mode (atomic|flex|contiguous_preferred)"),
+        ("track <task_id> <auto|primary|secondary> [--doc <id|alias>]", "Set which timeline (primary/secondary) a task belongs to"),
         ("rename <task_id> <title> [--doc <id|alias>]", "Rename a task"),
         ("schedule [days] | <start>-<end> | from <day> [to <count>]", "Display multi-day schedule, a day range, or a forecast from a future day"),
         ("sync", "Fetch and parse all configured documents"),
         ("sync <id|alias> [...]", "Sync one or more specific documents by ID or alias"),
-        ("today [HH:MM]", "Display today's scheduled tasks from optional start time"),
+        ("today [HH:MM] [--split]", "Display today's scheduled tasks; --split shows primary/secondary tracks side by side"),
         ("undone <task_id> [--doc <id|alias>]", "Mark a task as incomplete"),
-        ("update <task_id> [flags] [--doc <id|alias>]", "Update fields: --title --duration --external-deadline --user-deadline --mode --ref --deps --meta --remove-meta"),
+        ("update <task_id> [flags] [--doc <id|alias>]", "Update fields: --title --duration --external-deadline --user-deadline --mode --track --ref --deps --meta --remove-meta"),
         ("clear / cls", "Clear the terminal screen"),
         ("help", "Show this help message"),
         ("exit / quit", "Exit the interactive shell"),
@@ -1620,12 +1821,13 @@ def update_command(args: list[str]) -> int:
 
     VALID_FLAGS = (
         "--title", "--duration", "--external-deadline", "--user-deadline",
-        "--mode", "--ref", "--deps", "--meta", "--remove-meta", "--doc",
+        "--mode", "--track", "--ref", "--deps", "--meta", "--remove-meta", "--doc",
     )
 
     usage = (
         "Usage: update <task_id> [--title <title>] [--duration <duration>] "
         "[--external-deadline <ISO|->] [--user-deadline <ISO|->] [--mode <mode>] "
+        "[--track <auto|primary|secondary>] "
         "[--ref <ref>|-] [--deps <ref1,ref2,...>|-] [--meta key=value ...] "
         "[--remove-meta key ...] [--doc <id|alias>]"
     )
@@ -1703,6 +1905,16 @@ def update_command(args: list[str]) -> int:
                 return 1
             update.mode = new_mode
             i += 2
+        elif flag == "--track":
+            if i + 1 >= len(flags):
+                print_error("--track requires a value (auto, primary, secondary)")
+                return 1
+            new_track = flags[i + 1]
+            if new_track not in TaskParser.VALID_TRACKS:
+                print_error(f"Invalid track '{new_track}'. Valid: auto, primary, secondary")
+                return 1
+            update.track = new_track
+            i += 2
         elif flag == "--ref":
             if i + 1 >= len(flags):
                 print_error("--ref requires a value (e.g. task-a, or '-' to clear)")
@@ -1744,6 +1956,7 @@ def update_command(args: list[str]) -> int:
         update.has_external_deadline_change(),
         update.has_user_deadline_change(),
         update.mode,
+        update.track,
         update.metadata,
         update.metadata_remove,
         update.completed is not None,
@@ -2055,6 +2268,42 @@ def mode_command(args: list[str]) -> int:
     rc = _run_task_update(task_id, update, doc_token)
     if rc == 0:
         print_success(f"Task '{task_id}' mode set to '{new_mode}'.")
+    return rc
+
+
+def track_command(args: list[str]) -> int:
+    """
+    Track command: Set which independently-scheduled timeline a task belongs to.
+
+    Usage: track <task_id> <auto|primary|secondary> [--doc <id|alias>]
+
+    "auto" clears any explicit override and lets chronix infer the track from
+    the task's execution mode and duration at scheduling time (see
+    chronix.core.tracks.resolve_track). "primary" and "secondary" pin the
+    task to that lane regardless of the auto heuristic.
+    """
+    from chronix.core.writer import TaskUpdate
+
+    VALID_TRACKS = {"auto", "primary", "secondary"}
+    doc_token, remaining = _parse_edit_flags(args)
+
+    usage = "Usage: track <task_id> <auto|primary|secondary> [--doc <id|alias>]"
+    if len(remaining) < 2:
+        print_error(usage)
+        return 1
+
+    task_id = remaining[0]
+    if _reject_flag_as_task_id(task_id, usage):
+        return 1
+    new_track = remaining[1]
+    if new_track not in VALID_TRACKS:
+        print_error(f"Invalid track '{new_track}'. Valid: auto, primary, secondary")
+        return 1
+
+    update = TaskUpdate(track=new_track)
+    rc = _run_task_update(task_id, update, doc_token)
+    if rc == 0:
+        print_success(f"Task '{task_id}' track set to '{new_track}'.")
     return rc
 
 
