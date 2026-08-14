@@ -306,6 +306,46 @@ class MeetingParser:
         return dt
 
 
+def _extract_description(paragraphs: list[dict], task_index: int, task_indent_level: int) -> Optional[str]:
+    """Collect the description block immediately following a task paragraph.
+
+    A description is every contiguous paragraph after the task line whose
+    indent_level exceeds the task's own indent_level -- i.e. every paragraph
+    indented (via Tab) relative to the task's checkbox. It ends at the first
+    paragraph back at or above that indent level (the next task, a heading,
+    or end of tab), so it always reflects the document's current structure
+    rather than a cached range that could go stale if the user edits the doc.
+
+    Reverses the write-side markdown-bullet translation (see
+    google_docs.writer._format_description_text): a paragraph that is itself
+    a real Docs bullet is rendered back as "- [x] "/"- [ ] " (struck-through or
+    not) rather than plain "- ", since the Docs API can't tell a checkbox
+    bullet glyph apart from a plain disc/circle/square glyph on read (glyph
+    type comes back empty/unspecified for checkboxes either way) -- so every
+    real bullet round-trips through the checkbox syntax uniformly, with
+    strikethrough as the only signal available for checked state. A paragraph
+    that is plain text but already starts with a literal "-"/"* " is escaped
+    with a leading backslash on the way out, so writing this description back
+    doesn't misread that literal dash as a bullet marker on the next round-trip.
+    """
+    lines: list[str] = []
+    for paragraph in paragraphs[task_index + 1:]:
+        if paragraph.get('indent_level', 0) <= task_indent_level:
+            break
+        text = paragraph.get('text', '').strip()
+        if not text:
+            continue
+        bullet = paragraph.get('bullet')
+        if bullet is not None:
+            marker = "- [x] " if bullet.get('has_strikethrough', False) else "- [ ] "
+            lines.append(f"{marker}{text}")
+        elif text[:2] in ("- ", "* "):
+            lines.append(f"\\{text}")
+        else:
+            lines.append(text)
+    return "\n".join(lines) if lines else None
+
+
 class TodoDeriver:
     """Derives canonical TODO list from document structures."""
 
@@ -346,7 +386,8 @@ class TodoDeriver:
                         value=None,
                     )
 
-                for paragraph in tab.get('paragraphs', []):
+                paragraphs = tab.get('paragraphs', [])
+                for index, paragraph in enumerate(paragraphs):
                     style = paragraph.get('style', 'NORMAL_TEXT')
                     if style in ['HEADING_1', 'HEADING_2', 'HEADING_3']:
                         continue
@@ -357,6 +398,9 @@ class TodoDeriver:
                                 task.document_title = document_title
                             if tab_title:
                                 task.section = tab_title
+                            task.description = _extract_description(
+                                paragraphs, index, paragraph.get('indent_level', 0)
+                            )
                             tasks.append(task)
                     except TaskParseError:
                         continue
@@ -416,7 +460,8 @@ def parse_document_tasks(
         checkbox_list_id = tab.get('checkbox_list_id')
         if checkbox_list_id is None:
             continue
-        for paragraph in tab.get('paragraphs', []):
+        paragraphs = tab.get('paragraphs', [])
+        for index, paragraph in enumerate(paragraphs):
             try:
                 task = parser.parse_task_line(paragraph, checkbox_list_id, source=source)
                 if task:
@@ -424,6 +469,9 @@ def parse_document_tasks(
                         task.document_title = document_title
                     if tab_title:
                         task.section = tab_title
+                    task.description = _extract_description(
+                        paragraphs, index, paragraph.get('indent_level', 0)
+                    )
                     tasks.append(task)
             except TaskParseError:
                 continue
