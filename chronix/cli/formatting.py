@@ -526,6 +526,13 @@ def print_task_details(task: Task, project_context):
     console.print(title_text)
     console.print(f"   [dim]ID:[/dim] [yellow]{task.id}[/yellow]")
     console.print()
+
+    if task.description:
+        from rich.markup import escape
+        console.print("[bold]📄 Description[/bold]")
+        for line in task.description.split("\n"):
+            console.print(f"   {escape(line)}")
+        console.print()
     
     # Origin section
     console.print("[bold]📂 Origin[/bold]")
