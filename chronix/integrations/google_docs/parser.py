@@ -4,19 +4,48 @@ from typing import Any
 
 from chronix.core.todo import TaskParser
 
+# Google Docs' default Tab-indent increment for non-bulleted paragraphs, in
+# points. Used to convert paragraphStyle.indentStart into a discrete level
+# comparable to a bullet's integer nestingLevel.
+_INDENT_POINTS_PER_LEVEL = 36
+
+
+def _indent_level_from_style(paragraph_style: dict[str, Any]) -> int:
+    """Derive a discrete indent level from a non-bulleted paragraph's indentStart."""
+    indent_start = paragraph_style.get("indentStart")
+    if not indent_start:
+        return 0
+    magnitude = indent_start.get("magnitude", 0)
+    return int(magnitude // _INDENT_POINTS_PER_LEVEL)
+
 
 class ParsedParagraph:
-    """A parsed paragraph with text and metadata."""
+    """A parsed paragraph with text and metadata.
 
-    def __init__(self, text: str, bullet: dict[str, Any] | None = None, style: str = "NORMAL_TEXT"):
+    `indent_level` is a source-agnostic measure of nesting depth: for a
+    bulleted paragraph it is the bullet's nestingLevel; for a plain paragraph
+    indented via Tab (no bullet) it is derived from paragraphStyle.indentStart.
+    This lets callers compare indentation across bulleted and non-bulleted
+    paragraphs uniformly, regardless of which mechanism produced the indent.
+    """
+
+    def __init__(
+        self,
+        text: str,
+        bullet: dict[str, Any] | None = None,
+        style: str = "NORMAL_TEXT",
+        indent_level: int = 0,
+    ):
         self.text = text
         self.bullet = bullet
         self.style = style
+        self.indent_level = indent_level
 
     def to_dict(self) -> dict[str, Any]:
         result = {
             "text": self.text,
             "style": self.style,
+            "indent_level": self.indent_level,
         }
         if self.bullet:
             result["bullet"] = self.bullet
@@ -160,18 +189,23 @@ class GoogleDocsParser:
             return
 
         bullet_data = None
+        indent_level = 0
         if "bullet" in paragraph:
             bullet = paragraph["bullet"]
+            nesting_level = bullet.get("nestingLevel", 0)
             bullet_data = {
                 "list_id": bullet.get("listId"),
-                "nesting_level": bullet.get("nestingLevel", 0),
+                "nesting_level": nesting_level,
             }
+            indent_level = nesting_level
 
             bullet_text_style = bullet.get("textStyle", {})
             if bullet_text_style.get("strikethrough", False):
                 has_strikethrough = True
 
             bullet_data["has_strikethrough"] = has_strikethrough
+        else:
+            indent_level = _indent_level_from_style(paragraph.get("paragraphStyle", {}))
 
         named_style = paragraph.get("paragraphStyle", {}).get("namedStyleType", "NORMAL_TEXT")
 
@@ -179,6 +213,7 @@ class GoogleDocsParser:
             text=combined_text,
             bullet=bullet_data,
             style=named_style,
+            indent_level=indent_level,
         )
 
         tab.paragraphs.append(parsed_para)
