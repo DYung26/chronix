@@ -47,6 +47,15 @@ from chronix.cli.highlighting import ChronixCommandLexer, chronix_style
 # one-shot invocations start cold every time and must sync on demand.
 _FULL_CONTEXT_COMMANDS = frozenset({"today", "schedule", "calendar", "explain", "deadlines"})
 _TASK_LOOKUP_COMMANDS = frozenset({"done", "pause", "resume"})
+# Commands whose interactive (no-args) form prompts for a task_id and then
+# looks it up in `_context`. In the REPL this is fine (context is warm from
+# the startup sync); in one-shot mode there is no warm context, so calling
+# these with zero args would prompt for a task_id and then fail regardless --
+# one-shot mode rejects the zero-arg form outright instead of prompting.
+# This does not affect these commands when called *with* a task_id one-shot
+# (e.g. `chronix update abc123 --title ...`), which is unaffected and still
+# resolves its document the way it always has.
+_INTERACTIVE_TASK_COMMANDS = frozenset({"done", "pause", "resume", "undone", "delete", "meta", "update"})
 _SINGLE_DOC_COMMANDS = frozenset({"document"})
 
 
@@ -320,7 +329,20 @@ class ChronixShell:
         task lives in. One-shot invocations have no prior sync to resolve that
         from, so `--doc` is required here rather than falling back to a full
         sync of every configured document just to locate one task.
+
+        Commands with an interactive zero-args form (done/pause/resume/undone/
+        delete/meta/update) reject that form outright in one-shot mode: there
+        is no warm `_context` for the resulting prompt to resolve a task_id
+        against, so prompting here would only fail downstream. A task_id (or
+        task_id-less flag form, for update) must be supplied on the command line.
         """
+        if not args and command_name in _INTERACTIVE_TASK_COMMANDS:
+            raise ValueError(
+                f"'{command_name}' requires a task_id when run as a one-shot command "
+                f"(its interactive prompt has no synced context to resolve a task_id against here). "
+                f"Run the chronix shell for the interactive form, or pass a task_id directly."
+            )
+
         if command_name in _FULL_CONTEXT_COMMANDS:
             sync_command([])
         elif command_name in _TASK_LOOKUP_COMMANDS:
