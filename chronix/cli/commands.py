@@ -1380,22 +1380,22 @@ def help_command(args: list[str]) -> int:
     console.print()
     
     commands_table = [
-        ("add <duration> <title> [--doc <id|alias>] [--tab <title|id>]", "Create a new task in a Google Docs document"),
+        ("add [<duration> <title>] [flags]", "Create a task; run with no args for the interactive form"),
         ("blocks | blocks pause <label|kind> | blocks resume <label|kind>|all", "List or pause/resume recurring config time blocks for this session"),
         ("calendar [HH:MM] [--force] [--split]", "Sync primary track to Google Calendar; --split also syncs secondary (colored distinctly)"),
         ("config <cmd>", "Manage configuration (init, show, path, validate, reload)"),
         ("deadline <task_id> <ISO|-> [--user] [--doc <id|alias>]", "Set external deadline; --user sets user deadline instead"),
         ("deadlines <task_id>|--doc <id|alias>|--all [--dry-run]", "Backfill deadline_computed (exactly one scope required)"),
-        ("delete <task_id> [--doc <id|alias>]", "Delete a task from its document"),
+        ("delete [<task_id>] [--doc <id|alias>]", "Delete a task; run with no args to be prompted and confirm"),
         ("documents", "List all configured documents with aliases"),
         ("document <id|alias> [--page N] [--per-page N] [--status s]", "Show a document's task list, paginated"),
         ("tabs <id|alias>", "List the tabs in a document (for add's --tab flag)"),
-        ("done <task_id> [--doc <id|alias>]", "Complete a task, recording actual duration from sessions"),
-        ("pause <task_id> [--doc <id|alias>]", "Close the current work session"),
-        ("resume <task_id> [--doc <id|alias>]", "Open a new work session starting now"),
+        ("done [<task_id>] [--doc <id|alias>]", "Complete a task; run with no args to be prompted"),
+        ("pause [<task_id>] [--doc <id|alias>]", "Close the current work session; run with no args to be prompted"),
+        ("resume [<task_id>] [--doc <id|alias>]", "Open a new work session starting now; run with no args to be prompted"),
         ("duration <task_id> <dur> [--doc <id|alias>]", "Change a task's estimated duration (e.g. 2h, 30m)"),
         ("explain <task_id>", "Show details and scheduling info for a task"),
-        ("meta <task_id> [k=v ...] [--remove k] [--doc <id|alias>]", "Set or remove arbitrary metadata fields"),
+        ("meta [<task_id>] [k=v ...] [--remove k] [--doc <id|alias>]", "Set or remove metadata; run with no args to be prompted"),
         ("mode <task_id> <mode> [--doc <id|alias>]", "Set execution mode (atomic|flex|contiguous_preferred)"),
         ("track <task_id> <auto|primary|secondary> [--doc <id|alias>]", "Set which timeline (primary/secondary) a task belongs to"),
         ("rename <task_id> <title> [--doc <id|alias>]", "Rename a task"),
@@ -1403,8 +1403,8 @@ def help_command(args: list[str]) -> int:
         ("sync", "Fetch and parse all configured documents"),
         ("sync <id|alias> [...]", "Sync one or more specific documents by ID or alias"),
         ("today [HH:MM] [--split]", "Display today's scheduled tasks; --split shows primary/secondary tracks side by side"),
-        ("undone <task_id> [--doc <id|alias>]", "Mark a task as incomplete"),
-        ("update <task_id> [flags] [--doc <id|alias>]", "Update fields: --title --duration --external-deadline --user-deadline --mode --track --ref --deps --meta --remove-meta"),
+        ("undone [<task_id>] [--doc <id|alias>]", "Mark a task as incomplete; run with no args to be prompted"),
+        ("update [<task_id>] [flags] [--doc <id|alias>]", "Update fields; run with no args (or id alone) for the interactive form"),
         ("clear / cls", "Clear the terminal screen"),
         ("help", "Show this help message"),
         ("exit / quit", "Exit the interactive shell"),
@@ -1413,6 +1413,12 @@ def help_command(args: list[str]) -> int:
     for cmd, desc in commands_table:
         console.print(f"  [cyan]{cmd:52}[/cyan] [dim]{desc}[/dim]")
     
+    console.print()
+    console.print("[bold]Interactive forms:[/bold]")
+    console.print("  add/update/meta open a full-screen form when required arguments are")
+    console.print("  omitted; delete/done/undone/pause/resume prompt for a task ID on a")
+    console.print("  plain line. Tab/↓ and Shift+Tab/↑ move between form fields, Ctrl+S")
+    console.print("  submits, Esc cancels without making changes.")
     console.print()
     console.print("[bold]--doc resolution:[/bold]")
     console.print("  In this interactive shell, --doc is optional for task commands once a")
@@ -1459,33 +1465,84 @@ def add_command(args: list[str]) -> int:
     """
     Add command: Create a new task in a Google Docs document.
 
-    Usage: add <duration> <title> [--doc <id|alias>] [--tab <title|id>]
+    Usage: add <duration> <title> [--doc <id|alias>] [--tab <title|id>] [--description <text>]
+                [--external-deadline <ISO>] [--user-deadline <ISO>] [--mode <mode>]
+                [--track <auto|primary|secondary>] [--ref <ref>] [--deps <ref1,ref2,...>]
 
     Duration examples: 2h, 30m, 2hours, 30minutes
 
     Without --tab, the task is inserted into the first tab that has a
     TASKS section (matching prior behavior).
+
+    --description inserts the given text as an indented block immediately
+    below the task line (a Tab-indented paragraph in Google Docs), separate
+    from the ` ::: ` metadata line. Multiple lines can be passed by including
+    literal newlines in the shell argument, or entered via the interactive form.
+
+    Called with no arguments at all, opens a full-screen interactive form for
+    every field instead. A flag given without its value (e.g. `add --title`)
+    prompts only for that value on a plain line, leaving every other
+    already-given flag as typed.
     """
+    from chronix.core.metadata import parse_deadline
+    from chronix.core.todo import TaskParser
+
+    if not args:
+        return _add_command_interactive()
+
     doc_token: Optional[str] = None
     tab_token: Optional[str] = None
+    description: Optional[str] = None
+    external_deadline_str: Optional[str] = None
+    user_deadline_str: Optional[str] = None
+    mode: Optional[str] = None
+    track: Optional[str] = None
+    ref: Optional[str] = None
+    deps: Optional[str] = None
     remaining: list[str] = []
+
+    from chronix.cli.interactive_prompts import prompt_value
+
     i = 0
     while i < len(args):
-        if args[i] == "--doc" and i + 1 < len(args):
-            doc_token = args[i + 1]
-            i += 2
-        elif args[i] == "--tab" and i + 1 < len(args):
-            tab_token = args[i + 1]
-            i += 2
-        elif args[i].startswith("--"):
-            print_error(f"Unknown flag: {args[i]}")
+        arg = args[i]
+        has_value = i + 1 < len(args) and not (args[i + 1].startswith("--") and len(args[i + 1]) > 2)
+        if arg == "--doc":
+            doc_token = args[i + 1] if has_value else prompt_value("Document (id or alias)")
+            i += 2 if has_value else 1
+        elif arg == "--tab":
+            tab_token = args[i + 1] if has_value else prompt_value("Tab (title or ID)")
+            i += 2 if has_value else 1
+        elif arg == "--description":
+            description = args[i + 1] if has_value else prompt_value("Description")
+            i += 2 if has_value else 1
+        elif arg == "--external-deadline":
+            external_deadline_str = args[i + 1] if has_value else prompt_value("External deadline (ISO-8601)")
+            i += 2 if has_value else 1
+        elif arg == "--user-deadline":
+            user_deadline_str = args[i + 1] if has_value else prompt_value("User deadline (ISO-8601)")
+            i += 2 if has_value else 1
+        elif arg == "--mode":
+            mode = args[i + 1] if has_value else prompt_value("Mode (atomic/flex/contiguous_preferred)")
+            i += 2 if has_value else 1
+        elif arg == "--track":
+            track = args[i + 1] if has_value else prompt_value("Track (auto/primary/secondary)")
+            i += 2 if has_value else 1
+        elif arg == "--ref":
+            ref = args[i + 1] if has_value else prompt_value("Ref")
+            i += 2 if has_value else 1
+        elif arg == "--deps":
+            deps = args[i + 1] if has_value else prompt_value("Deps (comma-separated refs)")
+            i += 2 if has_value else 1
+        elif arg.startswith("--"):
+            print_error(f"Unknown flag: {arg}")
             return 1
         else:
-            remaining.append(args[i])
+            remaining.append(arg)
             i += 1
 
     if len(remaining) < 2:
-        print_error("Usage: add <duration> <title> [--doc <id|alias>] [--tab <title|id>]")
+        print_error("Usage: add <duration> <title> [flags] (or 'add' alone for the interactive form)")
         return 1
 
     duration_str = remaining[0]
@@ -1497,11 +1554,26 @@ def add_command(args: list[str]) -> int:
         print_error(str(e))
         return 1
 
+    if mode is not None and mode not in TaskParser.VALID_MODES:
+        print_error(f"Invalid mode '{mode}'. Valid: atomic, flex, contiguous_preferred")
+        return 1
+    if track is not None and track not in TaskParser.VALID_TRACKS:
+        print_error(f"Invalid track '{track}'. Valid: auto, primary, secondary")
+        return 1
+
     try:
         from chronix.config import ChronixConfig
         config = _context.config or ChronixConfig.load_or_default()
     except Exception as e:
         print_error(f"Failed to load configuration: {e}")
+        return 1
+
+    tz = _configured_tz(config)
+    try:
+        external_deadline = parse_deadline(external_deadline_str, tz) if external_deadline_str else None
+        user_deadline = parse_deadline(user_deadline_str, tz) if user_deadline_str else None
+    except ValueError as e:
+        print_error(str(e))
         return 1
 
     all_doc_ids = config.google_docs.document_ids
@@ -1529,11 +1601,124 @@ def add_command(args: list[str]) -> int:
 
     try:
         client = _context._ensure_google_client()
-        writer = GoogleDocsTaskWriter(auth_strategy=client.auth_strategy, tz=_configured_tz(config))
+        writer = GoogleDocsTaskWriter(auth_strategy=client.auth_strategy, tz=tz)
         task_id = generate_task_id()
-        writer.create_task(doc_id, NewTask(title=title, duration=duration, id=task_id, tab=tab_token))
+        writer.create_task(
+            doc_id,
+            NewTask(
+                title=title,
+                duration=duration,
+                id=task_id,
+                tab=tab_token,
+                description=description,
+                external_deadline=external_deadline,
+                user_deadline=user_deadline,
+                mode=mode,
+                track=track,
+                ref=ref,
+                depends=deps,
+            ),
+        )
         _resync_document(doc_id, config)
         print_success(f"Task added: {title} ({duration_str}) [id={task_id}]")
+        return 0
+    except Exception as e:
+        print_error(f"Failed to add task: {e}")
+        return 1
+
+
+def _add_command_interactive() -> int:
+    """Full-screen interactive form for creating a task, invoked by `add` with no args.
+
+    Resolves the target document/tab up front (same rules as the flagged
+    path: single configured doc auto-selected, multiple requires --doc
+    equivalent handled via prompt), then opens the shared TaskForm with every
+    field starting empty. Submitting creates the task; cancelling (Escape)
+    aborts with no changes made.
+    """
+    from chronix.core.metadata import parse_deadline
+    from chronix.core.models import generate_task_id
+    from chronix.core.todo import TaskParser
+    from chronix.core.writer import NewTask
+    from chronix.integrations.google_docs.writer import GoogleDocsTaskWriter
+    from chronix.cli.interactive_form import TaskForm, build_task_form_fields
+    from chronix.cli.interactive_prompts import prompt_value
+
+    try:
+        from chronix.config import ChronixConfig
+        config = _context.config or ChronixConfig.load_or_default()
+    except Exception as e:
+        print_error(f"Failed to load configuration: {e}")
+        return 1
+
+    all_doc_ids = config.google_docs.document_ids
+    if not all_doc_ids:
+        print_error("No documents configured. Run 'chronix config init' to set up.")
+        return 1
+
+    if len(all_doc_ids) == 1:
+        doc_id = all_doc_ids[0]
+    else:
+        labels = [
+            (doc.alias or doc.document_id) for doc in config.google_docs.documents
+        ]
+        console.print("[cyan]Multiple documents configured:[/cyan] " + ", ".join(labels))
+        doc_token = prompt_value("Document (id or alias)")
+        if not doc_token:
+            print_warning("Cancelled: a document is required.")
+            return 1
+        doc_id = _resolve_document_token(doc_token, config)
+        if doc_id is None:
+            print_error(f"Unknown document: '{doc_token}'")
+            return 1
+
+    fields = build_task_form_fields(include_tab_field=True)
+    form = TaskForm(title="Add Task", fields=fields)
+    result = form.run()
+    if result is None:
+        print_info("Cancelled. No task was created.")
+        return 1
+
+    tz = _configured_tz(config)
+    try:
+        duration = _parse_add_duration(result["duration"])
+        external_deadline = parse_deadline(result["external_deadline"], tz) if result["external_deadline"].strip() else None
+        user_deadline = parse_deadline(result["user_deadline"], tz) if result["user_deadline"].strip() else None
+    except ValueError as e:
+        print_error(str(e))
+        return 1
+
+    mode = result["mode"].strip() or None
+    track = result["track"].strip() or None
+    if mode is not None and mode not in TaskParser.VALID_MODES:
+        print_error(f"Invalid mode '{mode}'. Valid: atomic, flex, contiguous_preferred")
+        return 1
+    if track is not None and track not in TaskParser.VALID_TRACKS:
+        print_error(f"Invalid track '{track}'. Valid: auto, primary, secondary")
+        return 1
+
+    try:
+        client = _context._ensure_google_client()
+        writer = GoogleDocsTaskWriter(auth_strategy=client.auth_strategy, tz=tz)
+        task_id = generate_task_id()
+        writer.create_task(
+            doc_id,
+            NewTask(
+                title=result["title"],
+                duration=duration,
+                id=task_id,
+                tab=result["tab"].strip() or None,
+                description=result["description"].strip() or None,
+                external_deadline=external_deadline,
+                user_deadline=user_deadline,
+                mode=mode,
+                track=track,
+                ref=result["ref"].strip() or None,
+                depends=result["deps"].strip() or None,
+            ),
+        )
+        _resync_document(doc_id, config)
+        print_success(f"Task added: {result['title']} [id={task_id}]")
         return 0
     except Exception as e:
         print_error(f"Failed to add task: {e}")
@@ -1802,30 +1987,132 @@ def _find_duplicate_ref_task(ref_value: str, task_id: str) -> Optional[Task]:
     return None
 
 
+def _update_command_interactive(task_id: str, doc_token: Optional[str] = None) -> int:
+    """Open a full-screen form prefilled with task_id's current values and apply edits.
+
+    Requires the task to already be visible in `_context.projects` (i.e. a
+    prior sync); this mirrors every other edit command's `_find_task_in_context`
+    dependency rather than triggering an implicit sync here.
+    """
+    from chronix.core.metadata import (
+        KEY_DEPENDS, KEY_REF, parse_deadline, parse_duration,
+        serialize_deadline, serialize_duration,
+    )
+    from chronix.core.todo import TaskParser
+    from chronix.core.writer import TaskUpdate
+    from chronix.cli.interactive_form import TaskForm, build_task_form_fields
+
+    task = _find_task_in_context(task_id)
+    if task is None:
+        print_error(f"Task '{task_id}' not found. Run 'sync' first.")
+        return 1
+
+    try:
+        from chronix.config import ChronixConfig
+        config = _context.config or ChronixConfig.load_or_default()
+    except Exception as e:
+        print_error(f"Failed to load configuration: {e}")
+        return 1
+    tz = _configured_tz(config)
+
+    fields = build_task_form_fields(
+        title=task.title,
+        duration_str=serialize_duration(task.estimated_duration),
+        description=task.description or "",
+        external_deadline_str=serialize_deadline(task.deadline_external, tz) if task.deadline_external else "",
+        user_deadline_str=serialize_deadline(task.deadline_user, tz) if task.deadline_user else "",
+        mode=task.execution_mode,
+        track=task.track,
+        ref=task.ref or "",
+        deps=",".join(task.depends_on),
+        include_tab_field=False,
+    )
+    form = TaskForm(title=f"Update Task ({task_id})", fields=fields)
+    result = form.run()
+    if result is None:
+        print_info("Cancelled. No changes made.")
+        return 1
+
+    try:
+        duration = parse_duration(result["duration"])
+        if duration is None:
+            print_error(f"Invalid duration: '{result['duration']}'. Use: 2h, 30m, 2hours, 30minutes")
+            return 1
+        external_deadline = parse_deadline(result["external_deadline"], tz) if result["external_deadline"].strip() else None
+        user_deadline = parse_deadline(result["user_deadline"], tz) if result["user_deadline"].strip() else None
+    except ValueError as e:
+        print_error(str(e))
+        return 1
+
+    mode = result["mode"].strip() or None
+    track = result["track"].strip() or None
+    if mode is not None and mode not in TaskParser.VALID_MODES:
+        print_error(f"Invalid mode '{mode}'. Valid: atomic, flex, contiguous_preferred")
+        return 1
+    if track is not None and track not in TaskParser.VALID_TRACKS:
+        print_error(f"Invalid track '{track}'. Valid: auto, primary, secondary")
+        return 1
+
+    new_ref = result["ref"].strip() or None
+    if new_ref and new_ref != task.ref:
+        conflict = _find_duplicate_ref_task(new_ref, task_id)
+        if conflict is not None:
+            print_error(
+                f"Duplicate ref '{new_ref}': already used by task "
+                f"'{conflict.title}' (id={conflict.id})."
+            )
+            return 1
+
+    update = TaskUpdate(
+        title=result["title"],
+        duration=duration,
+        description=result["description"].strip() or None,
+        external_deadline=external_deadline,
+        user_deadline=user_deadline,
+        mode=mode,
+        track=track,
+    )
+    update.metadata[KEY_REF] = new_ref or ""
+    update.metadata[KEY_DEPENDS] = result["deps"].strip()
+
+    rc = _run_task_update(task_id, update, doc_token)
+    if rc == 0:
+        print_success(f"Task '{task_id}' updated.")
+    return rc
+
+
 def update_command(args: list[str]) -> int:
     """
     Update command: Modify one or more fields of a task by its ID.
 
     Usage: update <task_id> [--title <title>] [--duration <duration>]
+                            [--description <text>|-]
                             [--external-deadline <ISO|->] [--user-deadline <ISO|->]
                             [--mode <mode>] [--ref <ref>|-] [--deps <ref1,ref2,...>|-]
                             [--meta <key=value> ...]
                             [--remove-meta <key> ...]
                             [--doc <id|alias>]
 
-    At least one field flag must be supplied.
+    At least one field flag must be supplied when task_id and flags are both
+    given. Called as `update` alone, prompts for a task_id then opens a
+    full-screen interactive form prefilled with that task's current values.
+    Called as `update <task_id>` with no flags, skips straight to that form.
+    A flag given without its value (e.g. `update abc123 --title`) prompts
+    only for that value on a plain line, leaving every other field untouched.
     """
     from chronix.core.metadata import KEY_DEPENDS, KEY_REF, parse_deadline, parse_duration
     from chronix.core.todo import TaskParser
     from chronix.core.writer import TaskUpdate
+    from chronix.cli.interactive_prompts import prompt_task_id, prompt_value
 
     VALID_FLAGS = (
-        "--title", "--duration", "--external-deadline", "--user-deadline",
+        "--title", "--duration", "--description", "--external-deadline", "--user-deadline",
         "--mode", "--track", "--ref", "--deps", "--meta", "--remove-meta", "--doc",
     )
 
     usage = (
         "Usage: update <task_id> [--title <title>] [--duration <duration>] "
+        "[--description <text>|-] "
         "[--external-deadline <ISO|->] [--user-deadline <ISO|->] [--mode <mode>] "
         "[--track <auto|primary|secondary>] "
         "[--ref <ref>|-] [--deps <ref1,ref2,...>|-] [--meta key=value ...] "
@@ -1833,13 +2120,19 @@ def update_command(args: list[str]) -> int:
     )
 
     if not args:
-        print_error(usage)
-        return 1
+        task_id = prompt_task_id("update")
+        if task_id is None:
+            print_warning("Cancelled: a task ID is required.")
+            return 1
+        return _update_command_interactive(task_id)
 
     task_id = args[0]
     if _reject_flag_as_task_id(task_id, usage):
         return 1
     doc_token, flags = _parse_edit_flags(args[1:])
+
+    if not flags:
+        return _update_command_interactive(task_id, doc_token)
 
     try:
         from chronix.config import ChronixConfig
@@ -1853,82 +2146,60 @@ def update_command(args: list[str]) -> int:
     i = 0
     while i < len(flags):
         flag = flags[i]
+        has_value = i + 1 < len(flags) and not (flags[i + 1].startswith("--") and len(flags[i + 1]) > 2)
         if flag == "--title":
-            if i + 1 >= len(flags):
-                print_error("--title requires a value")
-                return 1
-            update.title = flags[i + 1]
-            i += 2
+            update.title = flags[i + 1] if has_value else prompt_value("Title")
+            i += 2 if has_value else 1
         elif flag == "--duration":
-            if i + 1 >= len(flags):
-                print_error("--duration requires a value (e.g. 2h, 30m, 2hours, 30minutes)")
-                return 1
-            dur = parse_duration(flags[i + 1])
+            dur_str = flags[i + 1] if has_value else prompt_value("Duration (e.g. 2h, 30m)")
+            dur = parse_duration(dur_str) if dur_str else None
             if dur is None:
-                print_error(f"Invalid duration: '{flags[i + 1]}'. Use: 2h, 30m, 2hours, 30minutes")
+                print_error(f"Invalid duration: '{dur_str}'. Use: 2h, 30m, 2hours, 30minutes")
                 return 1
             update.duration = dur
-            i += 2
+            i += 2 if has_value else 1
+        elif flag == "--description":
+            desc_value = flags[i + 1] if has_value else prompt_value("Description (or '-' to clear)")
+            update.description = None if desc_value == "-" else desc_value
+            i += 2 if has_value else 1
         elif flag == "--external-deadline":
-            if i + 1 >= len(flags):
-                print_error(
-                    "--external-deadline requires a value "
-                    "(ISO-8601, e.g. 2026-07-15T09:00:00, or '-' to clear)"
-                )
-                return 1
+            value = flags[i + 1] if has_value else prompt_value("External deadline (ISO-8601, or '-' to clear)")
             try:
-                update.external_deadline = parse_deadline(flags[i + 1], tz)
+                update.external_deadline = parse_deadline(value, tz)
             except ValueError as e:
                 print_error(str(e))
                 return 1
-            i += 2
+            i += 2 if has_value else 1
         elif flag == "--user-deadline":
-            if i + 1 >= len(flags):
-                print_error(
-                    "--user-deadline requires a value "
-                    "(ISO-8601, e.g. 2026-07-15T09:00:00, or '-' to clear)"
-                )
-                return 1
+            value = flags[i + 1] if has_value else prompt_value("User deadline (ISO-8601, or '-' to clear)")
             try:
-                update.user_deadline = parse_deadline(flags[i + 1], tz)
+                update.user_deadline = parse_deadline(value, tz)
             except ValueError as e:
                 print_error(str(e))
                 return 1
-            i += 2
+            i += 2 if has_value else 1
         elif flag == "--mode":
-            if i + 1 >= len(flags):
-                print_error("--mode requires a value (atomic, flex, contiguous_preferred)")
-                return 1
-            new_mode = flags[i + 1]
+            new_mode = flags[i + 1] if has_value else prompt_value("Mode (atomic/flex/contiguous_preferred)")
             if new_mode not in TaskParser.VALID_MODES:
                 print_error(f"Invalid mode '{new_mode}'. Valid: atomic, flex, contiguous_preferred")
                 return 1
             update.mode = new_mode
-            i += 2
+            i += 2 if has_value else 1
         elif flag == "--track":
-            if i + 1 >= len(flags):
-                print_error("--track requires a value (auto, primary, secondary)")
-                return 1
-            new_track = flags[i + 1]
+            new_track = flags[i + 1] if has_value else prompt_value("Track (auto/primary/secondary)")
             if new_track not in TaskParser.VALID_TRACKS:
                 print_error(f"Invalid track '{new_track}'. Valid: auto, primary, secondary")
                 return 1
             update.track = new_track
-            i += 2
+            i += 2 if has_value else 1
         elif flag == "--ref":
-            if i + 1 >= len(flags):
-                print_error("--ref requires a value (e.g. task-a, or '-' to clear)")
-                return 1
-            ref_value = flags[i + 1]
-            update.metadata[KEY_REF] = "" if ref_value == "-" else ref_value
-            i += 2
+            ref_value = flags[i + 1] if has_value else prompt_value("Ref (or '-' to clear)")
+            update.metadata[KEY_REF] = "" if ref_value == "-" else (ref_value or "")
+            i += 2 if has_value else 1
         elif flag == "--deps":
-            if i + 1 >= len(flags):
-                print_error("--deps requires a value (comma-separated refs, e.g. task-a,task-b, or '-' to clear)")
-                return 1
-            deps_value = flags[i + 1]
-            update.metadata[KEY_DEPENDS] = "" if deps_value == "-" else deps_value
-            i += 2
+            deps_value = flags[i + 1] if has_value else prompt_value("Deps (comma-separated refs, or '-' to clear)")
+            update.metadata[KEY_DEPENDS] = "" if deps_value == "-" else (deps_value or "")
+            i += 2 if has_value else 1
         elif flag == "--meta":
             if i + 1 >= len(flags):
                 print_error("--meta requires key=value (e.g. priority=high)")
@@ -1953,6 +2224,7 @@ def update_command(args: list[str]) -> int:
     if not any([
         update.title,
         update.duration,
+        update.has_description_change(),
         update.has_external_deadline_change(),
         update.has_user_deadline_change(),
         update.mode,
@@ -2351,6 +2623,8 @@ def done_command(args: list[str]) -> int:
     is found, a session from the calendar start to now is recorded.
 
     Usage: done <task_id> [--doc <id|alias>]
+
+    Called with no arguments, prompts for a task_id.
     """
     from chronix.core.writer import TaskUpdate
     from chronix.core.models import WorkSession
@@ -2361,16 +2635,20 @@ def done_command(args: list[str]) -> int:
         serialize_duration,
         serialize_sessions,
     )
+    from chronix.cli.interactive_prompts import prompt_task_id
 
     usage = "Usage: done <task_id> [--doc <id|alias>]"
     doc_token, remaining = _parse_edit_flags(args)
-    if not remaining:
-        print_error(usage)
-        return 1
 
-    task_id = remaining[0]
-    if _reject_flag_as_task_id(task_id, usage):
-        return 1
+    if not remaining:
+        task_id = prompt_task_id("mark done")
+        if task_id is None:
+            print_warning("Cancelled: a task ID is required.")
+            return 1
+    else:
+        task_id = remaining[0]
+        if _reject_flag_as_task_id(task_id, usage):
+            return 1
 
     try:
         from chronix.config import ChronixConfig
@@ -2421,6 +2699,8 @@ def pause_command(args: list[str]) -> int:
     set by resume.
 
     Usage: pause <task_id> [--doc <id|alias>]
+
+    Called with no arguments, prompts for a task_id.
     """
     from chronix.core.writer import TaskUpdate
     from chronix.core.models import WorkSession
@@ -2429,16 +2709,20 @@ def pause_command(args: list[str]) -> int:
         KEY_SESSIONS,
         serialize_sessions,
     )
+    from chronix.cli.interactive_prompts import prompt_task_id
 
     usage = "Usage: pause <task_id> [--doc <id|alias>]"
     doc_token, remaining = _parse_edit_flags(args)
-    if not remaining:
-        print_error(usage)
-        return 1
 
-    task_id = remaining[0]
-    if _reject_flag_as_task_id(task_id, usage):
-        return 1
+    if not remaining:
+        task_id = prompt_task_id("pause")
+        if task_id is None:
+            print_warning("Cancelled: a task ID is required.")
+            return 1
+    else:
+        task_id = remaining[0]
+        if _reject_flag_as_task_id(task_id, usage):
+            return 1
 
     task = _find_task_in_context(task_id)
     if task is None:
@@ -2525,19 +2809,25 @@ def resume_command(args: list[str]) -> int:
     Resume command: Begin a new work session starting at the current time.
 
     Usage: resume <task_id> [--doc <id|alias>]
+
+    Called with no arguments, prompts for a task_id.
     """
     from chronix.core.writer import TaskUpdate
     from chronix.core.metadata import KEY_ACTIVE_SINCE, serialize_active_since
+    from chronix.cli.interactive_prompts import prompt_task_id
 
     usage = "Usage: resume <task_id> [--doc <id|alias>]"
     doc_token, remaining = _parse_edit_flags(args)
-    if not remaining:
-        print_error(usage)
-        return 1
 
-    task_id = remaining[0]
-    if _reject_flag_as_task_id(task_id, usage):
-        return 1
+    if not remaining:
+        task_id = prompt_task_id("resume")
+        if task_id is None:
+            print_warning("Cancelled: a task ID is required.")
+            return 1
+    else:
+        task_id = remaining[0]
+        if _reject_flag_as_task_id(task_id, usage):
+            return 1
 
     task = _find_task_in_context(task_id)
     if task is None:
@@ -2568,22 +2858,83 @@ def undone_command(args: list[str]) -> int:
     Undone command: Mark a task as incomplete.
 
     Usage: undone <task_id> [--doc <id|alias>]
+
+    Called with no arguments, prompts for a task_id.
     """
     from chronix.core.writer import TaskUpdate
+    from chronix.cli.interactive_prompts import prompt_task_id
 
     usage = "Usage: undone <task_id> [--doc <id|alias>]"
     doc_token, remaining = _parse_edit_flags(args)
-    if not remaining:
-        print_error(usage)
-        return 1
 
-    task_id = remaining[0]
-    if _reject_flag_as_task_id(task_id, usage):
-        return 1
+    if not remaining:
+        task_id = prompt_task_id("mark incomplete")
+        if task_id is None:
+            print_warning("Cancelled: a task ID is required.")
+            return 1
+    else:
+        task_id = remaining[0]
+        if _reject_flag_as_task_id(task_id, usage):
+            return 1
     update = TaskUpdate(completed=False)
     rc = _run_task_update(task_id, update, doc_token)
     if rc == 0:
         print_success(f"Task '{task_id}' marked as incomplete.")
+    return rc
+
+
+def _meta_command_interactive(task_id: str, doc_token: Optional[str] = None) -> int:
+    """Interactively collect key=value pairs to set, then optional keys to remove.
+
+    Loops on plain line prompts (a key=value pair per line, blank line to
+    finish) rather than the full-screen form, since metadata is an open-ended
+    set of pairs rather than a fixed field list.
+    """
+    from chronix.core.writer import TaskUpdate
+
+    task = _find_task_in_context(task_id)
+    if task is None:
+        print_error(f"Task '{task_id}' not found. Run 'sync' first.")
+        return 1
+
+    console.print(f"[cyan]Editing metadata for '{task.title}' (id={task_id})[/cyan]")
+    console.print("[dim]Enter key=value pairs to set, one per line. Blank line to finish.[/dim]")
+
+    metadata: dict[str, str] = {}
+    while True:
+        try:
+            line = console.input("[cyan]key=value:[/cyan] ").strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print()
+            break
+        if not line:
+            break
+        if "=" not in line:
+            print_error(f"Expected key=value, got: '{line}'")
+            continue
+        k, _, v = line.partition("=")
+        metadata[k.strip()] = v.strip()
+
+    console.print("[dim]Enter keys to remove, one per line. Blank line to finish.[/dim]")
+    metadata_remove: list[str] = []
+    while True:
+        try:
+            line = console.input("[cyan]remove key:[/cyan] ").strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print()
+            break
+        if not line:
+            break
+        metadata_remove.append(line)
+
+    if not metadata and not metadata_remove:
+        print_info("No metadata changes specified. Cancelled.")
+        return 1
+
+    update = TaskUpdate(metadata=metadata, metadata_remove=metadata_remove)
+    rc = _run_task_update(task_id, update, doc_token)
+    if rc == 0:
+        print_success(f"Task '{task_id}' metadata updated.")
     return rc
 
 
@@ -2596,15 +2947,23 @@ def meta_command(args: list[str]) -> int:
     Examples:
         meta abc123 priority=high area=work
         meta abc123 --remove priority
+
+    Called with no arguments, prompts for a task_id then loops asking for
+    key=value pairs to set (blank line to finish), one at a time.
     """
     from chronix.core.writer import TaskUpdate
+    from chronix.cli.interactive_prompts import prompt_task_id
 
     usage = "Usage: meta <task_id> [key=value ...] [--remove key ...] [--doc <id|alias>]"
 
     doc_token, remaining = _parse_edit_flags(args)
+
     if not remaining:
-        print_error(usage)
-        return 1
+        task_id = prompt_task_id("edit metadata for")
+        if task_id is None:
+            print_warning("Cancelled: a task ID is required.")
+            return 1
+        return _meta_command_interactive(task_id, doc_token)
 
     task_id = remaining[0]
     if _reject_flag_as_task_id(task_id, usage):
@@ -2646,18 +3005,31 @@ def delete_command(args: list[str]) -> int:
     Delete command: Remove a task from its document.
 
     Usage: delete <task_id> [--doc <id|alias>]
+
+    Called with no arguments, prompts for a task_id, shows the task, and
+    asks for confirmation before deleting.
     """
     from chronix.core.writer import TaskNotFoundError
+    from chronix.cli.interactive_prompts import confirm, prompt_task_id
 
     usage = "Usage: delete <task_id> [--doc <id|alias>]"
     doc_token, remaining = _parse_edit_flags(args)
-    if not remaining:
-        print_error(usage)
-        return 1
 
-    task_id = remaining[0]
-    if _reject_flag_as_task_id(task_id, usage):
-        return 1
+    if not remaining:
+        task_id = prompt_task_id("delete")
+        if task_id is None:
+            print_warning("Cancelled: a task ID is required.")
+            return 1
+        task = _find_task_in_context(task_id)
+        if task is not None:
+            console.print(f"  [yellow]{task.title}[/yellow] [dim](id={task_id})[/dim]")
+        if not confirm(f"Delete task '{task_id}'?"):
+            print_info("Cancelled.")
+            return 1
+    else:
+        task_id = remaining[0]
+        if _reject_flag_as_task_id(task_id, usage):
+            return 1
 
     try:
         from chronix.config import ChronixConfig
