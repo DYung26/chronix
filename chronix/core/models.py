@@ -55,6 +55,7 @@ class Task(BaseModel):
 
     id: Optional[str] = None
     title: str
+    description: Optional[str] = None
     project: Optional[str] = None
     section: Optional[str] = None
     document_title: Optional[str] = None
