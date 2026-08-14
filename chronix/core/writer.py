@@ -28,6 +28,7 @@ class NewTask:
     title: str
     duration: timedelta
     id: Optional[str] = None
+    description: Optional[str] = None
     external_deadline: Optional[datetime] = None
     user_deadline: Optional[datetime] = None
     mode: Optional[str] = None
@@ -51,11 +52,15 @@ class TaskUpdate:
     ``metadata_remove`` lists keys to delete from the metadata section.
 
     Both ``completed=True`` and ``completed=False`` are meaningful, so None
-    means "do not change completion state".
+    means "do not change completion state". ``description`` follows the same
+    unset-vs-None convention as the deadline fields: leaving it unset preserves
+    the existing description block; explicit None clears it; a non-None string
+    replaces the block entirely.
     """
 
     title: Optional[str] = None
     duration: Optional[timedelta] = None
+    description: Optional[str] = field(default=_UNSET)  # type: ignore[assignment]
     external_deadline: Optional[datetime] = field(default=_UNSET)  # type: ignore[assignment]
     user_deadline: Optional[datetime] = field(default=_UNSET)  # type: ignore[assignment]
     mode: Optional[str] = None
@@ -63,6 +68,9 @@ class TaskUpdate:
     completed: Optional[bool] = None
     metadata: dict[str, str] = field(default_factory=dict)
     metadata_remove: list[str] = field(default_factory=list)
+
+    def has_description_change(self) -> bool:
+        return self.description is not _UNSET
 
     def has_external_deadline_change(self) -> bool:
         return self.external_deadline is not _UNSET
