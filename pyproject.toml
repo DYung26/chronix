@@ -20,8 +20,14 @@ dependencies = [
     "prompt_toolkit>=3.0.0",
 ]
 
+[project.optional-dependencies]
+mcp = [
+    "mcp>=1.2.0",
+]
+
 [project.scripts]
 chronix = "chronix.__main__:main"
+chronix-mcp = "chronix.mcp.server:main"
 
 [tool.setuptools.packages.find]
 include = ["chronix*"]
