@@ -7,6 +7,7 @@ from chronix.config.settings import (
     DocumentConfig,
     TimeBlockConfig,
     WorkWindowConfig,
+    StartupConfig,
 )
 from chronix.config.converters import (
     config_to_time_blocks,
@@ -21,6 +22,7 @@ __all__ = [
     "DocumentConfig",
     "TimeBlockConfig",
     "WorkWindowConfig",
+    "StartupConfig",
     "config_to_time_blocks",
     "get_work_window",
     "get_work_windows",

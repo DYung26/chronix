@@ -134,6 +134,12 @@ def config_show_command(args: list[str]) -> int:
                 print(f"     ... and {len(ranked) - 3} more")
         else:
             print(f"   Documents: None configured")
+        print()
+        
+        # Startup commands
+        print("🚀 Startup:")
+        for tokens in config.startup.commands:
+            print(f"   {' '.join(tokens)}")
         
         return 0
     
@@ -240,6 +246,7 @@ def config_validate_command(args: list[str]) -> int:
         print(f"  • Breaks: {len(config.scheduling.breaks)}")
         print(f"  • Meetings: {len(config.scheduling.meetings)}")
         print(f"  • Documents: {len(config.google_docs.document_ids)}")
+        print(f"  • Startup commands: {len(config.startup.commands)}")
         
         return 0
     

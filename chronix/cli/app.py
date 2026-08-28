@@ -254,6 +254,37 @@ class ChronixShell:
         
         return overall_success
 
+    def _run_startup_commands(self) -> None:
+        """Run the commands configured under [startup] before the prompt loop starts.
+
+        Defaults to a single `sync` (see StartupConfig) to match prior
+        behavior. A command that fails to parse, isn't recognized, or raises
+        is reported and skipped; later startup commands still run.
+        """
+        from chronix.config import ChronixConfig
+
+        try:
+            config = ChronixConfig.load_or_default()
+        except Exception as e:
+            console.print(f"[yellow]⚠️[/yellow]  Failed to load configuration for startup commands: {e}")
+            return
+
+        for tokens in config.startup.commands:
+            command_name, args = tokens[0], tokens[1:]
+            console.print(f"[dim]Running startup command: {' '.join(tokens)}[/dim]")
+
+            command = self.commands.get(command_name)
+            if command is None:
+                console.print(f"[yellow]⚠️[/yellow]  Unknown startup command: '{command_name}'")
+                continue
+
+            try:
+                command(args)
+            except Exception as e:
+                console.print(f"[yellow]⚠️[/yellow]  Startup command '{command_name}' failed: {e}")
+
+        console.print()
+
     def run(self):
         """Run the interactive shell."""
         # Clear terminal on startup
@@ -263,13 +294,7 @@ class ChronixShell:
         console.print("[bold cyan]chronix[/bold cyan] [dim]v0.1.0[/dim] — Interactive Shell")
         console.print("[dim]Type 'help' for available commands or 'exit' to quit.[/dim]\n")
         
-        # Auto-run sync on REPL startup
-        console.print("[dim]Running initial sync...[/dim]\n")
-        try:
-            sync_command([])
-        except Exception as e:
-            console.print(f"[yellow]⚠️[/yellow]  Initial sync failed: {e}")
-            console.print("[dim]You can retry with the 'sync' command.[/dim]\n")
+        self._run_startup_commands()
         
         while self.running:
             try:

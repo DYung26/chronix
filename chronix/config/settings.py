@@ -171,11 +171,34 @@ class GoogleDocsConfig(BaseModel):
         return document_id
 
 
+class StartupConfig(BaseModel):
+    """Configuration for commands run automatically when the REPL starts."""
+
+    commands: list[list[str]] = Field(
+        default_factory=lambda: [["sync"]],
+        description=(
+            "Shell commands to run in order at REPL startup, each as a list of "
+            "tokens (command name followed by its arguments), e.g. [\"sync\"] or "
+            "[\"sync\", \"my-doc\"]. A failing command is reported but does not "
+            "stop the ones after it."
+        ),
+    )
+
+    @field_validator("commands")
+    @classmethod
+    def validate_commands_nonempty(cls, v: list[list[str]]) -> list[list[str]]:
+        for tokens in v:
+            if not tokens:
+                raise ValueError("Each startup command must have at least one token (the command name)")
+        return v
+
+
 class ChronixConfig(BaseModel):
     """Root configuration for chronix."""
 
     scheduling: SchedulingConfig = Field(default_factory=SchedulingConfig)
     google_docs: GoogleDocsConfig = Field(default_factory=GoogleDocsConfig)
+    startup: StartupConfig = Field(default_factory=StartupConfig)
 
     @classmethod
     def from_toml(cls, path: Path) -> "ChronixConfig":
