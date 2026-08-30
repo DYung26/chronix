@@ -167,6 +167,7 @@ def _generate_today_schedules(
     # Aggregate all tasks
     aggregator = TaskAggregator()
     aggregated_tasks = aggregator.aggregate(_context.projects)
+    _warn_on_conflicts(aggregator)
     task_pool = aggregator.get_task_pool(aggregated_tasks)
     incomplete_tasks = [t for t in task_pool if not t.completed]
     primary_tasks, secondary_tasks = partition_by_track(incomplete_tasks)
@@ -293,13 +294,15 @@ def _is_block_active(time_block) -> bool:
     return key not in _context.disabled_blocks
 
 
-def _resolve_document_token(token: str, config: 'ChronixConfig') -> Optional[str]:
+def _resolve_project_token(token: str, config: 'ChronixConfig') -> Optional[str]:
     """
-    Resolve a token (alias or document_id) to its canonical document_id.
+    Resolve a token (project name) to the project's canonical name.
 
-    Returns the document_id if the token matches a configured alias or ID, else None.
+    Returns the project name if the token matches a configured project,
+    else None.
     """
-    return config.google_docs.resolve(token)
+    project = config.find_project(token)
+    return project.name if project is not None else None
 
 
 def _configured_tz(config: 'ChronixConfig') -> ZoneInfo:
@@ -308,18 +311,45 @@ def _configured_tz(config: 'ChronixConfig') -> ZoneInfo:
     return ZoneInfo(config.scheduling.timezone)
 
 
+def _warn_on_conflicts(aggregator: TaskAggregator) -> None:
+    """Print a warning if the most recent aggregate() call found sync conflicts.
+
+    A conflict is a task id that appeared from two or more sources with
+    disagreeing content (see chronix.core.aggregation._tasks_conflict).
+    Conflicted tasks are excluded from get_task_pool's scheduling output
+    entirely rather than picked between arbitrarily or double-scheduled, so
+    every scheduling command must call this after aggregate() to make that
+    exclusion visible -- otherwise a real task would simply, silently stop
+    appearing in `today`/`schedule` with no indication why.
+    """
+    conflicts = aggregator.get_conflicts()
+    if not conflicts:
+        return
+    count = len(conflicts)
+    task_word = "task" if count == 1 else "tasks"
+    ids = ", ".join(c.task_id for c in conflicts)
+    print_warning(
+        f"{count} {task_word} disagree across sources and were excluded from scheduling: {ids}"
+    )
+    console.print("[dim]Run 'conflicts' to see and resolve them.[/dim]")
+
+
 def sync_command(args: list[str]) -> int:
     """
-    Sync command: Fetch and parse configured project documents.
-    
-    Usage: sync [id|alias ...]
-    
-    With no argument: syncs all configured documents (continues on document-level failures)
-    With one or more id/alias tokens: syncs only those documents (all must be configured)
+    Sync command: Fetch and parse configured projects (each may have a Google Docs
+    source, a local file source, or both).
+
+    Usage: sync [project ...]
+
+    With no argument: syncs every configured project (continues on
+    project-level failures). With one or more project name tokens: syncs
+    only those projects (all must be configured). A project with two
+    sources has both fetched together, so aggregation can merge/dedupe them
+    correctly (see chronix.core.aggregation.TaskAggregator.aggregate).
     """
     try:
         tokens = args if args else None
-        
+
         console.print("[dim]Starting sync...[/dim]")
 
         # Load configuration (global failure)
@@ -332,80 +362,79 @@ def sync_command(args: list[str]) -> int:
             console.print("Run [cyan]chronix config init[/cyan] to create a default configuration.")
             return 1
 
-        all_document_ids = config.google_docs.document_ids
-        if not all_document_ids:
-            print_warning("No documents configured in your config file.")
-            console.print(f"Edit [cyan]{ChronixConfig.get_default_path()}[/cyan] and add document_ids to sync.")
+        if not config.projects:
+            print_warning("No projects configured in your config file.")
+            console.print(f"Edit [cyan]{ChronixConfig.get_default_path()}[/cyan] and add projects to sync.")
             return 1
 
         # If specific tokens were requested, resolve and validate all before fetching any
         if tokens:
-            unknown = [t for t in tokens if _resolve_document_token(t, config) is None]
+            unknown = [t for t in tokens if config.find_project(t) is None]
             if unknown:
                 for token in unknown:
-                    print_error(f"Unknown document '{token}'")
-                configured_labels = [
-                    config.google_docs.format_document_label(doc_id)
-                    for doc_id in all_document_ids
-                ]
-                console.print("Configured documents:")
-                for label in configured_labels:
-                    console.print(f"  [cyan]{label}[/cyan]")
+                    print_error(f"Unknown project '{token}'")
+                console.print("Configured projects:")
+                for project in config.projects:
+                    console.print(f"  [cyan]{project.label()}[/cyan]")
                 return 1
-            # Resolve tokens to canonical document IDs (deduplicated, preserving order)
+            # Resolve tokens to canonical project names (deduplicated, preserving order)
             seen: set[str] = set()
-            document_ids: list[str] = []
+            project_names: list[str] = []
             for t in tokens:
-                resolved = _resolve_document_token(t, config)
+                resolved = config.find_project(t).name
                 if resolved not in seen:
                     seen.add(resolved)
-                    document_ids.append(resolved)
+                    project_names.append(resolved)
         else:
-            document_ids = all_document_ids
+            project_names = [p.name for p in config.projects]
 
-        # Initialize client and authenticate (global failure)
-        client = _context._ensure_google_client()
-        console.print("[dim]Authenticating with Google Docs...[/dim]")
+        sources_to_sync = [s for s in config.all_sources() if s.project_name in project_names]
 
-        try:
-            if not client.authenticate():
-                print_error("Authentication failed. Please check your credentials.")
-                console.print("[dim]Hint: Ensure OAuth credentials are properly configured.[/dim]")
+        # Authenticate the Google Docs client only if at least one Docs source
+        # is actually in scope -- local-files-only syncs need no auth step.
+        needs_google_auth = any(s.type == "google_docs" for s in sources_to_sync)
+        if needs_google_auth:
+            client = _context._ensure_google_client()
+            console.print("[dim]Authenticating with Google Docs...[/dim]")
+            try:
+                if not client.authenticate():
+                    print_error("Authentication failed. Please check your credentials.")
+                    console.print("[dim]Hint: Ensure OAuth credentials are properly configured.[/dim]")
+                    return 1
+            except Exception as auth_error:
+                print_error(f"Authentication error: {auth_error}")
                 return 1
-        except Exception as auth_error:
-            print_error(f"Authentication error: {auth_error}")
-            return 1
+            console.print("[dim]✓ Authenticated successfully[/dim]")
 
-        console.print("[dim]✓ Authenticated successfully[/dim]")
+        # Sync each source with retry logic
+        from chronix.cli.sync_helpers import _sync_single_source_with_retries
+        from chronix.integrations.factory import get_client
 
-        # Sync each document with retry logic
-        from chronix.cli.sync_helpers import _sync_single_document_with_retries
-        
         tz = _configured_tz(config)
         projects = []
         all_meetings = []
         results = []
 
-        for doc_id in document_ids:
-            alias = config.google_docs.get_alias(doc_id)
-            priority = config.google_docs.get_priority(doc_id)
-            result, project, meetings = _sync_single_document_with_retries(
-                doc_id, client, alias=alias, priority=priority, tz=tz
-            )
+        for source in sources_to_sync:
+            source_client = _context._ensure_google_client() if source.type == "google_docs" else get_client(source)
+            result, project, meetings = _sync_single_source_with_retries(source, source_client, tz=tz)
             results.append(result)
-            
+
             if result.outcome.value == "success":
                 projects.append(project)
                 all_meetings.extend(meetings)
 
-        # Update context: merge or replace
+        # Update context: merge or replace, keyed by project_id (a project's
+        # two sources both carry the same project_id, so replacing "this
+        # project's entries" removes both old ProjectTodoLists together
+        # rather than leaving a stale one from the other source behind).
         if tokens:
             # Partial sync: merge into existing context
             if _context.projects:
-                synced_doc_ids = {p.project_context.document_id for p in projects}
+                synced_project_ids = {p.project_context.project_id for p in projects}
                 updated_projects = [
                     p for p in _context.projects
-                    if p.project_context.document_id not in synced_doc_ids
+                    if p.project_context.project_id not in synced_project_ids
                 ]
                 updated_projects.extend(projects)
                 _context.projects = updated_projects
@@ -413,14 +442,14 @@ def sync_command(args: list[str]) -> int:
             else:
                 _context.projects = projects
                 _context.ad_hoc_meetings = all_meetings
-                print_warning("Synced specific documents with no prior context.")
-                console.print("[dim]For complete task aggregation across all documents, run:[/dim]")
+                print_warning("Synced specific projects with no prior context.")
+                console.print("[dim]For complete task aggregation across all projects, run:[/dim]")
                 console.print("[cyan]  chronix sync[/cyan]")
         else:
             # Full sync: replace context entirely
             _context.projects = projects
             _context.ad_hoc_meetings = all_meetings
-        
+
         _context.last_sync = datetime.now(timezone.utc)
         _context.config = config
 
@@ -436,7 +465,7 @@ def sync_command(args: list[str]) -> int:
         )
 
         print_sync_summary(
-            num_projects=len(projects),
+            num_projects=len(project_names),
             total_tasks=total_tasks,
             incomplete_tasks=incomplete_tasks,
             completed_tasks=completed_tasks,
@@ -819,6 +848,7 @@ def schedule_command(args: list[str]) -> int:
         # Aggregate all tasks
         aggregator = TaskAggregator()
         aggregated_tasks = aggregator.aggregate(_context.projects)
+        _warn_on_conflicts(aggregator)
         task_pool = aggregator.get_task_pool(aggregated_tasks)
 
         # Filter incomplete tasks only
@@ -1053,81 +1083,128 @@ def explain_command(args: list[str]) -> int:
         return 1
 
 
-def documents_command(args: list[str]) -> int:
+def conflicts_command(args: list[str]) -> int:
     """
-    Documents command: List all configured documents.
-    
-    Usage: documents
+    Conflicts command: Show tasks that disagree across sources.
+
+    Usage: conflicts
+
+    A conflict happens when the same task id appears from two or more
+    configured sources (e.g. a Google Docs document and a local file) with
+    different content -- title, duration, deadline, completion state, etc.
+    Conflicted tasks are excluded from `today`/`schedule` until resolved:
+    edit or delete one of the versions shown here (with --source <name>
+    to target a specific source), then re-run `sync`.
     """
     if args:
-        print_error("documents command takes no arguments")
+        print_error("conflicts command takes no arguments")
         return 1
-    
+
+    if not _context.projects:
+        print_warning("No projects loaded. Run 'sync' first.")
+        return 1
+
+    aggregator = TaskAggregator()
+    aggregator.aggregate(_context.projects)
+    conflicts = aggregator.get_conflicts()
+
+    if not conflicts:
+        print_success("No sync conflicts.")
+        return 0
+
+    console.print()
+    console.print(f"[bold]{len(conflicts)} task(s) disagree across sources:[/bold]")
+    console.print()
+
+    for conflict in conflicts:
+        console.print(f"[yellow]Task id: {conflict.task_id}[/yellow]")
+        for version in conflict.versions:
+            label = version.project_context.document_label()
+            console.print(f"  [cyan]{label}[/cyan] ({version.project_context.source})")
+            console.print(f"    title:      {version.task.title}")
+            console.print(f"    duration:   {format_duration(version.task.estimated_duration)}")
+            console.print(f"    completed:  {version.task.completed}")
+            if version.task.deadline_external:
+                console.print(f"    ext. deadline: {version.task.deadline_external}")
+            if version.task.deadline_user:
+                console.print(f"    user deadline: {version.task.deadline_user}")
+        console.print()
+
+    console.print("[dim]Resolve by editing or deleting one version (--source <name> selects the source), then run 'sync'.[/dim]")
+    console.print()
+    return 0
+
+
+def projects_command(args: list[str]) -> int:
+    """
+    Projects command: List all configured projects and their source(s).
+
+    Usage: projects
+    """
+    if args:
+        print_error("projects command takes no arguments")
+        return 1
+
     try:
         from chronix.config import ChronixConfig
-        
+
         config = ChronixConfig.load_or_default()
-        documents = config.google_docs.documents
-        
-        if not documents:
-            print_warning("No documents configured in your config file.")
-            console.print(f"Edit [cyan]{ChronixConfig.get_default_path()}[/cyan] and add document_ids.")
+
+        if not config.projects:
+            print_warning("No projects configured in your config file.")
+            console.print(f"Edit [cyan]{ChronixConfig.get_default_path()}[/cyan] and add projects.")
             return 0
-        
+
         console.print()
-        console.print("[bold]Configured documents:[/bold]")
+        console.print("[bold]Configured projects:[/bold]")
         console.print()
-        
-        # Get document titles from context if available (from previous sync)
-        doc_titles = {}
-        if _context.projects:
-            doc_titles = {
-                p.project_context.document_id: p.project_context.project_name
-                for p in _context.projects
-                if p.project_context.document_id
-            }
-        
-        # Show explicitly ranked documents first (lowest rank number first,
+
+        # Show explicitly ranked projects first (lowest rank number first,
         # i.e. highest priority), then unranked ones in their configured order.
         ranked = sorted(
-            documents,
-            key=lambda d: d.priority if d.priority is not None else float("inf")
+            config.projects,
+            key=lambda p: p.priority if p.priority is not None else float("inf")
         )
 
-        for doc_config in ranked:
-            doc_id = doc_config.document_id
-            title = doc_titles.get(doc_id, "(not synced yet)")
-            priority_str = f"[yellow]P{doc_config.priority}[/yellow] " if doc_config.priority is not None else ""
-            if doc_config.alias:
-                console.print(f"  {priority_str}[cyan]{doc_config.alias}[/cyan] [dim]({doc_id})[/dim]  {title}")
-            else:
-                console.print(f"  {priority_str}[cyan]{doc_id}[/cyan]  {title}")
-        
+        synced_project_ids = {p.project_context.project_id for p in _context.projects}
+
+        for project in ranked:
+            priority_str = f"[yellow]P{project.priority}[/yellow] " if project.priority is not None else ""
+            synced_str = "" if project.name in synced_project_ids else " [dim](not synced yet)[/dim]"
+            console.print(f"  {priority_str}[cyan]{project.label()}[/cyan]{synced_str}")
+            for source in project.sources:
+                source_id = source.document_id if source.type == "google_docs" else source.file_path
+                type_str = "local" if source.type == "local_files" else "google_docs"
+                console.print(f"      [dim]({type_str})[/dim] {source_id}")
+
         console.print()
-        console.print(f"Use [cyan]sync <id|alias> [id|alias ...][/cyan] to sync specific documents")
-        console.print("[dim]Priority (lower = higher) is set per document via `priority` in config.toml.[/dim]")
+        console.print(f"Use [cyan]sync <name> [name ...][/cyan] to sync specific projects")
+        console.print("[dim]Priority (lower = higher) is set per project via `priority` in config.toml.[/dim]")
         console.print()
         return 0
-    
+
     except Exception as e:
-        print_error(f"Failed to list documents: {e}")
+        print_error(f"Failed to list projects: {e}")
         return 1
 
 
-def document_command(args: list[str]) -> int:
+def project_command(args: list[str]) -> int:
     """
-    Document command: Show a document's task list, paginated.
+    Project command: Show a project's task list, paginated.
 
-    Usage: document <id|alias> [--page N] [--per-page N] [--status incomplete|complete|all]
+    Usage: project <name> [--page N] [--per-page N] [--status incomplete|complete|all]
 
-    Defaults to incomplete tasks, 20 per page. Requires the document to
-    already be synced (the REPL syncs at startup; one-shot mode syncs it
-    automatically before running this command).
+    Defaults to incomplete tasks, 20 per page. Shows tasks aggregated across
+    all of the project's sources (see chronix.core.aggregation.TaskAggregator),
+    so a task appearing in only one of two configured sources still shows up
+    here. Requires the project to already be synced (the REPL syncs at
+    startup; one-shot mode syncs it automatically before running this
+    command).
     """
     DEFAULT_PER_PAGE = 20
     VALID_STATUS = ("incomplete", "complete", "all")
 
-    usage = "Usage: document <id|alias> [--page N] [--per-page N] [--status incomplete|complete|all]"
+    usage = "Usage: project <name> [--page N] [--per-page N] [--status incomplete|complete|all]"
 
     page = 1
     per_page = DEFAULT_PER_PAGE
@@ -1173,7 +1250,7 @@ def document_command(args: list[str]) -> int:
         print_error(usage)
         return 1
 
-    doc_token = remaining[0]
+    project_token = remaining[0]
 
     try:
         from chronix.config import ChronixConfig
@@ -1182,25 +1259,27 @@ def document_command(args: list[str]) -> int:
         print_error(f"Failed to load configuration: {e}")
         return 1
 
-    doc_id = _resolve_document_token(doc_token, config)
-    if doc_id is None:
-        print_error(f"Unknown document: '{doc_token}'")
+    project_name = _resolve_project_token(project_token, config)
+    if project_name is None:
+        print_error(f"Unknown project: '{project_token}'")
         return 1
 
-    project = next(
-        (p for p in _context.projects if p.project_context.document_id == doc_id),
-        None
-    )
-    if project is None:
-        print_warning(f"Document not synced yet. Run 'sync {doc_token}' first.")
+    project_todos = [
+        p for p in _context.projects if p.project_context.project_id == project_name
+    ]
+    if not project_todos:
+        print_warning(f"Project not synced yet. Run 'sync {project_token}' first.")
         return 1
 
-    all_tasks = project.tasks
+    aggregator = TaskAggregator()
+    aggregated_tasks = aggregator.aggregate(project_todos)
+    all_tasks = [agg.task for agg in aggregated_tasks]
+
     incomplete_count = sum(1 for t in all_tasks if not t.completed)
     completed_count = len(all_tasks) - incomplete_count
 
     print_document_overview(
-        document_label=project.project_context.document_label(),
+        document_label=project_todos[0].project_context.document_label(),
         total_tasks=len(all_tasks),
         incomplete_count=incomplete_count,
         completed_count=completed_count,
@@ -1228,12 +1307,14 @@ def document_command(args: list[str]) -> int:
 
 def tabs_command(args: list[str]) -> int:
     """
-    Tabs command: List the tabs in a document, for use with add's --tab flag.
+    Tabs command: List the tabs in a project's Google Docs source, for use with add's --tab flag.
 
-    Usage: tabs <id|alias>
+    Usage: tabs <name>
+
+    Only applies to Google Docs sources -- local files have no tab concept.
     """
     if len(args) != 1:
-        print_error("Usage: tabs <id|alias>")
+        print_error("Usage: tabs <name>")
         return 1
 
     doc_token = args[0]
@@ -1245,10 +1326,14 @@ def tabs_command(args: list[str]) -> int:
         print_error(f"Failed to load configuration: {e}")
         return 1
 
-    doc_id = _resolve_document_token(doc_token, config)
-    if doc_id is None:
+    source = config.resolve_source(doc_token)
+    if source is None:
         print_error(f"Unknown document: '{doc_token}'")
         return 1
+    if source.type != "google_docs":
+        print_error(f"'{doc_token}' is a local file, which has no tabs. Tabs only apply to Google Docs sources.")
+        return 1
+    doc_id = source.source_id
 
     try:
         client = _context._ensure_google_client()
@@ -1384,27 +1469,28 @@ def help_command(args: list[str]) -> int:
         ("blocks | blocks pause <label|kind> | blocks resume <label|kind>|all", "List or pause/resume recurring config time blocks for this session"),
         ("calendar [HH:MM] [--force] [--split]", "Sync primary track to Google Calendar; --split also syncs secondary (colored distinctly)"),
         ("config <cmd>", "Manage configuration (init, show, path, validate, reload)"),
-        ("deadline <task_id> <ISO|-> [--user] [--doc <id|alias>]", "Set external deadline; --user sets user deadline instead"),
-        ("deadlines <task_id>|--doc <id|alias>|--all [--dry-run]", "Backfill deadline_computed (exactly one scope required)"),
-        ("delete [<task_id>] [--doc <id|alias>]", "Delete a task; run with no args to be prompted and confirm"),
-        ("documents", "List all configured documents with aliases"),
-        ("document <id|alias> [--page N] [--per-page N] [--status s]", "Show a document's task list, paginated"),
-        ("tabs <id|alias>", "List the tabs in a document (for add's --tab flag)"),
-        ("done [<task_id>] [--doc <id|alias>]", "Complete a task; run with no args to be prompted"),
-        ("pause [<task_id>] [--doc <id|alias>]", "Close the current work session; run with no args to be prompted"),
-        ("resume [<task_id>] [--doc <id|alias>]", "Open a new work session starting now; run with no args to be prompted"),
-        ("duration <task_id> <dur> [--doc <id|alias>]", "Change a task's estimated duration (e.g. 2h, 30m)"),
+        ("conflicts", "Show tasks that disagree across sources, excluded from scheduling until resolved"),
+        ("deadline <task_id> <ISO|-> [--user] [--source <name>]", "Set external deadline; --user sets user deadline instead"),
+        ("deadlines <task_id>|--source <name>|--all [--dry-run]", "Backfill deadline_computed (exactly one scope required)"),
+        ("delete [<task_id>] [--source <name>]", "Delete a task; run with no args to be prompted and confirm"),
+        ("projects", "List all configured projects and their source(s)"),
+        ("project <name> [--page N] [--per-page N] [--status s]", "Show a project's task list, paginated"),
+        ("tabs <name>", "List the tabs in a project's Google Docs source (for add's --tab flag)"),
+        ("done [<task_id>] [--source <name>]", "Complete a task; run with no args to be prompted"),
+        ("pause [<task_id>] [--source <name>]", "Close the current work session; run with no args to be prompted"),
+        ("resume [<task_id>] [--source <name>]", "Open a new work session starting now; run with no args to be prompted"),
+        ("duration <task_id> <dur> [--source <name>]", "Change a task's estimated duration (e.g. 2h, 30m)"),
         ("explain <task_id>", "Show details and scheduling info for a task"),
-        ("meta [<task_id>] [k=v ...] [--remove k] [--doc <id|alias>]", "Set or remove metadata; run with no args to be prompted"),
-        ("mode <task_id> <mode> [--doc <id|alias>]", "Set execution mode (atomic|flex|contiguous_preferred)"),
-        ("track <task_id> <auto|primary|secondary> [--doc <id|alias>]", "Set which timeline (primary/secondary) a task belongs to"),
-        ("rename <task_id> <title> [--doc <id|alias>]", "Rename a task"),
+        ("meta [<task_id>] [k=v ...] [--remove k] [--source <name>]", "Set or remove metadata; run with no args to be prompted"),
+        ("mode <task_id> <mode> [--source <name>]", "Set execution mode (atomic|flex|contiguous_preferred)"),
+        ("track <task_id> <auto|primary|secondary> [--source <name>]", "Set which timeline (primary/secondary) a task belongs to"),
+        ("rename <task_id> <title> [--source <name>]", "Rename a task"),
         ("schedule [days] | <start>-<end> | from <day> [to <count>]", "Display multi-day schedule, a day range, or a forecast from a future day"),
-        ("sync", "Fetch and parse all configured documents"),
-        ("sync <id|alias> [...]", "Sync one or more specific documents by ID or alias"),
+        ("sync", "Fetch and parse all configured projects"),
+        ("sync <name> [...]", "Sync one or more specific projects by name"),
         ("today [HH:MM] [--split]", "Display today's scheduled tasks; --split shows primary/secondary tracks side by side"),
-        ("undone [<task_id>] [--doc <id|alias>]", "Mark a task as incomplete; run with no args to be prompted"),
-        ("update [<task_id>] [flags] [--doc <id|alias>]", "Update fields; run with no args (or id alone) for the interactive form"),
+        ("undone [<task_id>] [--source <name>]", "Mark a task as incomplete; run with no args to be prompted"),
+        ("update [<task_id>] [flags] [--source <name>]", "Update fields; run with no args (or id alone) for the interactive form"),
         ("clear / cls", "Clear the terminal screen"),
         ("help", "Show this help message"),
         ("exit / quit", "Exit the interactive shell"),
@@ -1420,10 +1506,10 @@ def help_command(args: list[str]) -> int:
     console.print("  plain line. Tab/↓ and Shift+Tab/↑ move between form fields, Ctrl+S")
     console.print("  submits, Esc cancels without making changes.")
     console.print()
-    console.print("[bold]--doc resolution:[/bold]")
-    console.print("  In this interactive shell, --doc is optional for task commands once a")
-    console.print("  document has been synced; chronix resolves it from the task's ID automatically.")
-    console.print("  In one-shot mode (chronix <cmd> ...), done/pause/resume require --doc")
+    console.print("[bold]--source resolution:[/bold]")
+    console.print("  In this interactive shell, --source is optional for task commands once a")
+    console.print("  project has been synced; chronix resolves it from the task's ID automatically.")
+    console.print("  In one-shot mode (chronix <cmd> ...), done/pause/resume require --source")
     console.print("  explicitly, since there's no prior sync to resolve it from.")
     console.print()
     console.print("[bold]Configuration:[/bold]")
@@ -1463,16 +1549,22 @@ def _parse_add_duration(value: str) -> timedelta:
 
 def add_command(args: list[str]) -> int:
     """
-    Add command: Create a new task in a Google Docs document.
+    Add command: Create a new task in a project's source.
 
-    Usage: add <duration> <title> [--doc <id|alias>] [--tab <title|id>] [--description <text>]
+    Usage: add <duration> <title> [--source <name>] [--tab <title|id>] [--description <text>]
                 [--external-deadline <ISO>] [--user-deadline <ISO>] [--mode <mode>]
                 [--track <auto|primary|secondary>] [--ref <ref>] [--deps <ref1,ref2,...>]
 
     Duration examples: 2h, 30m, 2hours, 30minutes
 
+    --source selects a project's source (its Google Docs document or local
+    file); required when a project has both. There's no auto-detection
+    here (unlike edit commands), since a brand-new task has no existing
+    location to detect from.
+
     Without --tab, the task is inserted into the first tab that has a
-    TASKS section (matching prior behavior).
+    TASKS section (matching prior behavior). --tab only applies to a
+    google_docs source.
 
     --description inserts the given text as an indented block immediately
     below the task line (a Tab-indented paragraph in Google Docs), separate
@@ -1490,7 +1582,7 @@ def add_command(args: list[str]) -> int:
     if not args:
         return _add_command_interactive()
 
-    doc_token: Optional[str] = None
+    source_token: Optional[str] = None
     tab_token: Optional[str] = None
     description: Optional[str] = None
     external_deadline_str: Optional[str] = None
@@ -1507,8 +1599,8 @@ def add_command(args: list[str]) -> int:
     while i < len(args):
         arg = args[i]
         has_value = i + 1 < len(args) and not (args[i + 1].startswith("--") and len(args[i + 1]) > 2)
-        if arg == "--doc":
-            doc_token = args[i + 1] if has_value else prompt_value("Document (id or alias)")
+        if arg == "--source":
+            source_token = args[i + 1] if has_value else prompt_value("Source (project name)")
             i += 2 if has_value else 1
         elif arg == "--tab":
             tab_token = args[i + 1] if has_value else prompt_value("Tab (title or ID)")
@@ -1576,35 +1668,32 @@ def add_command(args: list[str]) -> int:
         print_error(str(e))
         return 1
 
-    all_doc_ids = config.google_docs.document_ids
-    if not all_doc_ids:
-        print_error("No documents configured. Run 'chronix config init' to set up.")
+    all_sources = config.all_sources()
+    if not all_sources:
+        print_error("No sources configured. Run 'chronix config init' to set up.")
         return 1
 
-    if doc_token is not None:
-        doc_id = _resolve_document_token(doc_token, config)
-        if doc_id is None:
-            print_error(f"Unknown document: '{doc_token}'")
+    if source_token is not None:
+        source = config.resolve_source(source_token)
+        if source is None:
+            print_error(f"Unknown source: '{source_token}'")
             return 1
-    elif len(all_doc_ids) == 1:
-        doc_id = all_doc_ids[0]
+    elif len(all_sources) == 1:
+        source = all_sources[0]
     else:
-        print_error("Multiple documents configured. Specify one with --doc <id|alias>")
-        for doc in config.google_docs.documents:
-            label = f"{doc.alias} ({doc.document_id})" if doc.alias else doc.document_id
-            console.print(f"  [cyan]{label}[/cyan]")
+        print_error("Multiple sources configured. Specify one with --source <name>")
+        for s in all_sources:
+            console.print(f"  [cyan]{s.label()}[/cyan]")
         return 1
 
     from chronix.core.models import generate_task_id
     from chronix.core.writer import NewTask
-    from chronix.integrations.google_docs.writer import GoogleDocsTaskWriter
 
     try:
-        client = _context._ensure_google_client()
-        writer = GoogleDocsTaskWriter(auth_strategy=client.auth_strategy, tz=tz)
+        writer = _get_task_writer(tz, source_type=source.type)
         task_id = generate_task_id()
         writer.create_task(
-            doc_id,
+            source.source_id,
             NewTask(
                 title=title,
                 duration=duration,
@@ -1619,7 +1708,7 @@ def add_command(args: list[str]) -> int:
                 depends=deps,
             ),
         )
-        _resync_document(doc_id, config)
+        _resync_project_sources(source.project_name, config)
         print_success(f"Task added: {title} ({duration_str}) [id={task_id}]")
         return 0
     except Exception as e:
@@ -1630,17 +1719,19 @@ def add_command(args: list[str]) -> int:
 def _add_command_interactive() -> int:
     """Full-screen interactive form for creating a task, invoked by `add` with no args.
 
-    Resolves the target document/tab up front (same rules as the flagged
-    path: single configured doc auto-selected, multiple requires --doc
-    equivalent handled via prompt), then opens the shared TaskForm with every
-    field starting empty. Submitting creates the task; cancelling (Escape)
-    aborts with no changes made.
+    Resolves the target project/source/tab up front (same rules as the
+    flagged path: a single configured source auto-selected, multiple
+    requires a choice), then opens the shared TaskForm with every field
+    starting empty. When more than one source is configured, the project is
+    chosen first, and then, only if that project itself has two sources,
+    the source picker is scoped to that project's own sources rather than
+    every source in config. Submitting creates the task; cancelling
+    (Escape) aborts with no changes made.
     """
     from chronix.core.metadata import parse_deadline
     from chronix.core.models import generate_task_id
     from chronix.core.todo import TaskParser
     from chronix.core.writer import NewTask
-    from chronix.integrations.google_docs.writer import GoogleDocsTaskWriter
     from chronix.cli.interactive_form import TaskForm, build_task_form_fields
     from chronix.cli.interactive_prompts import prompt_value
 
@@ -1651,26 +1742,42 @@ def _add_command_interactive() -> int:
         print_error(f"Failed to load configuration: {e}")
         return 1
 
-    all_doc_ids = config.google_docs.document_ids
-    if not all_doc_ids:
-        print_error("No documents configured. Run 'chronix config init' to set up.")
+    all_sources = config.all_sources()
+    if not all_sources:
+        print_error("No sources configured. Run 'chronix config init' to set up.")
         return 1
 
-    if len(all_doc_ids) == 1:
-        doc_id = all_doc_ids[0]
+    if len(all_sources) == 1:
+        source = all_sources[0]
     else:
-        labels = [
-            (doc.alias or doc.document_id) for doc in config.google_docs.documents
-        ]
-        console.print("[cyan]Multiple documents configured:[/cyan] " + ", ".join(labels))
-        doc_token = prompt_value("Document (id or alias)")
-        if not doc_token:
-            print_warning("Cancelled: a document is required.")
+        project_labels = [p.label() for p in config.projects if p.sources]
+        console.print("[cyan]Configured projects:[/cyan] " + ", ".join(project_labels))
+        project_token = prompt_value("Project (name)")
+        if not project_token:
+            print_warning("Cancelled: a project is required.")
             return 1
-        doc_id = _resolve_document_token(doc_token, config)
-        if doc_id is None:
-            print_error(f"Unknown document: '{doc_token}'")
+        project = config.find_project(project_token)
+        if project is None:
+            print_error(f"Unknown project: '{project_token}'")
             return 1
+        project_sources = config.sources_for_project(project.name)
+        if not project_sources:
+            print_error(f"Project '{project.name}' has no sources configured.")
+            return 1
+        if len(project_sources) == 1:
+            source = project_sources[0]
+        else:
+            labels = [s.label() for s in project_sources]
+            console.print("[cyan]This project has two sources:[/cyan] " + ", ".join(labels))
+            source_token = prompt_value("Source (project name)")
+            if not source_token:
+                print_warning("Cancelled: a source is required.")
+                return 1
+            resolved = config.resolve_source(source_token)
+            source = resolved if resolved in project_sources else None
+            if source is None:
+                print_error(f"Unknown source: '{source_token}'")
+                return 1
 
     fields = build_task_form_fields(include_tab_field=True)
     form = TaskForm(title="Add Task", fields=fields)
@@ -1698,11 +1805,10 @@ def _add_command_interactive() -> int:
         return 1
 
     try:
-        client = _context._ensure_google_client()
-        writer = GoogleDocsTaskWriter(auth_strategy=client.auth_strategy, tz=tz)
+        writer = _get_task_writer(tz, source_type=source.type)
         task_id = generate_task_id()
         writer.create_task(
-            doc_id,
+            source.source_id,
             NewTask(
                 title=result["title"],
                 duration=duration,
@@ -1717,7 +1823,7 @@ def _add_command_interactive() -> int:
                 depends=result["deps"].strip() or None,
             ),
         )
-        _resync_document(doc_id, config)
+        _resync_project_sources(source.project_name, config)
         print_success(f"Task added: {result['title']} [id={task_id}]")
         return 0
     except Exception as e:
@@ -1841,46 +1947,69 @@ def _display_continuous_timeline(day_schedule, work_start: datetime, work_end: d
 # ---------------------------------------------------------------------------
 
 
-def _get_task_writer(tz: ZoneInfo):
-    from chronix.integrations.google_docs.writer import GoogleDocsTaskWriter
-    client = _context._ensure_google_client()
-    return GoogleDocsTaskWriter(auth_strategy=client.auth_strategy, tz=tz)
+def _get_task_writer(tz: ZoneInfo, source_type: str = "google_docs"):
+    """Return a TaskWriter for the given source type.
 
-
-def _resync_document(doc_id: str, config) -> None:
-    """Refresh in-memory task state for a single document after a write.
-
-    Keeps `_context.projects` consistent with the document just written to,
-    so a task just created or edited is immediately visible to subsequent
-    commands without requiring an explicit `sync`. Never raises: a refresh
-    failure here must not be mistaken for the write itself failing.
+    For google_docs, this reuses the shared authenticated client (so a
+    single OAuth flow serves every write in the session); local_files needs
+    no client/auth at all. Defaults to google_docs so every pre-existing
+    call site that hasn't been updated to pass source_type keeps working
+    unchanged.
     """
-    from chronix.cli.sync_helpers import _sync_single_document_with_retries
-
-    try:
+    from chronix.integrations.factory import get_writer, get_writer_for_client
+    if source_type == "google_docs":
         client = _context._ensure_google_client()
-        alias = config.google_docs.get_alias(doc_id)
-        priority = config.google_docs.get_priority(doc_id)
-        result, project, _meetings = _sync_single_document_with_retries(
-            doc_id, client, alias=alias, priority=priority, tz=_configured_tz(config)
-        )
-    except Exception:
-        print_warning("Could not refresh local state for this document. Run 'sync' to pick up the change.")
+        return get_writer_for_client(source_type, client, tz=tz)
+    return get_writer(source_type, tz=tz)
+
+
+def _resync_project_sources(project_name: str, config) -> None:
+    """Refresh in-memory task state for every source of a project after a write.
+
+    A project with two sources needs both refreshed together after any write
+    to either one: merge/conflict logic in TaskAggregator.aggregate only sees
+    what's currently in `_context.projects`, so leaving the other source
+    stale would let a real conflict go undetected until the next full sync.
+    Never raises: a refresh failure here must not be mistaken for the write
+    itself failing.
+    """
+    from chronix.cli.sync_helpers import _sync_single_source_with_retries
+    from chronix.integrations.factory import get_client
+
+    sources = config.sources_for_project(project_name)
+    if not sources:
+        print_warning("Could not refresh local state: project is no longer configured. Run 'sync' to pick up the change.")
         return
 
-    if result.outcome.value != "success":
-        print_warning("Could not refresh local state for this document. Run 'sync' to pick up the change.")
+    refreshed = []
+    for source in sources:
+        try:
+            client = _context._ensure_google_client() if source.type == "google_docs" else get_client(source)
+            result, project, _meetings = _sync_single_source_with_retries(
+                source, client, tz=_configured_tz(config)
+            )
+        except Exception:
+            print_warning(f"Could not refresh local state for {source.label()}. Run 'sync' to pick up the change.")
+            continue
+
+        if result.outcome.value != "success":
+            print_warning(f"Could not refresh local state for {source.label()}. Run 'sync' to pick up the change.")
+            continue
+
+        refreshed.append(project)
+
+    if not refreshed:
         return
 
     _context.projects = [
-        p for p in _context.projects if p.project_context.document_id != doc_id
-    ] + [project]
+        p for p in _context.projects if p.project_context.project_id != project_name
+    ] + refreshed
     _context.last_sync = datetime.now(timezone.utc)
     _context.config = config
 
 
-def _find_document_for_task(task_id: str) -> Optional[str]:
-    """Return the document_id of the currently-synced project containing task_id.
+def _find_project_for_task(task_id: str) -> Optional[str]:
+    """Return the project_name of the currently-synced project containing task_id.
 
     Only looks at in-memory `_context.projects`, so this is only useful after
     a sync has populated it (e.g. the REPL's startup sync, or a preceding
@@ -1889,37 +2018,67 @@ def _find_document_for_task(task_id: str) -> Optional[str]:
     for project in _context.projects:
         for task in project.tasks:
             if task.id == task_id:
-                return project.project_context.document_id
+                return project.project_context.project_name
     return None
 
 
-def _resolve_edit_doc(task_id: str, doc_token: Optional[str], config) -> Optional[str]:
-    all_doc_ids = config.google_docs.document_ids
-    if not all_doc_ids:
-        return None
-    if doc_token is not None:
-        return _resolve_document_token(doc_token, config)
-    found = _find_document_for_task(task_id)
+def _find_source_for_task(task_id: str, config) -> Optional['SourceRef']:
+    """Find which of a task's project's sources actually contains task_id.
+
+    A task belongs to exactly one source even when its project has two (see
+    chronix.core.aggregation.TaskAggregator.aggregate: cross-source entries
+    merge by id, they don't fan out from one source into the other). This
+    searches `_context.projects` -- which holds one ProjectTodoList per
+    source -- for the specific ProjectTodoList whose own tasks include
+    task_id, then resolves that source's SourceRef from config.
+    """
+    for project_todo in _context.projects:
+        if any(t.id == task_id for t in project_todo.tasks):
+            return next(
+                (
+                    s for s in config.sources_for_project(project_todo.project_context.project_id)
+                    if s.type == project_todo.project_context.source
+                ),
+                None,
+            )
+    return None
+
+
+def _resolve_edit_source(task_id: str, source_token: Optional[str], config) -> Optional['SourceRef']:
+    """Resolve the source a task-editing command should write to.
+
+    With an explicit --source token, that source wins outright. Otherwise,
+    auto-detect by searching the task's project's sources for whichever one
+    actually holds task_id (see _find_source_for_task) -- this is the
+    settled default for edit commands, since the task's existing location is
+    unambiguous and doesn't need the user to specify it. Falls back to the
+    single configured source if there's only one and detection found
+    nothing (e.g. a task not yet synced into context).
+    """
+    if source_token is not None:
+        return config.resolve_source(source_token)
+    found = _find_source_for_task(task_id, config)
     if found is not None:
         return found
-    if len(all_doc_ids) == 1:
-        return all_doc_ids[0]
+    all_sources = config.all_sources()
+    if len(all_sources) == 1:
+        return all_sources[0]
     return None
 
 
 def _parse_edit_flags(args: list[str]) -> tuple[Optional[str], list[str]]:
-    """Extract --doc <token> from args. Returns (doc_token, remaining_args)."""
-    doc_token: Optional[str] = None
+    """Extract --source <token> from args. Returns (source_token, remaining_args)."""
+    source_token: Optional[str] = None
     remaining: list[str] = []
     i = 0
     while i < len(args):
-        if args[i] == "--doc" and i + 1 < len(args):
-            doc_token = args[i + 1]
+        if args[i] == "--source" and i + 1 < len(args):
+            source_token = args[i + 1]
             i += 2
         else:
             remaining.append(args[i])
             i += 1
-    return doc_token, remaining
+    return source_token, remaining
 
 
 def _reject_flag_as_task_id(task_id: str, usage: str) -> bool:
@@ -1937,7 +2096,7 @@ def _reject_flag_as_task_id(task_id: str, usage: str) -> bool:
     return False
 
 
-def _run_task_update(task_id: str, update, doc_token: Optional[str] = None) -> int:
+def _run_task_update(task_id: str, update, source_token: Optional[str] = None) -> int:
     from chronix.core.writer import TaskNotFoundError
     try:
         from chronix.config import ChronixConfig
@@ -1946,21 +2105,20 @@ def _run_task_update(task_id: str, update, doc_token: Optional[str] = None) -> i
         print_error(f"Failed to load configuration: {e}")
         return 1
 
-    doc_id = _resolve_edit_doc(task_id, doc_token, config)
-    if doc_id is None:
-        if not config.google_docs.document_ids:
-            print_error("No documents configured.")
+    source = _resolve_edit_source(task_id, source_token, config)
+    if source is None:
+        if not config.all_sources():
+            print_error("No sources configured.")
         else:
-            print_error("Multiple documents configured. Specify one with --doc <id|alias>")
-            for doc in config.google_docs.documents:
-                label = f"{doc.alias} ({doc.document_id})" if doc.alias else doc.document_id
-                console.print(f"  [cyan]{label}[/cyan]")
+            print_error("Multiple sources configured for this task's project. Specify one with --source <name>")
+            for s in config.all_sources():
+                console.print(f"  [cyan]{s.label()}[/cyan]")
         return 1
 
     try:
-        writer = _get_task_writer(_configured_tz(config))
-        writer.update_task(doc_id, task_id, update)
-        _resync_document(doc_id, config)
+        writer = _get_task_writer(_configured_tz(config), source_type=source.type)
+        writer.update_task(source.source_id, task_id, update)
+        _resync_project_sources(source.project_name, config)
         return 0
     except TaskNotFoundError:
         print_error(f"No task with id='{task_id}' found.")
@@ -2091,7 +2249,7 @@ def update_command(args: list[str]) -> int:
                             [--mode <mode>] [--ref <ref>|-] [--deps <ref1,ref2,...>|-]
                             [--meta <key=value> ...]
                             [--remove-meta <key> ...]
-                            [--doc <id|alias>]
+                            [--source <name>]
 
     At least one field flag must be supplied when task_id and flags are both
     given. Called as `update` alone, prompts for a task_id then opens a
@@ -2107,7 +2265,7 @@ def update_command(args: list[str]) -> int:
 
     VALID_FLAGS = (
         "--title", "--duration", "--description", "--external-deadline", "--user-deadline",
-        "--mode", "--track", "--ref", "--deps", "--meta", "--remove-meta", "--doc",
+        "--mode", "--track", "--ref", "--deps", "--meta", "--remove-meta", "--source",
     )
 
     usage = (
@@ -2116,7 +2274,7 @@ def update_command(args: list[str]) -> int:
         "[--external-deadline <ISO|->] [--user-deadline <ISO|->] [--mode <mode>] "
         "[--track <auto|primary|secondary>] "
         "[--ref <ref>|-] [--deps <ref1,ref2,...>|-] [--meta key=value ...] "
-        "[--remove-meta key ...] [--doc <id|alias>]"
+        "[--remove-meta key ...] [--source <name>]"
     )
 
     if not args:
@@ -2257,11 +2415,11 @@ def rename_command(args: list[str]) -> int:
     """
     Rename command: Change the title of a task.
 
-    Usage: rename <task_id> <new title> [--doc <id|alias>]
+    Usage: rename <task_id> <new title> [--source <name>]
     """
     from chronix.core.writer import TaskUpdate
 
-    usage = "Usage: rename <task_id> <new title> [--doc <id|alias>]"
+    usage = "Usage: rename <task_id> <new title> [--source <name>]"
     doc_token, remaining = _parse_edit_flags(args)
     if len(remaining) < 2:
         print_error(usage)
@@ -2282,14 +2440,14 @@ def duration_command(args: list[str]) -> int:
     """
     Duration command: Update the estimated duration of a task.
 
-    Usage: duration <task_id> <duration> [--doc <id|alias>]
+    Usage: duration <task_id> <duration> [--source <name>]
 
     Duration examples: 2h, 30m, 2hours, 30minutes
     """
     from chronix.core.metadata import parse_duration
     from chronix.core.writer import TaskUpdate
 
-    usage = "Usage: duration <task_id> <duration> [--doc <id|alias>]"
+    usage = "Usage: duration <task_id> <duration> [--source <name>]"
     doc_token, remaining = _parse_edit_flags(args)
     if len(remaining) < 2:
         print_error(usage)
@@ -2324,7 +2482,7 @@ def deadline_command(args: list[str]) -> int:
     """
     Deadline command: Set the external or user deadline of a task.
 
-    Usage: deadline <task_id> <ISO-date|-> [--user] [--doc <id|alias>]
+    Usage: deadline <task_id> <ISO-date|-> [--user] [--source <name>]
 
     Without --user, updates external_deadline.
     With --user, updates user_deadline.
@@ -2337,7 +2495,7 @@ def deadline_command(args: list[str]) -> int:
     args = [a for a in args if a != "--user"]
     doc_token, remaining = _parse_edit_flags(args)
 
-    usage = "Usage: deadline <task_id> <ISO-date|-> [--user] [--doc <id|alias>]"
+    usage = "Usage: deadline <task_id> <ISO-date|-> [--user] [--source <name>]"
     if len(remaining) < 2:
         print_error(usage)
         return 1
@@ -2378,12 +2536,12 @@ def deadlines_command(args: list[str]) -> int:
     Deadlines command: Backfill deadline_computed for tasks with no real deadline.
 
     Usage: deadlines <task_id> [--dry-run]
-           deadlines --doc <id|alias> [--dry-run]
+           deadlines --source <name> [--dry-run]
            deadlines --all [--dry-run]
 
     Exactly one scope must be given:
     - <task_id>: backfill only that task.
-    - --doc <id|alias>: backfill every eligible task in that document.
+    - --source <name>: backfill every eligible task in that document.
     - --all: backfill every eligible task across all synced projects.
 
     There is no bulk default: a task with no deadline may simply not have
@@ -2406,7 +2564,7 @@ def deadlines_command(args: list[str]) -> int:
     from chronix.core.metadata import KEY_DEADLINE_COMPUTED, serialize_deadline
     from chronix.core.writer import TaskUpdate
 
-    usage = "Usage: deadlines <task_id> | --doc <id|alias> | --all [--dry-run]"
+    usage = "Usage: deadlines <task_id> | --source <name> | --all [--dry-run]"
 
     dry_run = "--dry-run" in args
     args = [a for a in args if a != "--dry-run"]
@@ -2429,7 +2587,7 @@ def deadlines_command(args: list[str]) -> int:
         console.print("[dim]Specify a single task, a document with --doc, or --all for the whole backlog.[/dim]")
         return 1
     if scopes_given > 1:
-        print_error("Specify only one of: <task_id>, --doc <id|alias>, --all")
+        print_error("Specify only one of: <task_id>, --source <name>, --all")
         return 1
 
     task_id = remaining[0] if remaining else None
@@ -2453,11 +2611,11 @@ def deadlines_command(args: list[str]) -> int:
         print_error(f"Task with ID '{task_id}' not found.")
         return 1
 
-    doc_id = None
+    source = None
     if doc_token is not None:
-        doc_id = _resolve_document_token(doc_token, config)
-        if doc_id is None:
-            print_error(f"Unknown document: '{doc_token}'")
+        source = config.resolve_source(doc_token)
+        if source is None:
+            print_error(f"Unknown source: '{doc_token}'")
             return 1
 
     now = datetime.now(timezone.utc)
@@ -2465,13 +2623,13 @@ def deadlines_command(args: list[str]) -> int:
 
     if task_id is not None:
         results = [r for r in results if r.task.id == task_id]
-    elif doc_id is not None:
-        doc_task_ids = {
+    elif source is not None:
+        source_task_ids = {
             t.id for p in _context.projects
-            if p.project_context.document_id == doc_id
+            if p.project_context.project_id == source.project_name
             for t in p.tasks
         }
-        results = [r for r in results if r.task.id in doc_task_ids]
+        results = [r for r in results if r.task.id in source_task_ids]
     # --all: no further filtering
 
     if not results:
@@ -2516,14 +2674,14 @@ def mode_command(args: list[str]) -> int:
     """
     Mode command: Set the execution mode of a task.
 
-    Usage: mode <task_id> <atomic|flex|contiguous_preferred> [--doc <id|alias>]
+    Usage: mode <task_id> <atomic|flex|contiguous_preferred> [--source <name>]
     """
     from chronix.core.writer import TaskUpdate
 
     VALID_MODES = {"atomic", "flex", "contiguous_preferred"}
     doc_token, remaining = _parse_edit_flags(args)
 
-    usage = "Usage: mode <task_id> <atomic|flex|contiguous_preferred> [--doc <id|alias>]"
+    usage = "Usage: mode <task_id> <atomic|flex|contiguous_preferred> [--source <name>]"
     if len(remaining) < 2:
         print_error(usage)
         return 1
@@ -2547,7 +2705,7 @@ def track_command(args: list[str]) -> int:
     """
     Track command: Set which independently-scheduled timeline a task belongs to.
 
-    Usage: track <task_id> <auto|primary|secondary> [--doc <id|alias>]
+    Usage: track <task_id> <auto|primary|secondary> [--source <name>]
 
     "auto" clears any explicit override and lets chronix infer the track from
     the task's execution mode and duration at scheduling time (see
@@ -2559,7 +2717,7 @@ def track_command(args: list[str]) -> int:
     VALID_TRACKS = {"auto", "primary", "secondary"}
     doc_token, remaining = _parse_edit_flags(args)
 
-    usage = "Usage: track <task_id> <auto|primary|secondary> [--doc <id|alias>]"
+    usage = "Usage: track <task_id> <auto|primary|secondary> [--source <name>]"
     if len(remaining) < 2:
         print_error(usage)
         return 1
@@ -2622,7 +2780,7 @@ def done_command(args: list[str]) -> int:
     and marks the task complete. If no sessions exist and a calendar event
     is found, a session from the calendar start to now is recorded.
 
-    Usage: done <task_id> [--doc <id|alias>]
+    Usage: done <task_id> [--source <name>]
 
     Called with no arguments, prompts for a task_id.
     """
@@ -2637,7 +2795,7 @@ def done_command(args: list[str]) -> int:
     )
     from chronix.cli.interactive_prompts import prompt_task_id
 
-    usage = "Usage: done <task_id> [--doc <id|alias>]"
+    usage = "Usage: done <task_id> [--source <name>]"
     doc_token, remaining = _parse_edit_flags(args)
 
     if not remaining:
@@ -2698,7 +2856,7 @@ def pause_command(args: list[str]) -> int:
     session start time. Subsequent pauses use the active_since timestamp
     set by resume.
 
-    Usage: pause <task_id> [--doc <id|alias>]
+    Usage: pause <task_id> [--source <name>]
 
     Called with no arguments, prompts for a task_id.
     """
@@ -2711,7 +2869,7 @@ def pause_command(args: list[str]) -> int:
     )
     from chronix.cli.interactive_prompts import prompt_task_id
 
-    usage = "Usage: pause <task_id> [--doc <id|alias>]"
+    usage = "Usage: pause <task_id> [--source <name>]"
     doc_token, remaining = _parse_edit_flags(args)
 
     if not remaining:
@@ -2780,7 +2938,7 @@ def pause_command(args: list[str]) -> int:
             return 1
 
         if choice.lower() == "done":
-            done_args = [task_id] + (["--doc", doc_token] if doc_token else [])
+            done_args = [task_id] + (["--source", doc_token] if doc_token else [])
             return done_command(done_args)
 
         new_duration = parse_duration(choice)
@@ -2808,7 +2966,7 @@ def resume_command(args: list[str]) -> int:
     """
     Resume command: Begin a new work session starting at the current time.
 
-    Usage: resume <task_id> [--doc <id|alias>]
+    Usage: resume <task_id> [--source <name>]
 
     Called with no arguments, prompts for a task_id.
     """
@@ -2816,7 +2974,7 @@ def resume_command(args: list[str]) -> int:
     from chronix.core.metadata import KEY_ACTIVE_SINCE, serialize_active_since
     from chronix.cli.interactive_prompts import prompt_task_id
 
-    usage = "Usage: resume <task_id> [--doc <id|alias>]"
+    usage = "Usage: resume <task_id> [--source <name>]"
     doc_token, remaining = _parse_edit_flags(args)
 
     if not remaining:
@@ -2857,14 +3015,14 @@ def undone_command(args: list[str]) -> int:
     """
     Undone command: Mark a task as incomplete.
 
-    Usage: undone <task_id> [--doc <id|alias>]
+    Usage: undone <task_id> [--source <name>]
 
     Called with no arguments, prompts for a task_id.
     """
     from chronix.core.writer import TaskUpdate
     from chronix.cli.interactive_prompts import prompt_task_id
 
-    usage = "Usage: undone <task_id> [--doc <id|alias>]"
+    usage = "Usage: undone <task_id> [--source <name>]"
     doc_token, remaining = _parse_edit_flags(args)
 
     if not remaining:
@@ -2942,7 +3100,7 @@ def meta_command(args: list[str]) -> int:
     """
     Meta command: Set or remove arbitrary metadata fields on a task.
 
-    Usage: meta <task_id> [key=value ...] [--remove key ...] [--doc <id|alias>]
+    Usage: meta <task_id> [key=value ...] [--remove key ...] [--source <name>]
 
     Examples:
         meta abc123 priority=high area=work
@@ -2954,7 +3112,7 @@ def meta_command(args: list[str]) -> int:
     from chronix.core.writer import TaskUpdate
     from chronix.cli.interactive_prompts import prompt_task_id
 
-    usage = "Usage: meta <task_id> [key=value ...] [--remove key ...] [--doc <id|alias>]"
+    usage = "Usage: meta <task_id> [key=value ...] [--remove key ...] [--source <name>]"
 
     doc_token, remaining = _parse_edit_flags(args)
 
@@ -3002,9 +3160,9 @@ def meta_command(args: list[str]) -> int:
 
 def delete_command(args: list[str]) -> int:
     """
-    Delete command: Remove a task from its document.
+    Delete command: Remove a task from its source.
 
-    Usage: delete <task_id> [--doc <id|alias>]
+    Usage: delete <task_id> [--source <name>]
 
     Called with no arguments, prompts for a task_id, shows the task, and
     asks for confirmation before deleting.
@@ -3012,8 +3170,8 @@ def delete_command(args: list[str]) -> int:
     from chronix.core.writer import TaskNotFoundError
     from chronix.cli.interactive_prompts import confirm, prompt_task_id
 
-    usage = "Usage: delete <task_id> [--doc <id|alias>]"
-    doc_token, remaining = _parse_edit_flags(args)
+    usage = "Usage: delete <task_id> [--source <name>]"
+    source_token, remaining = _parse_edit_flags(args)
 
     if not remaining:
         task_id = prompt_task_id("delete")
@@ -3038,21 +3196,20 @@ def delete_command(args: list[str]) -> int:
         print_error(f"Failed to load configuration: {e}")
         return 1
 
-    doc_id = _resolve_edit_doc(task_id, doc_token, config)
-    if doc_id is None:
-        if not config.google_docs.document_ids:
-            print_error("No documents configured.")
+    source = _resolve_edit_source(task_id, source_token, config)
+    if source is None:
+        if not config.all_sources():
+            print_error("No sources configured.")
         else:
-            print_error("Multiple documents configured. Specify one with --doc <id|alias>")
-            for doc in config.google_docs.documents:
-                label = f"{doc.alias} ({doc.document_id})" if doc.alias else doc.document_id
-                console.print(f"  [cyan]{label}[/cyan]")
+            print_error("Multiple sources configured for this task's project. Specify one with --source <name>")
+            for s in config.all_sources():
+                console.print(f"  [cyan]{s.label()}[/cyan]")
         return 1
 
     try:
-        writer = _get_task_writer(_configured_tz(config))
-        writer.delete_task(doc_id, task_id)
-        _resync_document(doc_id, config)
+        writer = _get_task_writer(_configured_tz(config), source_type=source.type)
+        writer.delete_task(source.source_id, task_id)
+        _resync_project_sources(source.project_name, config)
         print_success(f"Task '{task_id}' deleted.")
         return 0
     except TaskNotFoundError:

@@ -6,10 +6,10 @@ missing required field is returned as a structured `missing_fields_error`
 (see chronix.mcp.errors) rather than prompted for, so the calling model can
 ask the user and retry the call with the field filled in.
 
-Each write here refreshes the affected document in `_context` immediately
-after writing (mirroring `chronix.cli.commands._resync_document`), so a
-`document`/`explain`/`today` call right after reflects the change without a
-separate `sync`.
+Each write here refreshes the affected project's source(s) in `_context`
+immediately after writing (mirroring `chronix.cli.commands._resync_project_sources`),
+so a `document`/`explain`/`today` call right after reflects the change
+without a separate `sync`.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -22,9 +22,8 @@ from chronix.cli.commands import (
     _find_task_in_context,
     _get_calendar_task_start,
     _get_task_writer,
-    _resolve_document_token,
-    _resolve_edit_doc,
-    _resync_document,
+    _resolve_edit_source,
+    _resync_project_sources,
 )
 from chronix.core.metadata import parse_deadline, parse_duration
 from chronix.core.models import WorkSession, generate_task_id
@@ -54,18 +53,18 @@ def _load_config():
     return _context.config or ChronixConfig.load_or_default()
 
 
-def _resolve_write_document(document_token: Optional[str], config) -> Optional[str]:
-    """Resolve the target document for `add`, honoring a single configured document as default."""
-    if document_token is not None:
-        return _resolve_document_token(document_token, config)
-    all_doc_ids = config.google_docs.document_ids
-    return all_doc_ids[0] if len(all_doc_ids) == 1 else None
+def _resolve_write_source(source_token: Optional[str], config):
+    """Resolve the target source for `add`, honoring a single configured source as default."""
+    if source_token is not None:
+        return config.resolve_source(source_token)
+    all_sources = config.all_sources()
+    return all_sources[0] if len(all_sources) == 1 else None
 
 
 def add_task(
     duration: str,
     title: str,
-    document_token: Optional[str] = None,
+    source_token: Optional[str] = None,
     tab: Optional[str] = None,
     description: Optional[str] = None,
     external_deadline: Optional[str] = None,
@@ -75,14 +74,15 @@ def add_task(
     ref: Optional[str] = None,
     depends: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Create a new task in a Google Docs document.
+    """Create a new task in a project's source.
 
     `duration` accepts forms like "2h", "30m", "2hours", "30minutes".
-    `document_token` (id or alias) is required unless exactly one document is
-    configured. `tab` selects the tab by title or ID; without it, the task
-    goes into the first tab with a TASKS section. `external_deadline` and
-    `user_deadline` are ISO-8601. `mode` is one of atomic/flex/
-    contiguous_preferred; `track` is one of auto/primary/secondary.
+    `source_token` (a project name) is required unless exactly one source is
+    configured across all projects. `tab` selects the
+    tab by title or ID and only applies to a google_docs source; without
+    it, the task goes into the first tab with a TASKS section.
+    `external_deadline` and `user_deadline` are ISO-8601. `mode` is one of
+    atomic/flex/contiguous_preferred; `track` is one of auto/primary/secondary.
     """
     try:
         parsed_duration = parse_duration(duration)
@@ -108,26 +108,26 @@ def add_task(
     except ValueError as e:
         return validation_error(str(e))
 
-    if not config.google_docs.document_ids:
-        return validation_error("No documents configured. Run 'chronix config init' to set up.")
+    if not config.all_sources():
+        return validation_error("No sources configured. Run 'chronix config init' to set up.")
 
-    doc_id = _resolve_write_document(document_token, config)
-    if doc_id is None:
-        if document_token is not None:
-            return not_found_error("document", document_token)
+    source = _resolve_write_source(source_token, config)
+    if source is None:
+        if source_token is not None:
+            return not_found_error("source", source_token)
         return missing_fields_error(
             "add_task",
             [{
-                "field": "document_token",
-                "description": "Multiple documents are configured; specify which one by id or alias.",
+                "field": "source_token",
+                "description": "Multiple sources are configured; specify which one by project name.",
             }],
         )
 
     try:
-        writer = _get_task_writer(tz)
+        writer = _get_task_writer(tz, source_type=source.type)
         task_id = generate_task_id()
         writer.create_task(
-            doc_id,
+            source.source_id,
             NewTask(
                 title=title,
                 duration=parsed_duration,
@@ -142,45 +142,41 @@ def add_task(
                 depends=depends,
             ),
         )
-        _resync_document(doc_id, config)
+        _resync_project_sources(source.project_name, config)
     except Exception as e:
         return command_error(f"Failed to add task: {e}")
 
-    return {"ok": True, "task_id": task_id, "title": title, "document_id": doc_id}
+    return {"ok": True, "task_id": task_id, "title": title, "source_id": source.source_id, "project_name": source.project_name}
 
 
-def _resolve_document_for_edit(task_id: str, document_token: Optional[str], config) -> Optional[str]:
-    return _resolve_edit_doc(task_id, document_token, config)
-
-
-def _apply_update(command: str, task_id: str, update: TaskUpdate, document_token: Optional[str], config) -> dict[str, Any]:
-    doc_id = _resolve_document_for_edit(task_id, document_token, config)
-    if doc_id is None:
-        if not config.google_docs.document_ids:
-            return validation_error("No documents configured.")
+def _apply_update(command: str, task_id: str, update: TaskUpdate, source_token: Optional[str], config) -> dict[str, Any]:
+    source = _resolve_edit_source(task_id, source_token, config)
+    if source is None:
+        if not config.all_sources():
+            return validation_error("No sources configured.")
         return missing_fields_error(
             command,
             [{
-                "field": "document_token",
-                "description": "Multiple documents are configured and the task's document could not be inferred; specify one by id or alias.",
+                "field": "source_token",
+                "description": "Multiple sources are configured for this task's project and the source could not be inferred; specify one by project name.",
             }],
         )
 
     try:
-        writer = _get_task_writer(_configured_tz(config))
-        writer.update_task(doc_id, task_id, update)
-        _resync_document(doc_id, config)
+        writer = _get_task_writer(_configured_tz(config), source_type=source.type)
+        writer.update_task(source.source_id, task_id, update)
+        _resync_project_sources(source.project_name, config)
     except TaskNotFoundError:
         return not_found_error("task", task_id)
     except Exception as e:
         return command_error(f"Update failed: {e}")
 
-    return {"ok": True, "task_id": task_id, "document_id": doc_id}
+    return {"ok": True, "task_id": task_id, "source_id": source.source_id, "project_name": source.project_name}
 
 
 def update_task(
     task_id: str,
-    document_token: Optional[str] = None,
+    source_token: Optional[str] = None,
     title: Optional[str] = None,
     duration: Optional[str] = None,
     description: Optional[str] = None,
@@ -198,7 +194,7 @@ def update_task(
     Only fields explicitly passed are changed. For `description`,
     `external_deadline`, `user_deadline`, `ref`, and `depends`, pass "-" to
     clear that field rather than leave it unchanged. At least one field must
-    be provided beyond `task_id`/`document_token`.
+    be provided beyond `task_id`/`source_token`.
     """
     try:
         config = _load_config()
@@ -264,16 +260,16 @@ def update_task(
             }],
         )
 
-    return _apply_update("update_task", task_id, update, document_token, config)
+    return _apply_update("update_task", task_id, update, source_token, config)
 
 
-def rename_task(task_id: str, title: str, document_token: Optional[str] = None) -> dict[str, Any]:
+def rename_task(task_id: str, title: str, source_token: Optional[str] = None) -> dict[str, Any]:
     """Change a task's title."""
     config = _load_config()
-    return _apply_update("rename_task", task_id, TaskUpdate(title=title), document_token, config)
+    return _apply_update("rename_task", task_id, TaskUpdate(title=title), source_token, config)
 
 
-def set_duration(task_id: str, duration: str, document_token: Optional[str] = None) -> dict[str, Any]:
+def set_duration(task_id: str, duration: str, source_token: Optional[str] = None) -> dict[str, Any]:
     """Change a task's estimated duration (e.g. "2h", "30m"). Must exceed any already-logged work time."""
     parsed = parse_duration(duration)
     if parsed is None:
@@ -289,14 +285,14 @@ def set_duration(task_id: str, duration: str, document_token: Optional[str] = No
             )
 
     config = _load_config()
-    return _apply_update("set_duration", task_id, TaskUpdate(duration=parsed), document_token, config)
+    return _apply_update("set_duration", task_id, TaskUpdate(duration=parsed), source_token, config)
 
 
 def set_deadline(
     task_id: str,
     deadline: str,
     use_user_deadline: bool = False,
-    document_token: Optional[str] = None,
+    source_token: Optional[str] = None,
 ) -> dict[str, Any]:
     """Set a task's external (default) or user deadline. Pass "-" to clear it."""
     config = _load_config()
@@ -312,30 +308,30 @@ def set_deadline(
     else:
         update.external_deadline = parsed
 
-    return _apply_update("set_deadline", task_id, update, document_token, config)
+    return _apply_update("set_deadline", task_id, update, source_token, config)
 
 
-def set_mode(task_id: str, mode: str, document_token: Optional[str] = None) -> dict[str, Any]:
+def set_mode(task_id: str, mode: str, source_token: Optional[str] = None) -> dict[str, Any]:
     """Set a task's execution mode: atomic, flex, or contiguous_preferred."""
     if mode not in _VALID_MODES:
         return validation_error(f"Invalid mode '{mode}'. Valid: {', '.join(_VALID_MODES)}.", field="mode")
     config = _load_config()
-    return _apply_update("set_mode", task_id, TaskUpdate(mode=mode), document_token, config)
+    return _apply_update("set_mode", task_id, TaskUpdate(mode=mode), source_token, config)
 
 
-def set_track(task_id: str, track: str, document_token: Optional[str] = None) -> dict[str, Any]:
+def set_track(task_id: str, track: str, source_token: Optional[str] = None) -> dict[str, Any]:
     """Set which independently-scheduled timeline a task belongs to: auto, primary, or secondary."""
     if track not in _VALID_TRACKS:
         return validation_error(f"Invalid track '{track}'. Valid: {', '.join(_VALID_TRACKS)}.", field="track")
     config = _load_config()
-    return _apply_update("set_track", task_id, TaskUpdate(track=track), document_token, config)
+    return _apply_update("set_track", task_id, TaskUpdate(track=track), source_token, config)
 
 
 def set_metadata(
     task_id: str,
     metadata: Optional[dict[str, str]] = None,
     remove_keys: Optional[list[str]] = None,
-    document_token: Optional[str] = None,
+    source_token: Optional[str] = None,
 ) -> dict[str, Any]:
     """Set or remove arbitrary key=value metadata fields on a task."""
     if not metadata and not remove_keys:
@@ -345,10 +341,10 @@ def set_metadata(
         )
     config = _load_config()
     update = TaskUpdate(metadata=metadata or {}, metadata_remove=remove_keys or [])
-    return _apply_update("set_metadata", task_id, update, document_token, config)
+    return _apply_update("set_metadata", task_id, update, source_token, config)
 
 
-def mark_done(task_id: str, document_token: Optional[str] = None) -> dict[str, Any]:
+def mark_done(task_id: str, source_token: Optional[str] = None) -> dict[str, Any]:
     """Mark a task complete, closing any active session and recording actual work duration.
 
     If no work sessions exist and a scheduled calendar event is found, a
@@ -382,13 +378,13 @@ def mark_done(task_id: str, document_token: Optional[str] = None) -> dict[str, A
             update.metadata[KEY_SESSIONS] = serialize_sessions(sessions, tz)
             update.metadata[KEY_ACTUAL_DURATION] = serialize_duration(actual)
 
-    result = _apply_update("mark_done", task_id, update, document_token, config)
+    result = _apply_update("mark_done", task_id, update, source_token, config)
     if result.get("ok") and warning:
         result["warning"] = warning
     return result
 
 
-def pause_task(task_id: str, document_token: Optional[str] = None) -> dict[str, Any]:
+def pause_task(task_id: str, source_token: Optional[str] = None) -> dict[str, Any]:
     """Close the currently active work session on a task.
 
     The first pause uses the task's scheduled calendar start as the session
@@ -440,13 +436,13 @@ def pause_task(task_id: str, document_token: Optional[str] = None) -> dict[str, 
         metadata={KEY_SESSIONS: serialize_sessions(sessions, tz)},
         metadata_remove=[KEY_ACTIVE_SINCE],
     )
-    result = _apply_update("pause_task", task_id, update, document_token, config)
+    result = _apply_update("pause_task", task_id, update, source_token, config)
     if result.get("ok"):
         result["session_duration"] = serialize_duration(new_session.duration)
     return result
 
 
-def resume_task(task_id: str, document_token: Optional[str] = None) -> dict[str, Any]:
+def resume_task(task_id: str, source_token: Optional[str] = None) -> dict[str, Any]:
     """Begin a new work session on a task, starting now."""
     task = _find_task_in_context(task_id)
     if task is None:
@@ -459,75 +455,76 @@ def resume_task(task_id: str, document_token: Optional[str] = None) -> dict[str,
     now = datetime.now(timezone.utc)
 
     update = TaskUpdate(metadata={KEY_ACTIVE_SINCE: serialize_active_since(now, tz)})
-    return _apply_update("resume_task", task_id, update, document_token, config)
+    return _apply_update("resume_task", task_id, update, source_token, config)
 
 
-def mark_undone(task_id: str, document_token: Optional[str] = None) -> dict[str, Any]:
+def mark_undone(task_id: str, source_token: Optional[str] = None) -> dict[str, Any]:
     """Mark a completed task as incomplete again."""
     config = _load_config()
-    return _apply_update("mark_undone", task_id, TaskUpdate(completed=False), document_token, config)
+    return _apply_update("mark_undone", task_id, TaskUpdate(completed=False), source_token, config)
 
 
-def delete_task(task_id: str, document_token: Optional[str] = None) -> dict[str, Any]:
-    """Permanently remove a task from its document. This cannot be undone."""
+def delete_task(task_id: str, source_token: Optional[str] = None) -> dict[str, Any]:
+    """Permanently remove a task from its source. This cannot be undone."""
     try:
         config = _load_config()
     except Exception as e:
         return command_error(f"Failed to load configuration: {e}")
 
-    doc_id = _resolve_document_for_edit(task_id, document_token, config)
-    if doc_id is None:
-        if not config.google_docs.document_ids:
-            return validation_error("No documents configured.")
+    source = _resolve_edit_source(task_id, source_token, config)
+    if source is None:
+        if not config.all_sources():
+            return validation_error("No sources configured.")
         return missing_fields_error(
             "delete_task",
             [{
-                "field": "document_token",
-                "description": "Multiple documents are configured and the task's document could not be inferred; specify one by id or alias.",
+                "field": "source_token",
+                "description": "Multiple sources are configured for this task's project and the source could not be inferred; specify one by project name.",
             }],
         )
 
     try:
-        writer = _get_task_writer(_configured_tz(config))
-        writer.delete_task(doc_id, task_id)
-        _resync_document(doc_id, config)
+        writer = _get_task_writer(_configured_tz(config), source_type=source.type)
+        writer.delete_task(source.source_id, task_id)
+        _resync_project_sources(source.project_name, config)
     except TaskNotFoundError:
         return not_found_error("task", task_id)
     except Exception as e:
         return command_error(f"Delete failed: {e}")
 
-    return {"ok": True, "task_id": task_id, "document_id": doc_id}
+    return {"ok": True, "task_id": task_id, "source_id": source.source_id, "project_name": source.project_name}
 
 
 def deadlines_apply(
     task_id: Optional[str] = None,
-    document_token: Optional[str] = None,
+    project_token: Optional[str] = None,
     all_projects: bool = False,
 ) -> dict[str, Any]:
     """Backfill and write `deadline_computed` for eligible tasks in scope.
 
-    Exactly one scope must be given: `task_id`, `document_token`, or
+    Exactly one scope must be given: `task_id`, `project_token`, or
     `all_projects=True`. Use `deadlines_preview` first with the same scope to
     see what would be written without committing it.
     """
     from chronix.core.aggregation import TaskAggregator
     from chronix.core.deadline_backfill import compute_backlog_deadlines
 
-    scopes_given = sum([task_id is not None, document_token is not None, all_projects])
+    scopes_given = sum([task_id is not None, project_token is not None, all_projects])
     if scopes_given == 0:
-        return validation_error("Specify exactly one of task_id, document_token, or all_projects=True.")
+        return validation_error("Specify exactly one of task_id, project_token, or all_projects=True.")
     if scopes_given > 1:
-        return validation_error("Specify only one of task_id, document_token, or all_projects.")
+        return validation_error("Specify only one of task_id, project_token, or all_projects.")
 
     if not _context.projects:
         return validation_error("No projects loaded. Call sync first.")
 
     config = _load_config()
-    doc_id = None
-    if document_token is not None:
-        doc_id = _resolve_document_token(document_token, config)
-        if doc_id is None:
-            return not_found_error("document", document_token)
+    project_name = None
+    if project_token is not None:
+        project_config = config.find_project(project_token)
+        if project_config is None:
+            return not_found_error("project", project_token)
+        project_name = project_config.name
 
     aggregator = TaskAggregator()
     aggregated_tasks = aggregator.aggregate(_context.projects)
@@ -541,13 +538,13 @@ def deadlines_apply(
 
     if task_id is not None:
         results = [r for r in results if r.task.id == task_id]
-    elif doc_id is not None:
-        doc_task_ids = {
+    elif project_name is not None:
+        project_task_ids = {
             t.id for p in _context.projects
-            if p.project_context.document_id == doc_id
+            if p.project_context.project_id == project_name
             for t in p.tasks
         }
-        results = [r for r in results if r.task.id in doc_task_ids]
+        results = [r for r in results if r.task.id in project_task_ids]
 
     if not results:
         return {"ok": True, "updated": 0, "message": "No eligible tasks in scope."}

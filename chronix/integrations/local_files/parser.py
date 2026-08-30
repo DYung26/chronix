@@ -101,25 +101,19 @@ class LocalFileParser:
     def _parse_line(self, line: str, section: ParsedSection) -> None:
         stripped = line.strip()
 
-        if stripped == TaskParser.TASK_IDENTIFIER:
-            bullet = {
-                "list_id": _LOCAL_CHECKBOX_LIST_ID,
-                "nesting_level": 0,
-                "has_strikethrough": False,
-            }
-            section.paragraphs.append(ParsedParagraph(text=stripped, bullet=bullet, indent_level=0))
-            section.checkbox_list_id = _LOCAL_CHECKBOX_LIST_ID
-            return
-
         checkbox_match = _CHECKBOX_PATTERN.match(stripped)
         if checkbox_match:
             checked, text = checkbox_match.groups()
+            text = text.strip()
+            is_identifier = text == TaskParser.TASK_IDENTIFIER
             bullet = {
                 "list_id": _LOCAL_CHECKBOX_LIST_ID,
                 "nesting_level": 0,
-                "has_strikethrough": checked != "",
+                "has_strikethrough": False if is_identifier else checked != "",
             }
-            section.paragraphs.append(ParsedParagraph(text=text.strip(), bullet=bullet, indent_level=0))
+            section.paragraphs.append(ParsedParagraph(text=text, bullet=bullet, indent_level=0))
+            if is_identifier:
+                section.checkbox_list_id = _LOCAL_CHECKBOX_LIST_ID
             return
 
         if not stripped:

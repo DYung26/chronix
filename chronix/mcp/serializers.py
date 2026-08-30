@@ -91,7 +91,6 @@ def serialize_project_context(project: ProjectContext) -> dict[str, Any]:
         "project_id": project.project_id,
         "project_name": project.project_name,
         "document_id": project.document_id,
-        "alias": project.alias,
         "priority": project.priority,
         "label": project.document_label(),
     }

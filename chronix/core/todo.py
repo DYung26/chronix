@@ -360,8 +360,16 @@ class TodoDeriver:
         self,
         document_structure: dict,
         exclude_tab_titles: Optional[list[str]] = None,
+        source: str = "google_docs",
     ) -> list[Task]:
-        """Derive TODO list from tabs, excluding specified tab titles."""
+        """Derive TODO list from tabs, excluding specified tab titles.
+
+        `source` is stamped onto every derived Task (see Task.source) to
+        record which integration produced it -- callers syncing a
+        non-Google-Docs source (e.g. local_files) must pass their own
+        source.type here, or every task will be mislabeled "google_docs"
+        regardless of where the document_structure actually came from.
+        """
         if exclude_tab_titles is None:
             exclude_tab_titles = EXCLUDED_TAB_TITLES
 
@@ -392,7 +400,7 @@ class TodoDeriver:
                     if style in ['HEADING_1', 'HEADING_2', 'HEADING_3']:
                         continue
                     try:
-                        task = self.parser.parse_task_line(paragraph, checkbox_list_id)
+                        task = self.parser.parse_task_line(paragraph, checkbox_list_id, source=source)
                         if task:
                             if document_title:
                                 task.document_title = document_title

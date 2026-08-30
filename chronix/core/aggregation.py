@@ -1,7 +1,7 @@
 """Project-level task aggregation and normalization."""
 
 from typing import Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 from chronix.core.models import Task
@@ -14,14 +14,14 @@ from chronix.core.dependencies import resolve_task_dependencies, DependencyError
 
 _AGEING_HALF_LIFE_DAYS = 30.0
 
-# Sentinel used so unranked documents (Task.priority is None) sort after every
-# explicitly ranked one, consistent with DocumentConfig.priority's semantics
+# Sentinel used so unranked projects (Task.priority is None) sort after every
+# explicitly ranked one, consistent with ProjectConfig.priority's semantics
 # (lower number = higher priority; unset = lowest priority tier).
 _UNRANKED_PRIORITY = 2 ** 31
 
 
 def _priority_sort_key(task: Task) -> int:
-    """Sort key for a task's document priority (lower sorts first)."""
+    """Sort key for a task's project priority (lower sorts first)."""
     return task.priority if task.priority is not None else _UNRANKED_PRIORITY
 
 
@@ -48,31 +48,40 @@ def _ageing_bonus_seconds(task: Task, now: datetime) -> float:
 
 @dataclass
 class ProjectContext:
-    """Project identity and metadata."""
+    """Project identity and metadata.
+
+    Identity is the project's configured name alone (see
+    chronix.config.settings.ProjectConfig.name), not source-qualified: a
+    project synced from two sources (one google_docs, one local_files)
+    produces two ProjectTodoLists that share one equal ProjectContext here,
+    which is what lets TaskAggregator.aggregate treat their tasks as one
+    backlog. `source` and `document_id` below describe only the *last*
+    source stamped onto this particular ProjectContext instance -- for a
+    two-source project, prefer chronix.config.settings.SourceRef /
+    ChronixConfig.sources_for_project to enumerate all of a project's
+    sources rather than relying on these two fields.
+    """
 
     project_id: str
     project_name: str
     source: str = "google_docs"
     document_id: Optional[str] = None
-    alias: Optional[str] = None
-    # Scheduling priority rank from this document's config entry (lower =
+    # Scheduling priority rank from this project's config entry (lower =
     # higher priority; None = unranked). Propagated to each Task at
     # aggregation time -- see TaskAggregator._enrich_task_with_project.
     priority: Optional[int] = None
 
     def __hash__(self):
-        return hash((self.project_id, self.source))
+        return hash(self.project_id)
 
     def __eq__(self, other):
         if not isinstance(other, ProjectContext):
             return False
-        return self.project_id == other.project_id and self.source == other.source
+        return self.project_id == other.project_id
 
     def document_label(self) -> str:
-        """Format for display: 'alias (document_id)' or just 'document_id'."""
-        if self.alias and self.document_id:
-            return f"{self.alias} ({self.document_id})"
-        return self.document_id or self.project_id
+        """Format for display: the project's id."""
+        return self.project_id
 
 
 @dataclass
@@ -91,8 +100,79 @@ class AggregatedTask:
         return self.task.id == other.task.id and self.project_context == other.project_context
 
 
+# Task fields compared to decide whether two same-id tasks within the same
+# project (from different sources) are true duplicates (identical) or a
+# conflict (content differs). Deliberately excludes fields that are
+# source-derived rather than user-edited content -- source, project,
+# document_title, and priority are expected to differ (or be independently
+# stamped) across sources and would otherwise falsely flag every
+# cross-source duplicate as conflicting.
+_CONFLICT_COMPARISON_FIELDS = (
+    "title",
+    "description",
+    "estimated_duration",
+    "deadline_user",
+    "deadline_external",
+    "completed",
+    "ref",
+    "depends_on",
+    "execution_mode",
+    "track",
+)
+
+
+def _tasks_conflict(a: Task, b: Task) -> bool:
+    """True if two tasks sharing an id differ on any user-editable content field."""
+    return any(getattr(a, field) != getattr(b, field) for field in _CONFLICT_COMPARISON_FIELDS)
+
+
+@dataclass
+class TaskConflict:
+    """Two or more same-id tasks within one project, from different sources, whose content disagrees.
+
+    Surfaced via TaskAggregator.get_conflicts rather than raised as an error:
+    a conflict affecting one task in the backlog should never block sync or
+    scheduling for everything else. `versions` holds one AggregatedTask per
+    distinct source that has this id, in the order sync encountered them.
+    """
+
+    task_id: str
+    versions: list[AggregatedTask]
+
+
+class CrossProjectIdCollisionError(Exception):
+    """Raised when the same task id appears under two different projects.
+
+    Unlike a same-project conflict (see TaskConflict), this is not a
+    legitimate mirroring scenario -- task ids are meant to be globally
+    unique (see chronix.core.models.generate_task_id), so an id shared
+    across projects indicates a real anomaly (e.g. a metadata line
+    copy-pasted between files, or an exceedingly unlikely id collision),
+    not two sources of the same backlog. Aggregation refuses to guess which
+    project the task actually belongs to and raises instead of silently
+    merging or dropping either task.
+    """
+
+    def __init__(self, task_id: str, project_names: list[str]):
+        self.task_id = task_id
+        self.project_names = project_names
+        super().__init__(
+            f"Task id '{task_id}' appears under multiple projects ({', '.join(project_names)}), "
+            f"which should never happen since task ids are meant to be globally unique. "
+            f"This needs manual resolution -- check both projects' sources for a duplicated "
+            f"or copy-pasted task id."
+        )
+
+
 class ProjectTodoList:
-    """Represents a single project's TODO list with identity."""
+    """Represents one source's synced tasks for a project.
+
+    `project_id` (defaulting to a normalized form of `project_name` if not
+    given explicitly) is what TaskAggregator.aggregate groups sources by --
+    two ProjectTodoLists sharing the same `project_id` (e.g. one from a
+    project's google_docs source, one from its local_files source) are
+    treated as the same project's backlog and merged together.
+    """
 
     def __init__(
         self,
@@ -101,7 +181,6 @@ class ProjectTodoList:
         project_id: Optional[str] = None,
         source: str = "google_docs",
         document_id: Optional[str] = None,
-        alias: Optional[str] = None,
         priority: Optional[int] = None,
     ):
         self.project_context = ProjectContext(
@@ -109,7 +188,6 @@ class ProjectTodoList:
             project_name=project_name,
             source=source,
             document_id=document_id,
-            alias=alias,
             priority=priority,
         )
         self.tasks = tasks
@@ -132,24 +210,85 @@ class ProjectTodoList:
 class TaskAggregator:
     """Aggregates tasks from multiple projects into a unified view."""
 
+    def __init__(self):
+        # Populated by the most recent aggregate() call. A conflict here means
+        # the same task id appeared within one project's two sources with
+        # differing content (see _tasks_conflict) -- get_conflicts() exposes
+        # this for the user to resolve manually rather than aggregate()
+        # guessing which version is "right".
+        self._last_conflicts: list[TaskConflict] = []
+
     def aggregate(
         self,
         project_todos: list[ProjectTodoList]
     ) -> list[AggregatedTask]:
-        """Aggregate tasks from multiple projects into a single collection."""
+        """Aggregate tasks from multiple projects into a single collection.
+
+        Tasks sharing the same non-None id *within the same project*
+        (i.e. across that project's two sources) are deduplicated: if every
+        compared field agrees (see _CONFLICT_COMPARISON_FIELDS), only the
+        first-seen version is kept as a single entry. If any compared field
+        disagrees, every version is kept in the returned list (so nothing is
+        silently dropped or overwritten) but the id is also recorded in
+        get_conflicts() for the user to resolve. Tasks with id=None (not yet
+        backfilled) are never deduplicated against each other, since None is
+        not a real identity.
+
+        A task id shared across *different* projects is a hard error (see
+        CrossProjectIdCollisionError) rather than a conflict: task ids are
+        meant to be globally unique, so this should only happen from a real
+        anomaly, and guessing which project it "really" belongs to would be
+        worse than refusing to proceed.
+        """
         aggregated = []
+        first_seen_by_id: dict[str, AggregatedTask] = {}
+        conflicting_ids: dict[str, list[AggregatedTask]] = {}
 
         for project_todo in project_todos:
             for task in project_todo.tasks:
                 enriched_task = self._enrich_task_with_project(task, project_todo.project_context)
-
                 aggregated_task = AggregatedTask(
                     task=enriched_task,
                     project_context=project_todo.project_context
                 )
-                aggregated.append(aggregated_task)
+
+                task_id = enriched_task.id
+                if task_id is None:
+                    aggregated.append(aggregated_task)
+                    continue
+
+                existing = first_seen_by_id.get(task_id)
+                if existing is None:
+                    first_seen_by_id[task_id] = aggregated_task
+                    aggregated.append(aggregated_task)
+                    continue
+
+                if existing.project_context.project_id != aggregated_task.project_context.project_id:
+                    raise CrossProjectIdCollisionError(
+                        task_id,
+                        [existing.project_context.project_name, aggregated_task.project_context.project_name],
+                    )
+
+                if _tasks_conflict(existing.task, enriched_task):
+                    conflicting_ids.setdefault(task_id, [existing]).append(aggregated_task)
+                    aggregated.append(aggregated_task)
+                # else: true duplicate: enriched_task is dropped, existing stands.
+
+        self._last_conflicts = [
+            TaskConflict(task_id=task_id, versions=versions)
+            for task_id, versions in conflicting_ids.items()
+        ]
 
         return aggregated
+
+    def get_conflicts(self) -> list[TaskConflict]:
+        """Conflicts found by the most recent aggregate() call.
+
+        Empty before aggregate() has been called, and reset (possibly to
+        empty) on every subsequent call -- this reflects only the latest
+        aggregation, not an accumulated history across calls.
+        """
+        return self._last_conflicts
 
     def _enrich_task_with_project(self, task: Task, project_context: ProjectContext) -> Task:
         """Enrich task with project information if not already set."""
@@ -165,8 +304,22 @@ class TaskAggregator:
         self,
         aggregated_tasks: list[AggregatedTask]
     ) -> list[Task]:
-        """Extract raw Task objects from aggregated view and sort globally."""
-        tasks = [agg_task.task for agg_task in aggregated_tasks]
+        """Extract raw Task objects from aggregated view and sort globally.
+
+        Tasks whose id appears in get_conflicts() (populated by the most
+        recent aggregate() call) are excluded entirely -- with two
+        disagreeing versions of the same task, scheduling either arbitrarily
+        or both would silently produce a wrong or double-counted schedule.
+        Excluding it is visible instead: the task is simply absent from
+        today/schedule until the user resolves the conflict, and callers
+        that run scheduling commands are expected to warn when
+        get_conflicts() is non-empty (see cli.commands).
+        """
+        conflicted_ids = {c.task_id for c in self._last_conflicts}
+        tasks = [
+            agg_task.task for agg_task in aggregated_tasks
+            if agg_task.task.id not in conflicted_ids
+        ]
         sorted_tasks = self._sort_tasks_globally(tasks)
         try:
             return resolve_task_dependencies(sorted_tasks)
@@ -185,15 +338,15 @@ class TaskAggregator:
 
         Within each category, tasks are sorted by:
         - Primary: deadline (earliest first)
-        - Secondary: document priority rank (lower rank first; unranked last)
+        - Secondary: project priority rank (lower rank first; unranked last)
         - Tertiary: duration (shorter first)
         - Quaternary: title (alphabetical)
 
-        Document priority is a soft bias, same as in the scheduler's urgency
+        Project priority is a soft bias, same as in the scheduler's urgency
         scoring: it only distinguishes tasks that already tie on the primary
         key (or, for no-deadline tasks, ranks above the passive ageing bonus).
-        It never lets an unranked/low-priority document's deadline jump ahead
-        of a higher-priority document's earlier deadline.
+        It never lets an unranked/low-priority project's deadline jump ahead
+        of a higher-priority project's earlier deadline.
 
         Completed tasks appear after all incomplete tasks.
         """
@@ -294,11 +447,11 @@ class TaskAggregator:
         self,
         aggregated_tasks: list[AggregatedTask]
     ) -> dict[str, list[Task]]:
-        """Group tasks by project context (project_id + source)."""
+        """Group tasks by project context (project_id -- unique per project, not per source)."""
         by_project = {}
 
         for agg_task in aggregated_tasks:
-            key = f"{agg_task.project_context.project_id}@{agg_task.project_context.source}"
+            key = agg_task.project_context.project_id
             if key not in by_project:
                 by_project[key] = []
             by_project[key].append(agg_task.task)
@@ -335,7 +488,6 @@ def create_project_todo(
     project_id: Optional[str] = None,
     source: str = "google_docs",
     document_id: Optional[str] = None,
-    alias: Optional[str] = None,
     priority: Optional[int] = None,
 ) -> ProjectTodoList:
     """Create a ProjectTodoList with explicit project identity."""
@@ -345,6 +497,5 @@ def create_project_todo(
         project_id=project_id,
         source=source,
         document_id=document_id,
-        alias=alias,
         priority=priority,
     )

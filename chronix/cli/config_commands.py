@@ -115,25 +115,26 @@ def config_show_command(args: list[str]) -> int:
                 print(f"   {block.start_time.strftime('%H:%M')} - {block.end_time.strftime('%H:%M')} ({days}){label}")
             print()
         
-        # Google Docs settings
-        print("📄 Google Docs:")
+        # Projects and their sources
+        print("📄 Projects:")
         print(f"   Auth method: {config.google_docs.auth_method}")
         print(f"   Credentials: {config.google_docs.credentials_path}")
         print(f"   Token cache: {config.google_docs.token_path}")
-        if config.google_docs.documents:
-            print(f"   Documents: {len(config.google_docs.documents)} configured")
+        if config.projects:
+            print(f"   Projects: {len(config.projects)} configured")
             ranked = sorted(
-                config.google_docs.documents,
-                key=lambda d: d.priority if d.priority is not None else float("inf")
+                config.projects,
+                key=lambda p: p.priority if p.priority is not None else float("inf")
             )
-            for doc in ranked[:3]:
-                label = f"{doc.alias} ({doc.document_id})" if doc.alias else doc.document_id
-                priority_str = f" [priority {doc.priority}]" if doc.priority is not None else ""
-                print(f"     • {label}{priority_str}")
+            for project in ranked[:3]:
+                label = project.label()
+                priority_str = f" [priority {project.priority}]" if project.priority is not None else ""
+                source_types = ", ".join(s.type for s in project.sources)
+                print(f"     • {label}{priority_str} ({source_types})")
             if len(ranked) > 3:
                 print(f"     ... and {len(ranked) - 3} more")
         else:
-            print(f"   Documents: None configured")
+            print(f"   Projects: None configured")
         print()
         
         # Startup commands
@@ -187,24 +188,23 @@ def config_reload_command(args: list[str]) -> int:
 
     _context.config = config
 
-    # Document priority (and alias) get baked into each synced project's
-    # ProjectContext at sync time, and from there stamped onto each Task the
-    # first time it's aggregated (TaskAggregator._enrich_task_with_project
-    # only assigns task.priority when it's still None, so it never overwrites
-    # after that first stamp). Neither is re-read from config afterwards, so
-    # without this, editing a document's priority in config.toml and running
+    # Project priority gets baked into each synced project's ProjectContext
+    # at sync time, and from there stamped onto each Task the first time
+    # it's aggregated (TaskAggregator._enrich_task_with_project only assigns
+    # task.priority when it's still None, so it never overwrites after that
+    # first stamp). It's not re-read from config afterwards, so without
+    # this, editing a project's priority in config.toml and running
     # `config reload` has no effect on scheduling until a full `sync`
-    # rebuilds the Task objects from scratch. Refresh both here, in place,
-    # and reset task.priority so the next aggregate() call re-stamps it from
-    # the freshly reloaded config.
+    # rebuilds the Task objects from scratch. Refresh it here, in place, and
+    # reset task.priority so the next aggregate() call re-stamps it from the
+    # freshly reloaded config.
     refreshed_projects = 0
     refreshed_tasks = 0
     for project in _context.projects:
-        document_id = project.project_context.document_id
-        if document_id is None:
+        project_config = config.find_project(project.project_context.project_id)
+        if project_config is None:
             continue
-        project.project_context.priority = config.google_docs.get_priority(document_id)
-        project.project_context.alias = config.google_docs.get_alias(document_id)
+        project.project_context.priority = project_config.priority
         refreshed_projects += 1
         for task in project.tasks:
             task.priority = None
@@ -212,7 +212,7 @@ def config_reload_command(args: list[str]) -> int:
 
     print(f"✓ Configuration reloaded from: {config_path}")
     if refreshed_projects:
-        print(f"✓ Refreshed priority/alias for {refreshed_projects} synced document(s) ({refreshed_tasks} task(s)).")
+        print(f"✓ Refreshed priority for {refreshed_projects} synced project(s) ({refreshed_tasks} task(s)).")
     return 0
 
 
@@ -245,7 +245,7 @@ def config_validate_command(args: list[str]) -> int:
         print(f"  • Sleep windows: {len(config.scheduling.sleep_windows)}")
         print(f"  • Breaks: {len(config.scheduling.breaks)}")
         print(f"  • Meetings: {len(config.scheduling.meetings)}")
-        print(f"  • Documents: {len(config.google_docs.document_ids)}")
+        print(f"  • Projects: {len(config.projects)}")
         print(f"  • Startup commands: {len(config.startup.commands)}")
         
         return 0

@@ -16,12 +16,13 @@ from chronix.cli.commands import (
     sync_command,
     today_command,
     calendar_command,
-    documents_command,
-    document_command,
+    projects_command,
+    project_command,
     tabs_command,
     blocks_command,
     schedule_command,
     explain_command,
+    conflicts_command,
     help_command,
     update_command,
     rename_command,
@@ -45,7 +46,7 @@ from chronix.cli.highlighting import ChronixCommandLexer, chronix_style
 # Commands that read from `_context` and need it populated before running.
 # The REPL syncs once at startup and keeps `_context` warm for the session;
 # one-shot invocations start cold every time and must sync on demand.
-_FULL_CONTEXT_COMMANDS = frozenset({"today", "schedule", "calendar", "explain", "deadlines"})
+_FULL_CONTEXT_COMMANDS = frozenset({"today", "schedule", "calendar", "explain", "deadlines", "conflicts"})
 _TASK_LOOKUP_COMMANDS = frozenset({"done", "pause", "resume"})
 # Commands whose interactive (no-args) form prompts for a task_id and then
 # looks it up in `_context`. In the REPL this is fine (context is warm from
@@ -59,6 +60,24 @@ _INTERACTIVE_TASK_COMMANDS = frozenset({"done", "pause", "resume", "undone", "de
 _SINGLE_DOC_COMMANDS = frozenset({"document"})
 
 
+def _resolve_project_token_for_source(source_token: str, config) -> Optional[str]:
+    """Resolve a --source/--doc token given in one-shot mode to its project name.
+
+    _TASK_LOOKUP_COMMANDS (done/pause/resume) accept a source-level token
+    (matching the flagged edit commands' own --source flag), but sync_command
+    operates on projects, not individual sources. A source token can also
+    directly be a project name already (config.resolve_source and
+    config.find_project both resolve on project name), so try source
+    resolution first since that's the more specific match, then fall back to
+    treating the token as a project token outright.
+    """
+    source = config.resolve_source(source_token)
+    if source is not None:
+        return source.project_name
+    project = config.find_project(source_token)
+    return project.name if project is not None else None
+
+
 class ChronixShell:
     """Interactive REPL shell for chronix."""
     
@@ -69,12 +88,13 @@ class ChronixShell:
             'sync': sync_command,
             'today': today_command,
             'calendar': calendar_command,
-            'documents': documents_command,
-            'document': document_command,
+            'documents': projects_command,
+            'document': project_command,
             'tabs': tabs_command,
             'blocks': blocks_command,
             'schedule': schedule_command,
             'explain': explain_command,
+            'conflicts': conflicts_command,
             'config': config_command,
             'update': update_command,
             'rename': rename_command,
@@ -374,10 +394,15 @@ class ChronixShell:
             doc_token, _ = _parse_edit_flags(args)
             if doc_token is None:
                 raise ValueError(
-                    f"'{command_name}' requires --doc <id|alias> when run as a one-shot "
+                    f"'{command_name}' requires --source <name> when run as a one-shot "
                     f"command, since there's no prior sync to resolve the task's document from."
                 )
-            sync_command([doc_token])
+            from chronix.config import ChronixConfig
+            config = ChronixConfig.load_or_default()
+            project_name = _resolve_project_token_for_source(doc_token, config)
+            if project_name is None:
+                raise ValueError(f"Unknown source or project: '{doc_token}'")
+            sync_command([project_name])
         elif command_name in _SINGLE_DOC_COMMANDS:
             if args and not args[0].startswith("--"):
                 sync_command([args[0]])

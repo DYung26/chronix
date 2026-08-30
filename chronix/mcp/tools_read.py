@@ -10,8 +10,8 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from chronix.cli import commands as cli_commands
-from chronix.cli.commands import _context, _configured_tz, _resolve_document_token
-from chronix.cli.sync_helpers import _sync_single_document_with_retries
+from chronix.cli.commands import _context, _configured_tz
+from chronix.cli.sync_helpers import _sync_single_source_with_retries
 from chronix.core.aggregation import TaskAggregator
 from chronix.core.deadline_backfill import compute_backlog_deadlines
 from chronix.mcp.errors import command_error, not_found_error, validation_error
@@ -23,73 +23,76 @@ from chronix.mcp.serializers import (
 )
 
 
-def sync(document_tokens: Optional[list[str]] = None) -> dict[str, Any]:
-    """Fetch and parse configured Google Docs, refreshing the server's in-memory task state.
+def sync(project_tokens: Optional[list[str]] = None) -> dict[str, Any]:
+    """Fetch and parse configured projects, refreshing the server's in-memory task state.
 
-    With no arguments, syncs every document configured in config.toml and
-    replaces the current context entirely. With `document_tokens` (ids or
-    aliases), syncs only those documents and merges the result into the
-    existing context, leaving other already-synced documents untouched.
+    With no arguments, syncs every project configured in config.toml and
+    replaces the current context entirely. With `project_tokens` (project
+    names), syncs only those projects and merges the result into the
+    existing context, leaving other already-synced projects untouched. A
+    project with two sources (Google Docs and a local file) has both fetched
+    together, so aggregation can merge/dedupe them correctly.
 
     Call this before `today`, `schedule`, `explain`, or `deadlines` if the
     context has never been synced this session, or if changes may have been
-    made in Google Docs directly since the last sync. Write tools (add,
-    update, done, etc.) refresh their own document automatically and do not
+    made in a source directly since the last sync. Write tools (add,
+    update, done, etc.) refresh their own project automatically and do not
     require a sync first or after.
     """
     from chronix.config import ChronixConfig
+    from chronix.integrations.factory import get_client
 
     try:
         config = ChronixConfig.load_or_default()
     except Exception as e:
         return command_error(f"Failed to load configuration: {e}")
 
-    all_document_ids = config.google_docs.document_ids
-    if not all_document_ids:
-        return validation_error("No documents configured in config.toml.")
+    if not config.projects:
+        return validation_error("No projects configured in config.toml.")
 
-    if document_tokens:
-        unknown = [t for t in document_tokens if _resolve_document_token(t, config) is None]
+    if project_tokens:
+        unknown = [t for t in project_tokens if config.find_project(t) is None]
         if unknown:
-            return validation_error(f"Unknown document token(s): {', '.join(unknown)}")
+            return validation_error(f"Unknown project token(s): {', '.join(unknown)}")
         seen: set[str] = set()
-        doc_ids: list[str] = []
-        for token in document_tokens:
-            resolved = _resolve_document_token(token, config)
+        project_names: list[str] = []
+        for token in project_tokens:
+            resolved = config.find_project(token).name
             if resolved not in seen:
                 seen.add(resolved)
-                doc_ids.append(resolved)
+                project_names.append(resolved)
     else:
-        doc_ids = all_document_ids
+        project_names = [p.name for p in config.projects]
 
-    client = _context._ensure_google_client()
-    try:
-        if not client.authenticate():
-            return command_error("Google authentication failed. Check configured credentials.")
-    except Exception as e:
-        return command_error(f"Authentication error: {e}")
+    sources_to_sync = [s for s in config.all_sources() if s.project_name in project_names]
+
+    needs_google_auth = any(s.type == "google_docs" for s in sources_to_sync)
+    if needs_google_auth:
+        client = _context._ensure_google_client()
+        try:
+            if not client.authenticate():
+                return command_error("Google authentication failed. Check configured credentials.")
+        except Exception as e:
+            return command_error(f"Authentication error: {e}")
 
     tz = _configured_tz(config)
     synced_projects = []
     all_meetings = []
     failures = []
 
-    for doc_id in doc_ids:
-        alias = config.google_docs.get_alias(doc_id)
-        priority = config.google_docs.get_priority(doc_id)
-        result, project, meetings = _sync_single_document_with_retries(
-            doc_id, client, alias=alias, priority=priority, tz=tz
-        )
+    for source in sources_to_sync:
+        source_client = _context._ensure_google_client() if source.type == "google_docs" else get_client(source)
+        result, project, meetings = _sync_single_source_with_retries(source, source_client, tz=tz)
         if result.outcome.value == "success":
             synced_projects.append(project)
             all_meetings.extend(meetings)
         else:
-            failures.append({"document_id": doc_id, "reason": str(result)})
+            failures.append({"source_id": source.source_id, "project_name": source.project_name, "reason": str(result)})
 
-    if document_tokens and _context.projects:
-        synced_ids = {p.project_context.document_id for p in synced_projects}
+    if project_tokens and _context.projects:
+        synced_ids = {p.project_context.project_id for p in synced_projects}
         _context.projects = [
-            p for p in _context.projects if p.project_context.document_id not in synced_ids
+            p for p in _context.projects if p.project_context.project_id not in synced_ids
         ] + synced_projects
         _context.ad_hoc_meetings.extend(all_meetings)
     else:
@@ -104,7 +107,7 @@ def sync(document_tokens: Optional[list[str]] = None) -> dict[str, Any]:
 
     return {
         "ok": len(failures) == 0,
-        "synced_documents": len(synced_projects),
+        "synced_projects": len(project_names),
         "total_tasks": total_tasks,
         "incomplete_tasks": incomplete_tasks,
         "completed_tasks": total_tasks - incomplete_tasks,
@@ -261,7 +264,7 @@ def explain(task_id: str) -> dict[str, Any]:
 
 
 def documents() -> dict[str, Any]:
-    """List every document configured in config.toml, with sync status if known."""
+    """List every configured project and its source(s), with sync status if known."""
     from chronix.config import ChronixConfig
 
     try:
@@ -269,43 +272,47 @@ def documents() -> dict[str, Any]:
     except Exception as e:
         return command_error(f"Failed to load configuration: {e}")
 
-    doc_titles = {
-        p.project_context.document_id: p.project_context.project_name
-        for p in _context.projects
-        if p.project_context.document_id
-    }
+    synced_project_ids = {p.project_context.project_id for p in _context.projects}
 
     ranked = sorted(
-        config.google_docs.documents,
-        key=lambda d: d.priority if d.priority is not None else float("inf"),
+        config.projects,
+        key=lambda p: p.priority if p.priority is not None else float("inf"),
     )
 
     return {
         "ok": True,
-        "documents": [
+        "projects": [
             {
-                "document_id": doc.document_id,
-                "alias": doc.alias,
-                "priority": doc.priority,
-                "title": doc_titles.get(doc.document_id),
-                "synced": doc.document_id in doc_titles,
+                "name": project.name,
+                "priority": project.priority,
+                "synced": project.name in synced_project_ids,
+                "sources": [
+                    {
+                        "type": source.type,
+                        "source_id": source.document_id if source.type == "google_docs" else source.file_path,
+                    }
+                    for source in project.sources
+                ],
             }
-            for doc in ranked
+            for project in ranked
         ],
     }
 
 
 def document(
-    document_token: str,
+    project_token: str,
     page: int = 1,
     per_page: int = 20,
     status: str = "incomplete",
 ) -> dict[str, Any]:
-    """Return a paginated task list for a single synced document.
+    """Return a paginated task list for a single synced project.
 
-    `document_token` may be a document_id or configured alias. `status` is
-    one of "incomplete" (default), "complete", or "all". The document must
-    already be synced -- call `sync` with this document's token first if it
+    `project_token` is the project's configured name. `status` is
+    one of "incomplete" (default), "complete", or "all". Tasks are
+    aggregated across all of the project's sources (see
+    chronix.core.aggregation.TaskAggregator), so a task appearing in only
+    one of two configured sources still shows up here. The project must
+    already be synced -- call `sync` with this project's token first if it
     hasn't been synced yet this session.
     """
     if status not in ("incomplete", "complete", "all"):
@@ -318,22 +325,26 @@ def document(
     from chronix.config import ChronixConfig
 
     config = _context.config or ChronixConfig.load_or_default()
-    doc_id = _resolve_document_token(document_token, config)
-    if doc_id is None:
-        return not_found_error("document", document_token)
+    project_config = config.find_project(project_token)
+    if project_config is None:
+        return not_found_error("project", project_token)
 
-    project = next(
-        (p for p in _context.projects if p.project_context.document_id == doc_id), None
-    )
-    if project is None:
-        return validation_error(f"Document '{document_token}' not synced yet. Call sync with this document first.")
+    project_todos = [
+        p for p in _context.projects if p.project_context.project_id == project_config.name
+    ]
+    if not project_todos:
+        return validation_error(f"Project '{project_token}' not synced yet. Call sync with this project first.")
+
+    aggregator = TaskAggregator()
+    aggregated_tasks = aggregator.aggregate(project_todos)
+    all_tasks = [agg.task for agg in aggregated_tasks]
 
     if status == "incomplete":
-        filtered = [t for t in project.tasks if not t.completed]
+        filtered = [t for t in all_tasks if not t.completed]
     elif status == "complete":
-        filtered = [t for t in project.tasks if t.completed]
+        filtered = [t for t in all_tasks if t.completed]
     else:
-        filtered = project.tasks
+        filtered = all_tasks
 
     start = (page - 1) * per_page
     page_tasks = filtered[start:start + per_page]
@@ -341,13 +352,13 @@ def document(
     if not page_tasks and filtered:
         return validation_error(f"Page {page} is out of range ({len(filtered)} {status} task(s) total).")
 
-    incomplete_count = sum(1 for t in project.tasks if not t.completed)
+    incomplete_count = sum(1 for t in all_tasks if not t.completed)
     return {
         "ok": True,
-        "document": serialize_project_context(project.project_context),
-        "total_tasks": len(project.tasks),
+        "project": serialize_project_context(project_todos[0].project_context),
+        "total_tasks": len(all_tasks),
         "incomplete_count": incomplete_count,
-        "completed_count": len(project.tasks) - incomplete_count,
+        "completed_count": len(all_tasks) - incomplete_count,
         "page": page,
         "per_page": per_page,
         "total_matching": len(filtered),
@@ -355,21 +366,25 @@ def document(
     }
 
 
-def tabs(document_token: str) -> dict[str, Any]:
-    """List the tabs in a document, for use with `add`'s tab argument.
+def tabs(source_token: str) -> dict[str, Any]:
+    """List the tabs in a Google Docs source, for use with `add`'s tab argument.
 
-    `document_token` may be a document_id or configured alias. This fetches
+    `source_token` is the project's configured name, resolving to its
+    google_docs source. Local file sources have no tab concept. This fetches
     the document directly rather than reading from the synced context, so it
-    works even before the document has been synced.
+    works even before the project has been synced.
     """
     from chronix.config import ChronixConfig
     from chronix.core.todo import EXCLUDED_TAB_TITLES
     from chronix.integrations.google_docs.parser import GoogleDocsParser
 
     config = _context.config or ChronixConfig.load_or_default()
-    doc_id = _resolve_document_token(document_token, config)
-    if doc_id is None:
-        return not_found_error("document", document_token)
+    source = config.resolve_source(source_token)
+    if source is None:
+        return not_found_error("source", source_token)
+    if source.type != "google_docs":
+        return validation_error(f"'{source_token}' is a local file, which has no tabs. Tabs only apply to Google Docs sources.")
+    doc_id = source.source_id
 
     client = _context._ensure_google_client()
     try:
@@ -424,23 +439,23 @@ def blocks() -> dict[str, Any]:
 
 def deadlines_preview(
     task_id: Optional[str] = None,
-    document_token: Optional[str] = None,
+    project_token: Optional[str] = None,
     all_projects: bool = False,
 ) -> dict[str, Any]:
     """Preview backfilled `deadline_computed` values without writing them.
 
     Exactly one scope must be given: `task_id` for a single task,
-    `document_token` for every eligible task in that document, or
+    `project_token` for every eligible task in that project, or
     `all_projects=True` for the whole synced backlog. Eligible tasks are
     incomplete tasks with neither an external nor a user deadline. To
     actually write the previewed values, use `deadlines_apply` with the same
     scope.
     """
-    scopes_given = sum([task_id is not None, document_token is not None, all_projects])
+    scopes_given = sum([task_id is not None, project_token is not None, all_projects])
     if scopes_given == 0:
-        return validation_error("Specify exactly one of task_id, document_token, or all_projects=True.")
+        return validation_error("Specify exactly one of task_id, project_token, or all_projects=True.")
     if scopes_given > 1:
-        return validation_error("Specify only one of task_id, document_token, or all_projects.")
+        return validation_error("Specify only one of task_id, project_token, or all_projects.")
 
     if not _context.projects:
         return validation_error("No projects loaded. Call sync first.")
@@ -449,11 +464,12 @@ def deadlines_preview(
 
     config = _context.config or ChronixConfig.load_or_default()
 
-    doc_id = None
-    if document_token is not None:
-        doc_id = _resolve_document_token(document_token, config)
-        if doc_id is None:
-            return not_found_error("document", document_token)
+    project_name = None
+    if project_token is not None:
+        project_config = config.find_project(project_token)
+        if project_config is None:
+            return not_found_error("project", project_token)
+        project_name = project_config.name
 
     aggregator = TaskAggregator()
     aggregated_tasks = aggregator.aggregate(_context.projects)
@@ -467,13 +483,13 @@ def deadlines_preview(
 
     if task_id is not None:
         results = [r for r in results if r.task.id == task_id]
-    elif doc_id is not None:
-        doc_task_ids = {
+    elif project_name is not None:
+        project_task_ids = {
             t.id for p in _context.projects
-            if p.project_context.document_id == doc_id
+            if p.project_context.project_id == project_name
             for t in p.tasks
         }
-        results = [r for r in results if r.task.id in doc_task_ids]
+        results = [r for r in results if r.task.id in project_task_ids]
 
     return {
         "ok": True,
