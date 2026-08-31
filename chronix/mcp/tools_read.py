@@ -1,4 +1,4 @@
-"""Read-only MCP tools: context queries and schedule/document views.
+"""Read-only MCP tools: context queries and schedule/project views.
 
 None of these mutate chronix's persisted state. They read from the shared
 `chronix.cli.commands._context` singleton, which this MCP server keeps warm
@@ -263,7 +263,7 @@ def explain(task_id: str) -> dict[str, Any]:
     return {"ok": True, "task": result}
 
 
-def documents() -> dict[str, Any]:
+def projects() -> dict[str, Any]:
     """List every configured project and its source(s), with sync status if known."""
     from chronix.config import ChronixConfig
 
@@ -299,7 +299,7 @@ def documents() -> dict[str, Any]:
     }
 
 
-def document(
+def project(
     project_token: str,
     page: int = 1,
     per_page: int = 20,

@@ -8,7 +8,7 @@ ask the user and retry the call with the field filled in.
 
 Each write here refreshes the affected project's source(s) in `_context`
 immediately after writing (mirroring `chronix.cli.commands._resync_project_sources`),
-so a `document`/`explain`/`today` call right after reflects the change
+so a `project`/`explain`/`today` call right after reflects the change
 without a separate `sync`.
 """
 
