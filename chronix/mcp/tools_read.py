@@ -33,11 +33,9 @@ def sync(project_tokens: Optional[list[str]] = None) -> dict[str, Any]:
     project with two sources (Google Docs and a local file) has both fetched
     together, so aggregation can merge/dedupe them correctly.
 
-    Call this before `today`, `schedule`, `explain`, or `deadlines` if the
-    context has never been synced this session, or if changes may have been
-    made in a source directly since the last sync. Write tools (add,
-    update, done, etc.) refresh their own project automatically and do not
-    require a sync first or after.
+    Persistent MCP clients normally keep this context warm. Clients that
+    create a fresh server/session per tool call are supported too: read tools
+    establish the required context transparently when it is missing.
     """
     from chronix.config import ChronixConfig
     from chronix.integrations.factory import get_client
@@ -116,16 +114,56 @@ def sync(project_tokens: Optional[list[str]] = None) -> dict[str, Any]:
     }
 
 
-def today(time_override: Optional[str] = None, split: bool = False) -> dict[str, Any]:
-    """Return today's scheduled timeline, built from the currently synced context.
+def _ensure_context(
+    project_tokens: Optional[list[str]] = None,
+    *,
+    require_all: bool = False,
+) -> Optional[dict[str, Any]]:
+    """Ensure the context required by a read tool is available.
 
-    Requires a prior `sync`. `time_override` (HH:MM, 24-hour) sets the start
+    Warm MCP sessions reuse the process-local context. Cold/stateless sessions
+    transparently sync the minimum scope needed by the calling tool. Global
+    schedule/deadline views require the complete configured project set.
+    """
+    from chronix.config import ChronixConfig
+
+    config = _context.config or ChronixConfig.load_or_default()
+    configured_names = {p.name for p in config.projects}
+    loaded_names = {p.project_context.project_id for p in _context.projects}
+
+    if require_all:
+        if configured_names.issubset(loaded_names):
+            return None
+        result = sync()
+    elif project_tokens:
+        resolved_names = []
+        for token in project_tokens:
+            project_config = config.find_project(token)
+            if project_config is not None:
+                resolved_names.append(project_config.name)
+        if resolved_names and set(resolved_names).issubset(loaded_names):
+            return None
+        result = sync(resolved_names or project_tokens)
+    elif _context.projects:
+        return None
+    else:
+        result = sync()
+
+    return None if result.get("ok") else result
+
+
+def today(time_override: Optional[str] = None, split: bool = False) -> dict[str, Any]:
+    """Return today's scheduled timeline, built from the synced context.
+
+    The required project context is synced automatically when this is a cold
+    MCP session. `time_override` (HH:MM, 24-hour) sets the start
     of the scheduling window instead of the current time. `split` also
     schedules and returns the secondary track (tasks that can run alongside
     the primary track) as `secondary_schedule`.
     """
-    if not _context.projects:
-        return validation_error("No projects loaded. Call sync first.")
+    context_error = _ensure_context(require_all=True)
+    if context_error is not None:
+        return context_error
 
     try:
         primary, secondary, work_start, work_end, paused_blocks = cli_commands._generate_today_schedules(
@@ -155,9 +193,10 @@ def schedule(
     forecast_from_day: Optional[int] = None,
     forecast_count: Optional[int] = None,
 ) -> dict[str, Any]:
-    """Return a multi-day schedule projection from the currently synced context.
+    """Return a multi-day schedule projection from the synced context.
 
-    Requires a prior `sync`. With no arguments, schedules the full backlog
+    The full configured backlog is synced automatically when this is a cold
+    MCP session. With no arguments, schedules the full backlog
     starting today with no day limit. `days` caps how many days are
     returned. `day_range_start`/`day_range_end` run the same continuous
     simulation but only return that 1-indexed day range (today is day 1).
@@ -166,8 +205,9 @@ def schedule(
     full current backlog as-is rather than simulating depletion of the days
     before it.
     """
-    if not _context.projects:
-        return validation_error("No projects loaded. Call sync first.")
+    context_error = _ensure_context(require_all=True)
+    if context_error is not None:
+        return context_error
 
     from zoneinfo import ZoneInfo
     from datetime import date, timedelta as td
@@ -236,14 +276,16 @@ def schedule(
 
 
 def explain(task_id: str) -> dict[str, Any]:
-    """Return details and scheduling position for a task, from the currently synced context.
+    """Return details and scheduling position for a task.
 
-    Requires a prior `sync`. `position` (1-indexed) reflects where the task
+    The full configured backlog is synced automatically when this is a cold
+    MCP session. `position` (1-indexed) reflects where the task
     sits in the global incomplete-task queue chronix would schedule from;
     it is omitted for completed tasks.
     """
-    if not _context.projects:
-        return validation_error("No projects loaded. Call sync first.")
+    context_error = _ensure_context(require_all=True)
+    if context_error is not None:
+        return context_error
 
     aggregator = TaskAggregator()
     aggregated_tasks = aggregator.aggregate(_context.projects)
@@ -333,7 +375,14 @@ def project(
         p for p in _context.projects if p.project_context.project_id == project_config.name
     ]
     if not project_todos:
-        return validation_error(f"Project '{project_token}' not synced yet. Call sync with this project first.")
+        context_error = _ensure_context([project_config.name])
+        if context_error is not None:
+            return context_error
+        project_todos = [
+            p for p in _context.projects if p.project_context.project_id == project_config.name
+        ]
+    if not project_todos:
+        return validation_error(f"Project '{project_token}' could not be loaded. Call sync with this project first.")
 
     aggregator = TaskAggregator()
     aggregated_tasks = aggregator.aggregate(project_todos)
@@ -446,8 +495,10 @@ def deadlines_preview(
 
     Exactly one scope must be given: `task_id` for a single task,
     `project_token` for every eligible task in that project, or
-    `all_projects=True` for the whole synced backlog. Eligible tasks are
-    incomplete tasks with neither an external nor a user deadline. To
+    `all_projects=True` for the whole synced backlog. A cold MCP session
+    automatically syncs the full configured backlog before computing the
+    preview. Eligible tasks are incomplete tasks with neither an external nor
+    a user deadline. To
     actually write the previewed values, use `deadlines_apply` with the same
     scope.
     """
@@ -457,8 +508,9 @@ def deadlines_preview(
     if scopes_given > 1:
         return validation_error("Specify only one of task_id, project_token, or all_projects.")
 
-    if not _context.projects:
-        return validation_error("No projects loaded. Call sync first.")
+    context_error = _ensure_context(require_all=True)
+    if context_error is not None:
+        return context_error
 
     from chronix.config import ChronixConfig
 

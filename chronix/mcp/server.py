@@ -3,14 +3,15 @@
 Sync model
 ----------
 This server keeps `chronix.cli.commands._context` warm for its entire
-process lifetime, the same way the interactive REPL keeps it warm for a
-session -- there is no per-call re-sync and no auto-sync on startup. `sync`
-is an ordinary tool: call it once near the start of a session, or again
-whenever Google Docs may have changed outside of this server (e.g. edited
-directly, or by another client). Every write tool (add_task, update_task,
-mark_done, etc.) refreshes its own project's state in-context immediately
-after writing, so results stay consistent without an explicit `sync` after
-every edit.
+process lifetime when the MCP client preserves the server session. `sync`
+is still useful when starting a session and whenever Google Docs may have
+changed outside this server (for example, direct edits or another client).
+Read tools also tolerate cold/stateless MCP sessions: when their required
+context is missing, they transparently sync the necessary project(s) before
+reading. Warm sessions avoid that extra fetch. Every write tool (add_task,
+update_task, mark_done, etc.) refreshes its own project's state in-context
+immediately after writing, so results stay consistent without an explicit
+`sync` after every edit.
 
 Interactive-only behavior from the CLI (full-screen forms, prompts for a
 missing task_id) does not apply here: every write tool requires its
@@ -27,10 +28,12 @@ _INSTRUCTIONS = """\
 chronix manages tasks synced from Google Docs and schedules them against
 configured work hours, breaks, sleep, and meetings.
 
-Sync is explicit and the server keeps synced state in memory for the whole
-session: call `sync` once before using `today`, `schedule`, `explain`,
-`project`, or `deadlines_preview`/`deadlines_apply` for the first time, and
-again only if Google Docs may have changed outside this server. Write tools
+The server keeps synced state in memory for the whole session when the MCP
+client preserves it. `today`, `schedule`, and `explain` automatically sync
+the full configured backlog when their context is cold; `project` syncs only
+the requested project. `deadlines_preview` also establishes the full
+backlog automatically. An explicit `sync` remains useful to refresh data
+that may have changed outside this server. Write tools
 (add_task, update_task, mark_done, pause_task, resume_task, mark_undone,
 delete_task, rename_task, set_duration, set_deadline, set_mode, set_track,
 set_metadata, deadlines_apply) refresh their own project automatically, so
