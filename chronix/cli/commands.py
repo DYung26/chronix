@@ -1328,7 +1328,7 @@ def tabs_command(args: list[str]) -> int:
 
     source = config.resolve_source(doc_token)
     if source is None:
-        print_error(f"Unknown document: '{doc_token}'")
+        print_error(f"Unknown project: '{doc_token}'")
         return 1
     if source.type != "google_docs":
         print_error(f"'{doc_token}' is a local file, which has no tabs. Tabs only apply to Google Docs sources.")
@@ -2541,12 +2541,12 @@ def deadlines_command(args: list[str]) -> int:
 
     Exactly one scope must be given:
     - <task_id>: backfill only that task.
-    - --source <name>: backfill every eligible task in that document.
+    - --source <name>: backfill every eligible task in that project.
     - --all: backfill every eligible task across all synced projects.
 
     There is no bulk default: a task with no deadline may simply not have
     one, so touching more than a single task always requires an explicit
-    --doc or --all.
+    --source or --all.
 
     Eligible tasks are incomplete tasks with neither an external nor a user
     deadline. Projection always considers the full synced task pool so
@@ -2584,7 +2584,7 @@ def deadlines_command(args: list[str]) -> int:
     scopes_given = sum([bool(remaining), doc_token is not None, all_scope])
     if scopes_given == 0:
         print_error(usage)
-        console.print("[dim]Specify a single task, a document with --doc, or --all for the whole backlog.[/dim]")
+        console.print("[dim]Specify a single task, a project with --source, or --all for the whole backlog.[/dim]")
         return 1
     if scopes_given > 1:
         print_error("Specify only one of: <task_id>, --source <name>, --all")

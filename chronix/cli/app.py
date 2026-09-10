@@ -55,13 +55,13 @@ _TASK_LOOKUP_COMMANDS = frozenset({"done", "pause", "resume"})
 # one-shot mode rejects the zero-arg form outright instead of prompting.
 # This does not affect these commands when called *with* a task_id one-shot
 # (e.g. `chronix update abc123 --title ...`), which is unaffected and still
-# resolves its document the way it always has.
+# resolves its project/source the way it always has.
 _INTERACTIVE_TASK_COMMANDS = frozenset({"done", "pause", "resume", "undone", "delete", "meta", "update"})
-_SINGLE_DOC_COMMANDS = frozenset({"document"})
+_SINGLE_PROJECT_COMMANDS = frozenset({"project"})
 
 
 def _resolve_project_token_for_source(source_token: str, config) -> Optional[str]:
-    """Resolve a --source/--doc token given in one-shot mode to its project name.
+    """Resolve a --source token given in one-shot mode to its project name.
 
     _TASK_LOOKUP_COMMANDS (done/pause/resume) accept a source-level token
     (matching the flagged edit commands' own --source flag), but sync_command
@@ -88,8 +88,8 @@ class ChronixShell:
             'sync': sync_command,
             'today': today_command,
             'calendar': calendar_command,
-            'documents': projects_command,
-            'document': project_command,
+            'projects': projects_command,
+            'project': project_command,
             'tabs': tabs_command,
             'blocks': blocks_command,
             'schedule': schedule_command,
@@ -365,15 +365,15 @@ class ChronixShell:
             return 1
 
     def _ensure_context_for_one_shot(self, command_name: str, args: list[str]) -> None:
-        """Sync the documents a command needs before running it.
+        """Sync the projects a command needs before running it.
 
         Full-context commands (today/schedule/calendar/explain) require the
         complete aggregated task view and always sync everything configured.
 
-        Task-lookup commands (done/pause/resume) only need the one document a
-        task lives in. One-shot invocations have no prior sync to resolve that
-        from, so `--doc` is required here rather than falling back to a full
-        sync of every configured document just to locate one task.
+        Task-lookup commands (done/pause/resume) only need the one project a
+        task belongs to. One-shot invocations have no prior sync to resolve that
+        from, so `--source` is required here rather than falling back to a full
+        sync of every configured project just to locate one task.
 
         Commands with an interactive zero-args form (done/pause/resume/undone/
         delete/meta/update) reject that form outright in one-shot mode: there
@@ -395,7 +395,7 @@ class ChronixShell:
             if doc_token is None:
                 raise ValueError(
                     f"'{command_name}' requires --source <name> when run as a one-shot "
-                    f"command, since there's no prior sync to resolve the task's document from."
+                    f"command, since there's no prior sync to resolve the task's project from."
                 )
             from chronix.config import ChronixConfig
             config = ChronixConfig.load_or_default()
@@ -403,7 +403,7 @@ class ChronixShell:
             if project_name is None:
                 raise ValueError(f"Unknown source or project: '{doc_token}'")
             sync_command([project_name])
-        elif command_name in _SINGLE_DOC_COMMANDS:
+        elif command_name in _SINGLE_PROJECT_COMMANDS:
             if args and not args[0].startswith("--"):
                 sync_command([args[0]])
 

@@ -70,18 +70,20 @@ Place your service account key file at:
 
 **Note**: To obtain credentials, visit the [Google Cloud Console](https://console.cloud.google.com/apis/credentials) and enable the Google Docs API.
 
-### 3. Configure Document IDs
+### 3. Configure Projects
 
-Edit `~/.config/chronix/config.toml` and add your Google Docs document IDs:
+Edit `~/.config/chronix/config.toml` and add your projects and their sources:
 
 ```toml
-[google_docs]
-document_ids = [
-    "1JiPapSKWzs775Kl7h_MlkK-aLjRMEMN-uvjntNBLAB8"
-]
+[[projects]]
+name = "My Project"
+
+[[projects.sources]]
+type = "google_docs"
+document_id = "1JiPapSKWzs775Kl7h_MlkK-aLjRMEMN-uvjntNBLAB8"
 ```
 
-**Important**: Only provide document IDs, not document names. Chronix automatically retrieves document titles from the Google Docs API.
+A project is the scheduling identity and can have a Google Docs source, a local file source, or both. Google Docs sources use the document ID to identify the underlying document.
 
 ## Usage
 
@@ -96,8 +98,10 @@ chronix
 The REPL automatically runs `sync` on startup to fetch the latest tasks.
 
 Available commands:
-- `sync` - Fetch and parse all configured documents
-- `sync <id> [id ...]` - Sync one or more specific documents
+- `projects` - List all configured projects and their sources
+- `project <name>` - Show a project's task list
+- `sync` - Fetch and parse all configured projects
+- `sync <name> [name ...]` - Sync one or more specific projects
 - `today` - Display today's complete schedule
 - `explain <task_id>` - Show detailed information about a specific task
 - `clear` or `cls` - Clear the terminal screen
@@ -122,8 +126,10 @@ Available commands:
 Run commands directly without entering the REPL:
 
 ```bash
-chronix sync                      # Sync all documents
-chronix sync <id> [id ...]        # Sync specific documents
+chronix projects                  # List configured projects
+chronix project "My Project"       # Show a project
+chronix sync                      # Sync all projects
+chronix sync <name> [name ...]     # Sync specific projects
 chronix today         # View today's schedule
 chronix explain xyz   # Get details about task with ID xyz
 ```
