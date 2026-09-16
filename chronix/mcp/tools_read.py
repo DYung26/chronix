@@ -68,7 +68,7 @@ def sync(project_tokens: Optional[list[str]] = None) -> dict[str, Any]:
     if needs_google_auth:
         client = _context._ensure_google_client()
         try:
-            if not client.authenticate():
+            if not client.authenticate(interactive=False):
                 return command_error("Google authentication failed. Check configured credentials.")
         except Exception as e:
             return command_error(f"Authentication error: {e}")
@@ -437,7 +437,7 @@ def tabs(source_token: str) -> dict[str, Any]:
 
     client = _context._ensure_google_client()
     try:
-        if not client.authenticate():
+        if not client.authenticate(interactive=False):
             return command_error("Google authentication failed. Check configured credentials.")
         doc = client.fetch_document(doc_id)
     except Exception as e:

@@ -13,21 +13,24 @@ class GoogleDocsClient(TaskSourceIntegration):
     def __init__(self, auth_strategy: Optional[AuthStrategy] = None):
         self.auth_strategy = auth_strategy or get_default_auth_strategy()
         self._service = None
+        self._interactive_auth = True
 
     @property
     def service(self) -> Any:
         """Lazily initialize and return the Google Docs API service."""
         if self._service is None:
-            self._service = self.auth_strategy.get_service()
+            self._service = self.auth_strategy.get_service(interactive=self._interactive_auth)
         return self._service
 
-    def authenticate(self) -> bool:
-        """Authenticate with Google Docs API. Raises exceptions on auth failures."""
-        try:
-            self.service
-            return True
-        except Exception as e:
-            raise e
+    def authenticate(self, interactive: bool = True) -> bool:
+        """Authenticate and cache the Google Docs service.
+
+        ``interactive=False`` is used by MCP so expired/unusable credentials
+        produce a normal authentication error instead of attempting browser OAuth.
+        """
+        self._interactive_auth = interactive
+        self._service = self.auth_strategy.get_service(interactive=interactive)
+        return True
 
     def validate_connection(self) -> bool:
         """Validate connection to Google Docs API."""

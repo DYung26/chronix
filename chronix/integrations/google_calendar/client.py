@@ -15,34 +15,18 @@ class GoogleCalendarClient:
     
     @property
     def service(self) -> Any:
-        """Lazily initialize and return the Google Calendar API service."""
+        """Lazily build Calendar service from the shared auth strategy."""
         if self._service is None:
-            # Get credentials from auth strategy
-            creds = None
-            if hasattr(self.auth_strategy, 'token_path'):
-                from google.oauth2.credentials import Credentials
-                token_path = self.auth_strategy.token_path
-                if token_path.exists():
-                    creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
-            
-            if not creds:
-                # Fall back to getting service from auth strategy (it uses docs service with expanded scopes)
-                # We need to build calendar service directly
-                from google.oauth2.credentials import Credentials
-                from pathlib import Path
-                config_dir = Path.home() / ".config" / "chronix" / "google"
-                token_path = config_dir / "token.json"
-                
-                if token_path.exists():
-                    creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
-            
-            if creds:
-                self._service = build("calendar", "v3", credentials=creds)
-            else:
-                raise ValueError("Could not initialize Calendar service credentials")
-        
+            creds = self.auth_strategy.get_credentials(interactive=False)
+            self._service = build("calendar", "v3", credentials=creds)
         return self._service
-    
+
+    def authenticate(self, interactive: bool = False) -> bool:
+        """Validate shared credentials and initialize the Calendar service."""
+        creds = self.auth_strategy.get_credentials(interactive=interactive)
+        self._service = build("calendar", "v3", credentials=creds)
+        return True
+
     def list_events(self, calendar_id: str, start_time: datetime, end_time: datetime) -> list[dict]:
         """List calendar events in the given time range."""
         events_result = self.service.events().list(

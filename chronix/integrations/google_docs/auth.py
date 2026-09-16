@@ -24,9 +24,13 @@ class AuthStrategy(ABC):
     """Abstract base class for Google Docs authentication strategies."""
     
     @abstractmethod
-    def get_service(self):
-        """Returns an authenticated Google Docs API service."""
+    def get_credentials(self, interactive: bool = True):
+        """Return usable credentials, optionally allowing interactive auth."""
         pass
+
+    def get_service(self, interactive: bool = True):
+        """Return an authenticated Google Docs API service."""
+        raise NotImplementedError
 
 
 class OAuthAuth(AuthStrategy):
@@ -41,18 +45,27 @@ class OAuthAuth(AuthStrategy):
         self.credentials_path = credentials_path
         self.token_path = token_path
         self.scopes = scopes
+        self._credentials = None
 
-    def get_service(self):
-        """Returns authenticated service using OAuth flow."""
-        creds = None
+    def get_credentials(self, interactive: bool = True):
+        """Return usable OAuth credentials, optionally allowing interactive auth.
 
-        if self.token_path.exists():
+        Existing credentials are always loaded first. Expired credentials with a
+        refresh token are refreshed before interactive authentication is considered.
+        MCP callers pass ``interactive=False`` so a missing/unrefreshable credential
+        never attempts to launch a browser.
+        """
+        creds = self._credentials
+
+        if creds is None and self.token_path.exists():
             creds = Credentials.from_authorized_user_file(str(self.token_path), self.scopes)
+            self._credentials = creds
 
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
                 try:
                     creds.refresh(Request())
+                    self._credentials = creds
                     # Save the refreshed token
                     self.token_path.parent.mkdir(parents=True, exist_ok=True)
                     with open(self.token_path, "w") as token_file:
@@ -63,6 +76,13 @@ class OAuthAuth(AuthStrategy):
                     creds = None
             
             if not creds or not creds.valid:
+                if not interactive:
+                    raise RuntimeError(
+                        "Google authentication is unavailable without interactive authorization. "
+                        "The stored credentials are missing, expired without a usable refresh token, "
+                        "or could not be refreshed. Run Chronix from the CLI to re-authenticate."
+                    )
+
                 # Need full OAuth re-authentication
                 if not self.credentials_path.exists():
                     raise FileNotFoundError(
@@ -86,12 +106,17 @@ class OAuthAuth(AuthStrategy):
                     pass
 
                 creds = flow.run_local_server(port=0)
+                self._credentials = creds
 
                 self.token_path.parent.mkdir(parents=True, exist_ok=True)
                 with open(self.token_path, "w") as token_file:
                     token_file.write(creds.to_json())
 
-        return build("docs", "v1", credentials=creds)
+        return creds
+
+    def get_service(self, interactive: bool = True):
+        """Return an authenticated Google Docs API service."""
+        return build("docs", "v1", credentials=self.get_credentials(interactive=interactive))
 
 
 class ServiceAccountAuth(AuthStrategy):
@@ -100,19 +125,26 @@ class ServiceAccountAuth(AuthStrategy):
     def __init__(self, credentials_path: Path, scopes: list[str] = SCOPES):
         self.credentials_path = credentials_path
         self.scopes = scopes
+        self._credentials = None
 
-    def get_service(self):
-        """Returns authenticated service using service account."""
+    def get_credentials(self, interactive: bool = True):
+        """Return service-account credentials."""
         if not self.credentials_path.exists():
             raise FileNotFoundError(
                 f"Service account credentials not found at {self.credentials_path}"
             )
 
-        creds = service_account.Credentials.from_service_account_file(
-            str(self.credentials_path), scopes=self.scopes
-        )
+        if self._credentials is None:
+            self._credentials = service_account.Credentials.from_service_account_file(
+                str(self.credentials_path), scopes=self.scopes
+            )
+        return self._credentials
 
-        return build("docs", "v1", credentials=creds)
+    def get_service(self, interactive: bool = True):
+        """Return an authenticated Google Docs API service."""
+        creds = self.get_credentials(interactive=interactive)
+        http = AuthorizedHttp(creds, http=httplib2.Http(timeout=30))
+        return build("docs", "v1", http=http)
 
 
 def get_default_auth_strategy() -> AuthStrategy:

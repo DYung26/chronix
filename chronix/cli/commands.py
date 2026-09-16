@@ -607,7 +607,11 @@ def calendar_command(args: list[str]) -> int:
         # existing Chronix events is also scoped per track, so syncing one
         # track never touches or deletes the other's already-synced events.
         from chronix.integrations.google_calendar import CalendarSyncService
-        sync_service = CalendarSyncService()
+        google_client = _context._ensure_google_client()
+        if not google_client.authenticate():
+            print_error("Google authentication failed. Please check your credentials.")
+            return 1
+        sync_service = CalendarSyncService(auth_strategy=google_client.auth_strategy)
         
         primary_result = sync_service.sync(
             day_schedule=primary_schedule,
@@ -2764,7 +2768,8 @@ def _get_calendar_task_start(task_id: str, created: Optional[datetime] = None) -
     """
     try:
         from chronix.integrations.google_calendar import CalendarSyncService
-        sync_service = CalendarSyncService()
+        google_client = _context._ensure_google_client()
+        sync_service = CalendarSyncService(auth_strategy=google_client.auth_strategy)
         search_end = datetime.now(timezone.utc)
         search_start = created if created is not None else search_end - _DEFAULT_CALENDAR_SEARCH_LOOKBACK
         return sync_service.find_task_scheduled_start(task_id, search_start, search_end)

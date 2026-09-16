@@ -80,8 +80,10 @@ class CalendarEventClassifier:
 class CalendarSyncService:
     """Orchestrates syncing Chronix schedules to Google Calendar."""
     
-    def __init__(self, calendar_client: Optional[GoogleCalendarClient] = None):
-        self.client = calendar_client or GoogleCalendarClient()
+    def __init__(self, calendar_client: Optional[GoogleCalendarClient] = None, auth_strategy=None):
+        if calendar_client is not None and auth_strategy is not None:
+            raise ValueError("Pass either calendar_client or auth_strategy, not both")
+        self.client = calendar_client or GoogleCalendarClient(auth_strategy=auth_strategy)
         self.classifier = CalendarEventClassifier()
     
     def sync(
