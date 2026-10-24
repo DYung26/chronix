@@ -60,6 +60,8 @@ On first use, Chronix will open a browser for authentication and store the token
 ~/.config/chronix/google/token.json
 ```
 
+If no browser can launch (for example, on a headless VPS), Chronix prints an authorization URL. Open it on a device with a browser, approve access, then paste the full localhost redirect URL from that browser's address bar back into the waiting terminal. This fallback requires an installed-app OAuth client; web OAuth clients require a configured, reachable HTTPS callback.
+
 #### Option B: Service Account
 
 Place your service account key file at:
