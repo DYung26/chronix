@@ -41,9 +41,16 @@ def widget_tasks_from_intervals(
 class ActiveTaskProvider:
     """Resolve active scheduled intervals from Chronix and its calendar snapshot."""
 
-    def __init__(self, context_refresh_seconds: float = 30.0) -> None:
+    def __init__(
+        self,
+        context_refresh_seconds: float = 30.0,
+        calendar_refresh_seconds: float = 30.0,
+    ) -> None:
         self.context_refresh_seconds = context_refresh_seconds
+        self.calendar_refresh_seconds = calendar_refresh_seconds
         self._last_context_sync: float | None = None
+        self._last_calendar_sync: float | None = None
+        self._cached_intervals: list[dict[str, Any]] | None = None
         self._calendar_service: CalendarSyncService | None = None
         self._lock = threading.RLock()
 
@@ -68,8 +75,26 @@ class ActiveTaskProvider:
                 self._calendar_service = CalendarSyncService(
                     auth_strategy=google_client.auth_strategy
                 )
-            intervals = self._calendar_service.get_active_scheduled_tasks(now)
-            return widget_tasks_from_intervals(intervals, tasks_by_id)
+            monotonic_now = time.monotonic()
+            cache_is_fresh = (
+                self._cached_intervals is not None
+                and self._last_calendar_sync is not None
+                and monotonic_now - self._last_calendar_sync < self.calendar_refresh_seconds
+            )
+            if not cache_is_fresh:
+                try:
+                    intervals = self._calendar_service.get_active_scheduled_tasks(now)
+                except Exception:
+                    if self._cached_intervals is None:
+                        raise
+                    logger.exception(
+                        "Calendar refresh failed; serving the last successful interval snapshot"
+                    )
+                else:
+                    self._cached_intervals = intervals
+                    self._last_calendar_sync = monotonic_now
+
+            return widget_tasks_from_intervals(self._cached_intervals or [], tasks_by_id)
 
     def _refresh_context(self) -> None:
         now = time.monotonic()
