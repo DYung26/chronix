@@ -64,3 +64,19 @@ def test_normal_same_day_block_is_unchanged():
     assert block.start.date() == block.end.date()
     assert block.end.hour == 12
     assert block.end.minute == 30
+
+
+def test_sleep_window_category_overrides_inconsistent_legacy_kind():
+    config = ChronixConfig()
+    config.scheduling.sleep_windows = [
+        TimeBlockConfig(
+            start_time=time(17, 0),
+            end_time=time(21, 0),
+            kind="break",
+            label="Sleep",
+            days=["monday"],
+        )
+    ]
+
+    block, = config_to_time_blocks(config, date(2026, 11, 16))
+    assert block.kind == "sleep"
