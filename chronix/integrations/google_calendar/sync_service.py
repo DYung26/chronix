@@ -3,10 +3,10 @@
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
-from chronix.core.models import ScheduledTask, DaySchedule, TimeBlock
+
+from chronix.core.models import DaySchedule, ScheduledTask, TimeBlock
 from chronix.integrations.google_calendar.client import GoogleCalendarClient
 from chronix.integrations.google_calendar.models import CalendarSyncResult, ConflictInfo
-
 
 UTC = ZoneInfo("UTC")
 
@@ -189,6 +189,59 @@ class CalendarSyncService:
                 success=False,
                 error_message=f"Sync failed: {str(e)}"
             )
+
+    def get_active_scheduled_tasks(self, now: datetime) -> list[dict]:
+        """Return Chronix-managed task intervals that overlap the supplied instant.
+
+        Google Calendar stores the original start/end values written by the
+        calendar sync command. Reading those values avoids regenerating the
+        schedule from the current time, which would move an in-progress
+        interval every time a client polls the API.
+        """
+        if now.tzinfo is None:
+            raise ValueError("now must be timezone-aware")
+
+        calendar_id = self.client.get_primary_calendar()
+        events = self.client.list_events(
+            calendar_id,
+            now - timedelta(seconds=1),
+            now + timedelta(seconds=1),
+        )
+
+        active_by_task_id: dict[str, dict] = {}
+        for event in events:
+            if not self.classifier.is_chronix_managed(event):
+                continue
+
+            task_id = self.classifier.get_chronix_task_id(event)
+            if not task_id:
+                continue
+
+            start = _parse_datetime(event.get("start"))
+            end = _parse_datetime(event.get("end"))
+            if start is None or end is None:
+                continue
+
+            if start.tzinfo is None:
+                start = start.replace(tzinfo=now.tzinfo)
+            if end.tzinfo is None:
+                end = end.replace(tzinfo=now.tzinfo)
+
+            if not start <= now < end:
+                continue
+
+            interval = {
+                "id": task_id,
+                "title": event.get("summary") or task_id,
+                "start": start,
+                "end": end,
+                "track": self.classifier.get_chronix_track(event),
+            }
+            previous = active_by_task_id.get(task_id)
+            if previous is None or start > previous["start"]:
+                active_by_task_id[task_id] = interval
+
+        return sorted(active_by_task_id.values(), key=lambda item: (item["start"], item["id"]))
 
     def find_task_scheduled_start(
         self,
