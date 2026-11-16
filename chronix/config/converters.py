@@ -1,6 +1,6 @@
 """Utilities for converting configuration to domain models."""
 
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -33,7 +33,10 @@ def config_to_time_blocks(
             continue
 
         start_dt = datetime.combine(target_date, block_config.start_time, tzinfo=tz)
-        end_dt = datetime.combine(target_date, block_config.end_time, tzinfo=tz)
+        end_date = target_date
+        if block_config.end_time <= block_config.start_time:
+            end_date += timedelta(days=1)
+        end_dt = datetime.combine(end_date, block_config.end_time, tzinfo=tz)
 
         blocks.append(TimeBlock(
             start=start_dt,
