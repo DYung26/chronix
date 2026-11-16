@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Any
 
@@ -73,8 +73,14 @@ class ActiveTaskProvider:
             config = _context.config or ChronixConfig.load_or_default()
             local_now = now.astimezone(ZoneInfo(config.scheduling.timezone))
             blocks = []
-            for block in config_to_time_blocks(config, local_now.date()):
-                blocks.append({
+            # Include yesterday for active overnight blocks and tomorrow for previews.
+            for block_date in (
+                local_now.date() - timedelta(days=1),
+                local_now.date(),
+                local_now.date() + timedelta(days=1),
+            ):
+                for block in config_to_time_blocks(config, block_date):
+                    blocks.append({
                         "id": f"{block.kind}:{block.start.isoformat()}:{block.label or ''}",
                         "title": block.label or block.kind.replace("_", " ").title(),
                         "kind": block.kind,

@@ -173,7 +173,7 @@ def test_widget_data_includes_active_configured_blocks_without_task_projects(mon
     monkeypatch.setattr(service._context, "projects", [])
     monkeypatch.setattr(service._context, "config", config)
     monkeypatch.setattr(service._context, "ad_hoc_meetings", [])
-    monkeypatch.setattr(service, "config_to_time_blocks", lambda *args: [block])
+    monkeypatch.setattr(service, "config_to_time_blocks", lambda config, target_date: [block] if target_date == now.date() else [])
 
     provider = ActiveTaskProvider()
     provider._refresh_context = lambda: None
@@ -203,7 +203,7 @@ def test_widget_data_includes_upcoming_configured_blocks(monkeypatch):
     monkeypatch.setattr(service._context, "projects", [])
     monkeypatch.setattr(service._context, "config", SimpleNamespace(scheduling=SimpleNamespace(timezone="UTC")))
     monkeypatch.setattr(service._context, "ad_hoc_meetings", [])
-    monkeypatch.setattr(service, "config_to_time_blocks", lambda *args: [block])
+    monkeypatch.setattr(service, "config_to_time_blocks", lambda config, target_date: [block] if target_date == now.date() else [])
 
     provider = ActiveTaskProvider()
     provider._refresh_context = lambda: None
