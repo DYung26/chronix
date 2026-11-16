@@ -243,7 +243,7 @@ Schedule for Today
 Chronix can expose a small read-only HTTP API for desktop widgets:
 
 ```bash
-chronix-api --host 127.0.0.1 --port 8765
+chronix-api --host 127.0.0.1 --port 8766
 ```
 
 - `GET /healthz` reports whether the API process is running.

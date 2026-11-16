@@ -88,7 +88,7 @@ def main() -> None:
         "--host", default=os.environ.get("CHRONIX_API_HOST", "127.0.0.1")
     )
     parser.add_argument(
-        "--port", type=int, default=int(os.environ.get("CHRONIX_API_PORT", "8765"))
+        "--port", type=int, default=int(os.environ.get("CHRONIX_API_PORT", "8766"))
     )
     args = parser.parse_args()
 
