@@ -6,10 +6,12 @@ import logging
 import threading
 import time
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from typing import Any
 
 from chronix.cli.commands import _context
 from chronix.core.aggregation import TaskAggregator
+from chronix.config import ChronixConfig, config_to_time_blocks
 from chronix.integrations.google_calendar import CalendarSyncService
 from chronix.mcp import tools_read
 
@@ -54,15 +56,45 @@ class ActiveTaskProvider:
         self._calendar_service: CalendarSyncService | None = None
         self._lock = threading.RLock()
 
-    def get_active_tasks(self, now: datetime | None = None) -> list[dict[str, str]]:
+    def get_widget_data(self, now: datetime | None = None) -> dict[str, list[dict[str, str]]]:
+        """Resolve current tasks and configured time blocks for the widget."""
         now = now or datetime.now(timezone.utc)
         if now.tzinfo is None:
             raise ValueError("now must be timezone-aware")
 
         with self._lock:
-            self._refresh_context()
+            try:
+                self._refresh_context()
+            except RuntimeError:
+                # The personal schedule is still useful when task sources are
+                # temporarily unavailable. Keep configured blocks visible.
+                logger.exception("Task context unavailable; serving configured time blocks")
+
+            config = _context.config or ChronixConfig.load_or_default()
+            local_now = now.astimezone(ZoneInfo(config.scheduling.timezone))
+            blocks = []
+            for block in config_to_time_blocks(config, local_now.date()):
+                blocks.append({
+                        "id": f"{block.kind}:{block.start.isoformat()}:{block.label or ''}",
+                        "title": block.label or block.kind.replace("_", " ").title(),
+                        "kind": block.kind,
+                        "startAt": block.start.isoformat(),
+                        "endAt": block.end.isoformat(),
+                    })
+
+            for meeting in _context.ad_hoc_meetings:
+                if meeting.start.date() == local_now.date():
+                    blocks.append({
+                        "id": f"meeting:{meeting.start.isoformat()}:{meeting.label or ''}",
+                        "title": meeting.label or "Meeting",
+                        "kind": "meeting",
+                        "startAt": meeting.start.isoformat(),
+                        "endAt": meeting.end.isoformat(),
+                    })
+
+            blocks.sort(key=lambda block: (block["startAt"], block["id"]))
             if not _context.projects:
-                return []
+                return {"tasks": [], "blocks": blocks}
 
             aggregator = TaskAggregator()
             aggregated = aggregator.aggregate(_context.projects)
@@ -94,7 +126,14 @@ class ActiveTaskProvider:
                     self._cached_intervals = intervals
                     self._last_calendar_sync = monotonic_now
 
-            return widget_tasks_from_intervals(self._cached_intervals or [], tasks_by_id)
+            return {
+                "tasks": widget_tasks_from_intervals(self._cached_intervals or [], tasks_by_id),
+                "blocks": blocks,
+            }
+
+    def get_active_tasks(self, now: datetime | None = None) -> list[dict[str, str]]:
+        """Backward-compatible task-only accessor."""
+        return self.get_widget_data(now)["tasks"]
 
     def _refresh_context(self) -> None:
         now = time.monotonic()
@@ -142,9 +181,14 @@ def create_payload(
     provider: ActiveTaskProvider, now: datetime | None = None
 ) -> dict[str, Any]:
     now = now or datetime.now(timezone.utc)
+    if hasattr(provider, "get_widget_data"):
+        widget_data = provider.get_widget_data(now)
+    else:
+        widget_data = {"tasks": provider.get_active_tasks(now), "blocks": []}
     return {
         "ok": True,
         "serverTime": now.isoformat(),
-        "tasks": provider.get_active_tasks(now),
+        "tasks": widget_data["tasks"],
+        "blocks": widget_data["blocks"],
         "pollAfterMs": 10000,
     }

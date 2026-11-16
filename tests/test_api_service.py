@@ -157,3 +157,58 @@ def test_active_task_provider_serves_cached_calendar_snapshot_on_refresh_failure
     assert provider.get_active_tasks(now) == []
     assert provider.get_active_tasks(now + timedelta(seconds=1)) == []
     assert "serving the last successful interval snapshot" in caplog.text
+
+
+def test_widget_data_includes_active_configured_blocks_without_task_projects(monkeypatch):
+    from chronix.core.models import TimeBlock
+
+    now = datetime(2026, 11, 16, 10, 15, tzinfo=timezone.utc)
+    block = TimeBlock(
+        start=datetime(2026, 11, 16, 10, 0, tzinfo=timezone.utc),
+        end=datetime(2026, 11, 16, 11, 0, tzinfo=timezone.utc),
+        kind="break",
+        label="Sleep",
+    )
+    config = SimpleNamespace(scheduling=SimpleNamespace(timezone="UTC"))
+    monkeypatch.setattr(service._context, "projects", [])
+    monkeypatch.setattr(service._context, "config", config)
+    monkeypatch.setattr(service._context, "ad_hoc_meetings", [])
+    monkeypatch.setattr(service, "config_to_time_blocks", lambda *args: [block])
+
+    provider = ActiveTaskProvider()
+    provider._refresh_context = lambda: None
+
+    result = provider.get_widget_data(now)
+
+    assert result["tasks"] == []
+    assert result["blocks"] == [{
+        "id": "break:2026-11-16T10:00:00+00:00:Sleep",
+        "title": "Sleep",
+        "kind": "break",
+        "startAt": "2026-11-16T10:00:00+00:00",
+        "endAt": "2026-11-16T11:00:00+00:00",
+    }]
+
+
+def test_widget_data_includes_upcoming_configured_blocks(monkeypatch):
+    from chronix.core.models import TimeBlock
+
+    now = datetime(2026, 11, 16, 10, 15, tzinfo=timezone.utc)
+    block = TimeBlock(
+        start=datetime(2026, 11, 16, 11, 0, tzinfo=timezone.utc),
+        end=datetime(2026, 11, 16, 12, 0, tzinfo=timezone.utc),
+        kind="meeting",
+        label="Later",
+    )
+    monkeypatch.setattr(service._context, "projects", [])
+    monkeypatch.setattr(service._context, "config", SimpleNamespace(scheduling=SimpleNamespace(timezone="UTC")))
+    monkeypatch.setattr(service._context, "ad_hoc_meetings", [])
+    monkeypatch.setattr(service, "config_to_time_blocks", lambda *args: [block])
+
+    provider = ActiveTaskProvider()
+    provider._refresh_context = lambda: None
+
+    result = provider.get_widget_data(now)
+    assert result["tasks"] == []
+    assert result["blocks"][0]["title"] == "Later"
+    assert result["blocks"][0]["startAt"] == "2026-11-16T11:00:00+00:00"
