@@ -22,13 +22,13 @@ def config_to_time_blocks(
     blocks = []
     day_name = target_date.strftime("%A").lower()
 
-    all_blocks = (
-        config.scheduling.sleep_windows +
-        config.scheduling.breaks +
-        config.scheduling.meetings
+    categorized_blocks = (
+        [(block, "sleep") for block in config.scheduling.sleep_windows]
+        + [(block, "break") for block in config.scheduling.breaks]
+        + [(block, "meeting") for block in config.scheduling.meetings]
     )
 
-    for block_config in all_blocks:
+    for block_config, kind in categorized_blocks:
         if day_name not in block_config.days:
             continue
 
@@ -41,7 +41,7 @@ def config_to_time_blocks(
         blocks.append(TimeBlock(
             start=start_dt,
             end=end_dt,
-            kind=block_config.kind,
+            kind=kind,
             label=block_config.label,
         ))
 
