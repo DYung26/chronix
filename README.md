@@ -253,7 +253,7 @@ chronix-api --host 127.0.0.1 --port 8766
 - Task source data is refreshed in the API process at most once every 30 seconds; the active calendar interval is checked on each request, and completed or removed tasks are filtered out.
 - The endpoint is read-only and does not enforce a concurrency limit or cap the number of returned tasks.
 
-The server binds to loopback by default. Keep it on `127.0.0.1` and expose it to other devices through a private Tailscale Serve route; do not bind it to a public interface. The endpoint uses permissive CORS for desktop webviews, so network access must be restricted by the private tailnet.
+Keep the server bound to `127.0.0.1` and expose it only through a private Tailscale Serve route. Browser CORS is limited to Tauri production and local Vite origins; native desktop clients use ordinary HTTP.
 
 ## Architecture
 
