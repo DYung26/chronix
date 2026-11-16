@@ -102,3 +102,58 @@ def test_active_task_provider_fails_when_no_project_context_can_be_loaded(monkey
 
     with pytest.raises(RuntimeError, match="task sources could not be loaded"):
         ActiveTaskProvider()._refresh_context()
+
+
+class _EmptyAggregator:
+    def aggregate(self, projects):
+        return []
+
+    def get_task_pool(self, aggregated):
+        return []
+
+
+def test_active_task_provider_caches_calendar_snapshot(monkeypatch):
+    project = SimpleNamespace(project_context=SimpleNamespace(project_id="project"))
+    monkeypatch.setattr(service._context, "projects", [project])
+    monkeypatch.setattr(service, "TaskAggregator", _EmptyAggregator)
+
+    class CalendarService:
+        calls = 0
+
+        def get_active_scheduled_tasks(self, now):
+            self.calls += 1
+            return []
+
+    provider = ActiveTaskProvider(calendar_refresh_seconds=30)
+    provider._refresh_context = lambda: None
+    provider._calendar_service = CalendarService()
+
+    first = datetime(2026, 11, 16, 10, 0, tzinfo=timezone.utc)
+    provider.get_active_tasks(first)
+    provider.get_active_tasks(first + timedelta(seconds=10))
+
+    assert provider._calendar_service.calls == 1
+
+
+def test_active_task_provider_serves_cached_calendar_snapshot_on_refresh_failure(monkeypatch, caplog):
+    project = SimpleNamespace(project_context=SimpleNamespace(project_id="project"))
+    monkeypatch.setattr(service._context, "projects", [project])
+    monkeypatch.setattr(service, "TaskAggregator", _EmptyAggregator)
+
+    class CalendarService:
+        calls = 0
+
+        def get_active_scheduled_tasks(self, now):
+            self.calls += 1
+            if self.calls > 1:
+                raise TimeoutError("calendar timeout")
+            return []
+
+    provider = ActiveTaskProvider(calendar_refresh_seconds=0)
+    provider._refresh_context = lambda: None
+    provider._calendar_service = CalendarService()
+
+    now = datetime(2026, 11, 16, 10, 0, tzinfo=timezone.utc)
+    assert provider.get_active_tasks(now) == []
+    assert provider.get_active_tasks(now + timedelta(seconds=1)) == []
+    assert "serving the last successful interval snapshot" in caplog.text
