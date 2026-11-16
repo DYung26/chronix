@@ -91,7 +91,14 @@ class ActiveTaskProvider:
         if result.get("ok"):
             return
 
-        # Keep the last known-good context if a source is temporarily offline.
+        if _context.projects and _context.projects is not previous[0]:
+            logger.warning(
+                "Chronix source refresh was partial; serving %d successfully synced projects: %s",
+                len(_context.projects),
+                result.get("failures", []),
+            )
+            return
+
         (
             _context.projects,
             _context.ad_hoc_meetings,
@@ -99,12 +106,16 @@ class ActiveTaskProvider:
             _context.config,
         ) = previous
         if _context.projects:
-            logger.warning("Chronix source refresh failed; serving cached task context: %s", result)
+            logger.warning(
+                "Chronix source refresh failed; serving cached task context: %s", result
+            )
             return
         raise RuntimeError("Chronix task sources could not be loaded")
 
 
-def create_payload(provider: ActiveTaskProvider, now: datetime | None = None) -> dict[str, Any]:
+def create_payload(
+    provider: ActiveTaskProvider, now: datetime | None = None
+) -> dict[str, Any]:
     now = now or datetime.now(timezone.utc)
     return {
         "ok": True,
