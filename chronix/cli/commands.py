@@ -1357,7 +1357,7 @@ def tabs_command(args: list[str]) -> int:
         return 0
 
     console.print()
-    console.print(f"[bold]Tabs in {config.google_docs.format_document_label(doc_id)}:[/bold]")
+    console.print(f"[bold]Tabs in {source.label()}:[/bold]")
     console.print()
 
     for tab in structure.tabs:
