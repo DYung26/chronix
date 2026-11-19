@@ -1,0 +1,13 @@
+[Unit]
+Description=Chronix task rings (Quickshell Wayland overlay)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/quickshell --config chronix-widget
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target
