@@ -86,7 +86,7 @@ jobs:
         working-directory: apps/widget
 
       - name: Upload installer
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: chronix-widget-windows-x64
           path: apps/widget/src-tauri/target/release/bundle/nsis/*.exe
