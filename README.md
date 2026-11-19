@@ -14,6 +14,10 @@ A task management CLI tool that syncs tasks from Google Docs and schedules them 
 - **Complete Timeline View**: See your full day including tasks, breaks, sleep, and empty time slots
 - **Task Management**: Track incomplete and completed tasks with detailed metadata
 
+## Desktop Widget
+
+Chronix includes a cross-platform desktop widget in [apps/widget](apps/widget). It provides the Tauri desktop application and native GNOME Shell and Quickshell integrations. See [apps/widget/README.md](apps/widget/README.md) for setup and development.
+
 ## Installation
 
 Install Chronix from source:
