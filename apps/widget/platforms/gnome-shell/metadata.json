@@ -4,7 +4,7 @@
   "name": "Chronix Task Rings",
   "description": "Floating countdown rings for active Chronix scheduled tasks.",
   "gettext-domain": "chronix-widget",
-  "url": "https://github.com/DYung26/chronix-widget",
+  "url": "https://github.com/DYung26/chronix",
   "shell-version": ["51"],
   "version": 1
 }
