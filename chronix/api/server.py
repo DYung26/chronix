@@ -71,7 +71,7 @@ def make_handler(provider: ActiveTaskProvider):
             try:
                 self._send_json(200, create_payload(provider))
             except Exception:
-                logger.exception("Unable to resolve active scheduled tasks")
+                logger.exception("Unable to resolve scheduled task intervals")
                 self._send_json(503, {"ok": False, "error": "task data unavailable"})
 
         def log_message(self, format: str, *args) -> None:

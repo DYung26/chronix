@@ -247,10 +247,10 @@ chronix-api --host 127.0.0.1 --port 8766
 ```
 
 - `GET /healthz` reports whether the API process is running.
-- `GET /api/v1/active-tasks` returns currently overlapping Chronix-managed schedule intervals as `id`, `title`, `startAt`, `endAt`, and `track`.
-- Intervals are read from the original Google Calendar event timestamps written by Chronix calendar sync. The API does not regenerate the schedule on every request, so ring progress does not reset while a task is underway.
-- Only persisted calendar intervals are returned. Run `chronix calendar --split` after scheduling when both primary and secondary tracks should be represented; the API itself never writes or regenerates schedule events.
-- Task source data is refreshed in the API process at most once every 30 seconds; the active calendar interval is checked on each request, and completed or removed tasks are filtered out.
+- `GET /api/v1/active-tasks` returns current and upcoming Chronix-managed task intervals as `id`, `title`, `startAt`, `endAt`, and `track`.
+- Current intervals use the original Google Calendar event timestamps written by Chronix calendar sync, so ring progress remains stable while a task is underway.
+- Upcoming intervals come from the current Chronix `today` schedule for both primary and secondary tracks. They are computed in memory; the widget API never writes or changes calendar events.
+- Task context, active calendar intervals, and upcoming schedule intervals are each refreshed at most once every 30 seconds. Completed or removed tasks are filtered out.
 - The endpoint is read-only and does not enforce a concurrency limit or cap the number of returned tasks.
 
 Keep the server bound to `127.0.0.1` and expose it only through a private Tailscale Serve route. Browser CORS is limited to Tauri production and local Vite origins; native desktop clients use ordinary HTTP.

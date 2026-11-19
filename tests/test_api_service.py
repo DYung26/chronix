@@ -116,6 +116,12 @@ def test_active_task_provider_caches_calendar_snapshot(monkeypatch):
     project = SimpleNamespace(project_context=SimpleNamespace(project_id="project"))
     monkeypatch.setattr(service._context, "projects", [project])
     monkeypatch.setattr(service, "TaskAggregator", _EmptyAggregator)
+    empty_schedule = SimpleNamespace(scheduled_tasks=[])
+    monkeypatch.setattr(
+        service,
+        "_generate_today_schedules",
+        lambda: (empty_schedule, empty_schedule, None, None, []),
+    )
 
     class CalendarService:
         calls = 0
@@ -139,6 +145,12 @@ def test_active_task_provider_serves_cached_calendar_snapshot_on_refresh_failure
     project = SimpleNamespace(project_context=SimpleNamespace(project_id="project"))
     monkeypatch.setattr(service._context, "projects", [project])
     monkeypatch.setattr(service, "TaskAggregator", _EmptyAggregator)
+    empty_schedule = SimpleNamespace(scheduled_tasks=[])
+    monkeypatch.setattr(
+        service,
+        "_generate_today_schedules",
+        lambda: (empty_schedule, empty_schedule, None, None, []),
+    )
 
     class CalendarService:
         calls = 0
@@ -212,3 +224,86 @@ def test_widget_data_includes_upcoming_configured_blocks(monkeypatch):
     assert result["tasks"] == []
     assert result["blocks"][0]["title"] == "Later"
     assert result["blocks"][0]["startAt"] == "2026-11-16T11:00:00+00:00"
+
+
+def test_widget_task_intervals_from_schedules_returns_only_future_tasks():
+    from chronix.api.service import widget_task_intervals_from_schedules
+
+    now = datetime(2026, 11, 16, 10, 0, tzinfo=timezone.utc)
+    active = SimpleNamespace(
+        task=SimpleNamespace(id="active"),
+        start=now - timedelta(minutes=15),
+        end=now + timedelta(minutes=15),
+    )
+    future = SimpleNamespace(
+        task=SimpleNamespace(id="future"),
+        start=now + timedelta(hours=1),
+        end=now + timedelta(hours=2),
+    )
+    primary = SimpleNamespace(scheduled_tasks=[active, future])
+    secondary = SimpleNamespace(scheduled_tasks=[])
+
+    assert widget_task_intervals_from_schedules(primary, secondary, now) == [{
+        "id": "future",
+        "start": future.start,
+        "end": future.end,
+        "track": "primary",
+    }]
+
+
+def test_widget_data_includes_upcoming_scheduled_tasks_from_both_tracks(monkeypatch):
+    now = datetime(2026, 11, 16, 10, 0, tzinfo=timezone.utc)
+    project = SimpleNamespace(project_context=SimpleNamespace(project_id="project"))
+    tasks = [
+        SimpleNamespace(id="primary", title="Primary next task", completed=False),
+        SimpleNamespace(id="secondary", title="Secondary task", completed=False),
+    ]
+
+    class TaskAggregator:
+        def aggregate(self, projects):
+            return projects
+
+        def get_task_pool(self, aggregated):
+            return tasks
+
+    class CalendarService:
+        def get_active_scheduled_tasks(self, current_time):
+            return []
+
+    def scheduled_task(task_id, start):
+        return SimpleNamespace(
+            task=SimpleNamespace(id=task_id),
+            start=start,
+            end=start + timedelta(minutes=30),
+        )
+
+    primary_schedule = SimpleNamespace(
+        scheduled_tasks=[scheduled_task("primary", now + timedelta(hours=1))]
+    )
+    secondary_schedule = SimpleNamespace(
+        scheduled_tasks=[scheduled_task("secondary", now + timedelta(hours=1))]
+    )
+    config = SimpleNamespace(scheduling=SimpleNamespace(timezone="UTC"))
+
+    monkeypatch.setattr(service._context, "projects", [project])
+    monkeypatch.setattr(service._context, "config", config)
+    monkeypatch.setattr(service._context, "ad_hoc_meetings", [])
+    monkeypatch.setattr(service, "TaskAggregator", TaskAggregator)
+    monkeypatch.setattr(service, "config_to_time_blocks", lambda *_: [])
+    monkeypatch.setattr(
+        service,
+        "_generate_today_schedules",
+        lambda: (primary_schedule, secondary_schedule, None, None, []),
+    )
+
+    provider = ActiveTaskProvider()
+    provider._refresh_context = lambda: None
+    provider._calendar_service = CalendarService()
+
+    result = provider.get_widget_data(now)
+
+    assert [task["title"] for task in result["tasks"]] == [
+        "Primary next task",
+        "Secondary task",
+    ]
+    assert [task["track"] for task in result["tasks"]] == ["primary", "secondary"]

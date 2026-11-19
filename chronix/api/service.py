@@ -9,8 +9,9 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Any
 
-from chronix.cli.commands import _context
+from chronix.cli.commands import _context, _generate_today_schedules
 from chronix.core.aggregation import TaskAggregator
+from chronix.core.models import DaySchedule
 from chronix.config import ChronixConfig, config_to_time_blocks
 from chronix.integrations.google_calendar import CalendarSyncService
 from chronix.mcp import tools_read
@@ -22,7 +23,7 @@ def widget_tasks_from_intervals(
     intervals: list[dict[str, Any]],
     tasks_by_id: dict[str, Any],
 ) -> list[dict[str, str]]:
-    """Join persisted schedule intervals to current, incomplete Chronix tasks."""
+    """Convert scheduled intervals into current, incomplete Chronix task records."""
     result = []
     for interval in intervals:
         task = tasks_by_id.get(interval["id"])
@@ -40,8 +41,31 @@ def widget_tasks_from_intervals(
     return result
 
 
+def widget_task_intervals_from_schedules(
+    primary_schedule: DaySchedule,
+    secondary_schedule: DaySchedule,
+    now: datetime,
+) -> list[dict[str, Any]]:
+    """Return future task intervals from both tracks of today's schedule."""
+    intervals = []
+    for track, schedule in (
+        ("primary", primary_schedule),
+        ("secondary", secondary_schedule),
+    ):
+        for scheduled_task in schedule.scheduled_tasks:
+            if scheduled_task.start <= now or not scheduled_task.task.id:
+                continue
+            intervals.append({
+                "id": scheduled_task.task.id,
+                "start": scheduled_task.start,
+                "end": scheduled_task.end,
+                "track": track,
+            })
+    return intervals
+
+
 class ActiveTaskProvider:
-    """Resolve active scheduled intervals from Chronix and its calendar snapshot."""
+    """Resolve current and upcoming scheduled task intervals for the widget."""
 
     def __init__(
         self,
@@ -53,11 +77,13 @@ class ActiveTaskProvider:
         self._last_context_sync: float | None = None
         self._last_calendar_sync: float | None = None
         self._cached_intervals: list[dict[str, Any]] | None = None
+        self._last_schedule_sync: float | None = None
+        self._cached_upcoming_intervals: list[dict[str, Any]] | None = None
         self._calendar_service: CalendarSyncService | None = None
         self._lock = threading.RLock()
 
     def get_widget_data(self, now: datetime | None = None) -> dict[str, list[dict[str, str]]]:
-        """Resolve current tasks and configured time blocks for the widget."""
+        """Resolve current and upcoming tasks alongside configured time blocks."""
         now = now or datetime.now(timezone.utc)
         if now.tzinfo is None:
             raise ValueError("now must be timezone-aware")
@@ -132,8 +158,40 @@ class ActiveTaskProvider:
                     self._cached_intervals = intervals
                     self._last_calendar_sync = monotonic_now
 
+            schedule_is_fresh = (
+                self._cached_upcoming_intervals is not None
+                and self._last_schedule_sync is not None
+                and monotonic_now - self._last_schedule_sync < self.calendar_refresh_seconds
+            )
+            if not schedule_is_fresh:
+                try:
+                    primary_schedule, secondary_schedule, *_ = _generate_today_schedules()
+                    self._cached_upcoming_intervals = widget_task_intervals_from_schedules(
+                        primary_schedule,
+                        secondary_schedule,
+                        now,
+                    )
+                except (RuntimeError, ValueError):
+                    if self._cached_upcoming_intervals is None:
+                        self._cached_upcoming_intervals = []
+                    logger.exception("Unable to generate upcoming Chronix task intervals")
+                finally:
+                    self._last_schedule_sync = monotonic_now
+
+            current_tasks = widget_tasks_from_intervals(self._cached_intervals or [], tasks_by_id)
+            upcoming_tasks = widget_tasks_from_intervals(
+                self._cached_upcoming_intervals or [],
+                tasks_by_id,
+            )
             return {
-                "tasks": widget_tasks_from_intervals(self._cached_intervals or [], tasks_by_id),
+                "tasks": sorted(
+                    current_tasks + upcoming_tasks,
+                    key=lambda task: (
+                        task["startAt"],
+                        task["track"] != "primary",
+                        task["id"],
+                    ),
+                ),
                 "blocks": blocks,
             }
 
