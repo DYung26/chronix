@@ -121,6 +121,7 @@ def _generate_today_schedule(time_override: Optional[str] = None) -> tuple[DaySc
 
 def _generate_today_schedules(
     time_override: Optional[str] = None,
+    now_override: datetime | None = None,
 ) -> tuple[DaySchedule, DaySchedule, datetime, datetime, list]:
     """
     Generate today's primary and secondary track schedules.
@@ -173,7 +174,9 @@ def _generate_today_schedules(
     primary_tasks, secondary_tasks = partition_by_track(incomplete_tasks)
     
     # Get today's date and time
-    now = datetime.now(tz)
+    if now_override is not None and now_override.tzinfo is None:
+        raise ValueError("now_override must be timezone-aware")
+    now = now_override.astimezone(tz) if now_override is not None else datetime.now(tz)
     today = now.date()
 
     # Get all work windows from config

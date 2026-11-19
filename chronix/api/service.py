@@ -165,7 +165,7 @@ class ActiveTaskProvider:
             )
             if not schedule_is_fresh:
                 try:
-                    primary_schedule, secondary_schedule, *_ = _generate_today_schedules()
+                    primary_schedule, secondary_schedule, *_ = _generate_today_schedules(now_override=now)
                     self._cached_upcoming_intervals = widget_task_intervals_from_schedules(
                         primary_schedule,
                         secondary_schedule,
@@ -187,7 +187,7 @@ class ActiveTaskProvider:
                 "tasks": sorted(
                     current_tasks + upcoming_tasks,
                     key=lambda task: (
-                        task["startAt"],
+                        datetime.fromisoformat(task["startAt"]).astimezone(timezone.utc),
                         task["track"] != "primary",
                         task["id"],
                     ),

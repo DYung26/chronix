@@ -120,7 +120,7 @@ def test_active_task_provider_caches_calendar_snapshot(monkeypatch):
     monkeypatch.setattr(
         service,
         "_generate_today_schedules",
-        lambda: (empty_schedule, empty_schedule, None, None, []),
+        lambda **_: (empty_schedule, empty_schedule, None, None, []),
     )
 
     class CalendarService:
@@ -149,7 +149,7 @@ def test_active_task_provider_serves_cached_calendar_snapshot_on_refresh_failure
     monkeypatch.setattr(
         service,
         "_generate_today_schedules",
-        lambda: (empty_schedule, empty_schedule, None, None, []),
+        lambda **_: (empty_schedule, empty_schedule, None, None, []),
     )
 
     class CalendarService:
@@ -293,7 +293,7 @@ def test_widget_data_includes_upcoming_scheduled_tasks_from_both_tracks(monkeypa
     monkeypatch.setattr(
         service,
         "_generate_today_schedules",
-        lambda: (primary_schedule, secondary_schedule, None, None, []),
+        lambda **_: (primary_schedule, secondary_schedule, None, None, []),
     )
 
     provider = ActiveTaskProvider()
@@ -307,3 +307,67 @@ def test_widget_data_includes_upcoming_scheduled_tasks_from_both_tracks(monkeypa
         "Secondary task",
     ]
     assert [task["track"] for task in result["tasks"]] == ["primary", "secondary"]
+
+
+def test_widget_data_uses_request_time_and_sorts_intervals_by_instant(monkeypatch):
+    now = datetime.fromisoformat("2026-11-16T14:30:00+00:00")
+    current_start = datetime.fromisoformat("2026-11-16T09:00:00-05:00")
+    upcoming_start = datetime.fromisoformat("2026-11-16T07:00:00-08:00")
+    project = SimpleNamespace(project_context=SimpleNamespace(project_id="project"))
+    tasks = [
+        SimpleNamespace(id="current", title="Current task", completed=False),
+        SimpleNamespace(id="upcoming", title="Upcoming task", completed=False),
+    ]
+
+    class TaskAggregator:
+        def aggregate(self, projects):
+            return projects
+
+        def get_task_pool(self, aggregated):
+            return tasks
+
+    class CalendarService:
+        def get_active_scheduled_tasks(self, current_time):
+            return [{
+                "id": "current",
+                "start": current_start,
+                "end": current_start + timedelta(hours=2),
+                "track": "primary",
+            }]
+
+    upcoming = SimpleNamespace(
+        task=SimpleNamespace(id="upcoming"),
+        start=upcoming_start,
+        end=upcoming_start + timedelta(hours=1),
+    )
+    current_scheduled = SimpleNamespace(
+        task=SimpleNamespace(id="current"),
+        start=now,
+        end=now + timedelta(hours=1),
+    )
+    schedule = SimpleNamespace(scheduled_tasks=[current_scheduled, upcoming])
+    generated_times = []
+
+    def generate_schedules(now_override=None):
+        generated_times.append(now_override)
+        return schedule, SimpleNamespace(scheduled_tasks=[]), None, None, []
+
+    monkeypatch.setattr(service._context, "projects", [project])
+    monkeypatch.setattr(
+        service._context,
+        "config",
+        SimpleNamespace(scheduling=SimpleNamespace(timezone="UTC")),
+    )
+    monkeypatch.setattr(service._context, "ad_hoc_meetings", [])
+    monkeypatch.setattr(service, "TaskAggregator", TaskAggregator)
+    monkeypatch.setattr(service, "config_to_time_blocks", lambda *_: [])
+    monkeypatch.setattr(service, "_generate_today_schedules", generate_schedules)
+
+    provider = ActiveTaskProvider()
+    provider._refresh_context = lambda: None
+    provider._calendar_service = CalendarService()
+
+    result = provider.get_widget_data(now)
+
+    assert generated_times == [now]
+    assert [task["id"] for task in result["tasks"]] == ["current", "upcoming"]
