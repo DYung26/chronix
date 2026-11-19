@@ -4,7 +4,7 @@ This is the native Hyprland/Wayland overlay for the Chronix task rings. It uses 
 
 ## Install
 
-Run ./platforms/quickshell/install.sh from the repository root. The installer creates a named Quickshell config link and enables the user service.
+Run apps/widget/platforms/quickshell/install.sh from the Chronix repository root. The installer creates a named Quickshell config link and enables the user service.
 
 The API base URL is read from ~/.config/chronix-widget/api-base-url. The default is http://127.0.0.1:8766. For a remote API, set this file to your private Tailscale Serve URL.
 

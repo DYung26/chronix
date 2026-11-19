@@ -12,6 +12,8 @@ Copy .env.example to .env.local for local development and set the base URL to th
 
 ## Development
 
+Run these commands from the widget directory (apps/widget):
+
 ```bash
 npm ci
 npm test
